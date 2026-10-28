@@ -324,8 +324,11 @@ a warning), **Jest JSON** (jest + vitest), **Mocha JSON**, **`go test -json`**
 noted `flaky: failed k of n runs` when other runs passed; a parent test with
 `t.Run` subtests is only reported when it failed on its own; build failures —
 go 1.24 `build-fail` events or compiler errors on merged stderr — become
-warnings), **TAP** (node:test `--test-reporter=tap`; nested subtests become
-`ancestor > …` suites, `# SKIP`/`# TODO` map to skip), and **TRX**
+warnings), **TAP** (node:test `--test-reporter=tap` and plain TAP13/14; nested
+subtests — by indentation, with or without `# Subtest:` headers — become
+`ancestor > …` suites, a parent is only reported when it failed on its own,
+`# SKIP`/`# TODO` map to skip, multi-line YAML `error: |-` diagnostics and
+`duration_ms` are read), and **TRX**
 (.NET `dotnet test --logger trx`; suite = the test class name).
 
 - **table** — sections per classification (`FLAKY (confirmed)`,

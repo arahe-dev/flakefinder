@@ -209,3 +209,103 @@ describe('TAP YAML block scalars (r5 #5)', () => {
     ]);
   });
 });
+
+describe('TAP robustness (r5 #6)', () => {
+  it('accepts assertions without a number and/or a dash (TAP13/14)', () => {
+    const content = [
+      'TAP version 14',
+      'ok 1 numbered no dash',
+      'ok - dashed no number',
+      'not ok failing bare',
+      'ok',
+      'not ok',
+      'ok 6',
+      'ok 7 - classic # SKIP not today',
+      'okay this is not an assertion',
+    ].join('\n');
+    const { results } = tapParser.parse(content, 'inline');
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'numbered no dash:pass',
+      'dashed no number:pass',
+      'failing bare:fail',
+      '(test 4):pass',
+      '(test 5):fail',
+      '(test 6):pass',
+      'classic:skip',
+    ]);
+  });
+
+  it('reads duration_ms and unescapes \\\\ as well as \\#', () => {
+    const { results } = tapParser.parse(
+      load('tap-node20-multiline.tap'),
+      'tap-node20-multiline.tap',
+    );
+    const slow = results.find((r) => r.name === 'slow pass')!;
+    expect(slow.durationMs).toBeGreaterThanOrEqual(20);
+    expect(Number.isInteger(slow.durationMs)).toBe(true);
+    const BS = String.fromCharCode(92);
+    expect(results.map((r) => r.name)).toContain(`passes # with hash and back${BS}slash`);
+    // node's TAP stream was the 5 tests of multiline.test.mjs — nothing else
+    expect(results).toHaveLength(5);
+  });
+
+  it('never re-scans YAML diagnostic lines as assertions', () => {
+    const content = [
+      'TAP version 13',
+      'not ok 1 - outer',
+      '  ---',
+      '  error: |-',
+      '    ok 2 - looks like an assertion',
+      '    not ok 3 - so does this',
+      '  ...',
+      'ok 2 - real second',
+    ].join('\n');
+    const { results } = tapParser.parse(content, 'inline');
+    expect(results.map((r) => r.name)).toEqual(['outer', 'real second']);
+    expect(results[0]!.message).toBe('ok 2 - looks like an assertion\nnot ok 3 - so does this');
+  });
+
+  it('does not double-emit parents of indentation-nested subtests without # Subtest headers', () => {
+    const content = [
+      'TAP version 14',
+      '    ok 1 - child a',
+      '    not ok 2 - child b',
+      '    1..2',
+      'not ok 1 - parent',
+      '        ok 1 - deep',
+      '        1..1',
+      '    ok 1 - middle',
+      '    1..1',
+      'ok 2 - outer',
+      'ok 3 - flat',
+      '1..3',
+    ].join('\n');
+    const { results, warnings } = tapParser.parse(content, 'inline');
+    expect(warnings).toEqual([]);
+    expect(results.map((r) => `${r.suite} :: ${r.name}:${r.status}`)).toEqual([
+      'parent :: child a:pass',
+      'parent :: child b:fail',
+      'outer > middle :: deep:pass',
+      'node:test :: flat:pass',
+    ]);
+  });
+
+  // tap-node20-parents.tap: REAL node 20.20 TAP for tests/tap-sample/parents.test.mjs
+  it('keeps a parent/suite failure that no child carries; B-F7 suppression otherwise', () => {
+    const { results, warnings } = tapParser.parse(
+      load('tap-node20-parents.tap'),
+      'tap-node20-parents.tap',
+    );
+    expect(warnings).toEqual([]);
+    expect(results.map((r) => `${r.suite} :: ${r.name}:${r.status}`)).toEqual([
+      `node:test :: it's quoted "double":fail`,
+      'parent throws after passing child :: child ok:pass',
+      // its own failure (thrown after the child passed) is reported nowhere else
+      'node:test :: parent throws after passing child:fail',
+      // before() failed: the cancelled child carries the failure → suite suppressed
+      'suite with failing before :: child a:fail',
+    ]);
+    expect(results[0]!.message).toBe(`it's broken: "x"`);
+    expect(results[2]!.message).toBe('parent own failure');
+  });
+});
