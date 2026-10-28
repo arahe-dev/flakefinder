@@ -72,10 +72,10 @@ describe('buildPrComment', () => {
   });
 
   it('details block only for NEW flakes, message truncated to 400 chars, fences survive', () => {
-    const nasty = `${'x'.repeat(500)}\n\`\`\`nested\n`;
+    const nasty = `\`\`\`nested\n${'x'.repeat(500)}\n`;
     const body = buildPrComment([verdict({ lastMessage: nasty })], null);
     expect(body).toContain('<details>');
-    expect(body).toContain('````text'); // four-backtick outer fence
+    expect(body).toContain('````text'); // outer fence longer than the nested ```
     expect(body).toContain('flakefinder quarantine add abcd1234');
     expect(body).not.toContain('x'.repeat(450)); // truncated
   });
@@ -106,7 +106,60 @@ describe('secret redaction (v0.2.0)', () => {
     const md = renderMarkdown([verdict({ name: 'check AKIAIOSFODNN7EXAMPLE works' })], {
       flakesOnly: true,
     });
-    expect(md).toContain('AKIA[REDACTED]');
+    expect(md).toContain('AKIA\\[REDACTED\\]'); // brackets escaped (R5 #9); renders as AKIA[REDACTED]
     expect(md).not.toContain('AKIAIOSFODNN7EXAMPLE');
+  });
+});
+
+describe('markdown injection is neutralised (R5 #9)', () => {
+  const ZWJ = '‍';
+
+  it('@mentions in names/suites do not ping anyone', () => {
+    const md = renderMarkdown([verdict({ name: 'ping @octocat and @org/team', suite: '@x' })], {
+      flakesOnly: true,
+    });
+    expect(md).not.toMatch(/@octocat|@org\/team|@x/);
+    expect(md).toContain(`@${ZWJ}octocat`);
+    expect(md).toContain(`@${ZWJ}org/team`);
+  });
+
+  it('link and image syntax is escaped', () => {
+    const md = renderMarkdown(
+      [verdict({ name: 'click [here](https://evil.example) ![x](https://evil.example/p.png)' })],
+      { flakesOnly: true },
+    );
+    expect(md).not.toContain('[here](');
+    expect(md).not.toContain('![x](');
+    expect(md).toContain('\\[here\\](https://evil.example)');
+  });
+
+  it('HTML tags cannot close the details block or inject elements', () => {
+    const body = buildPrComment(
+      [verdict({ name: 'x</code></summary></details><img src=x onerror=1>', suite: '<b>s</b>' })],
+      null,
+    );
+    expect((body.match(/<\/details>/g) ?? []).length).toBe(1); // only our own
+    expect(body).not.toContain('<img');
+    expect(body).not.toContain('<b>');
+    expect(body).toContain('&lt;/details&gt;');
+  });
+
+  it('lastMessage fence is longer than any backtick run inside it', () => {
+    const msg = 'before\n``````\n</details>\n@octocat\nafter';
+    const body = buildPrComment([verdict({ lastMessage: msg })], null);
+    expect(body).toContain('```````text\n'); // 7 > 6
+    const lines = body.split('\n');
+    const open = lines.indexOf('```````text');
+    const close = lines.indexOf('```````', open + 1);
+    expect(close).toBeGreaterThan(open);
+    // the hostile content sits entirely inside the fence
+    const inner = lines.slice(open + 1, close).join('\n');
+    expect(inner).toContain('``````');
+    expect(inner).toContain('</details>');
+  });
+
+  it('a plain message still gets a normal fence', () => {
+    const body = buildPrComment([verdict({ lastMessage: 'boom' })], null);
+    expect(body).toContain('```text\nboom\n```\n');
   });
 });

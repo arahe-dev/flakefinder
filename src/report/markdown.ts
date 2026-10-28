@@ -9,12 +9,45 @@ function isFlaky(v: TestVerdict): boolean {
   return (FLAKY_CLASSES as readonly string[]).includes(v.classification);
 }
 
-/** Table-cell safe: no pipes, no newlines, capped length; secrets redacted. */
+/**
+ * Neutralise untrusted text (test names, suites — anyone who can open a PR
+ * controls them) for inline GitHub/GitLab markdown:
+ * - HTML: `&`, `<`, `>` become entities, so `</details>`, `<img …>` or an
+ *   autolink can't break out of our markup (they still render as text);
+ * - link/image syntax: `[` and `]` are backslash-escaped;
+ * - @mentions: a zero-width joiner after `@` stops user/team pings;
+ * - table pipes are escaped.
+ * Expects one line of already-redacted text.
+ */
+export function escapeMarkdownInline(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/[[\]]/g, '\\$&')
+    .replace(/@(?=[A-Za-z0-9_-])/g, '@\u200D')
+    .replace(/\|/g, '\\|');
+}
+
+/** Table-cell safe: one line, capped length, secrets redacted, markdown/HTML neutralised. */
 function cell(s: string | undefined, max = 80): string {
   if (!s) return '';
+  // redact BEFORE truncating (a split token can't survive), escape AFTER (an
+  // entity can't be cut in half)
   const oneLine = redact(s).replace(/\r?\n/g, ' ');
   const out = oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
-  return out.replace(/\|/g, '\\|');
+  return escapeMarkdownInline(out);
+}
+
+/**
+ * A backtick fence longer than any backtick run in `content` (min 3), so
+ * content can never close the code block early. Inside a fence, mentions,
+ * links and HTML are inert.
+ */
+export function fenceFor(content: string): string {
+  let longest = 0;
+  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  return '`'.repeat(Math.max(3, longest + 1));
 }
 
 function classLabel(v: TestVerdict): string {
@@ -123,10 +156,10 @@ export function buildPrComment(verdicts: TestVerdict[], previous: TestVerdict[] 
       `<details><summary><code>${cell(v.name, 60)}</code> — score ${v.flakeScore}</summary>`,
       '',
     );
-    out.push('````text');
     // redact BEFORE truncating so a token split by the slice can't survive partially
-    out.push(redact(v.lastMessage ?? '(no failure message recorded)').slice(0, 400));
-    out.push('````', '');
+    const message = redact(v.lastMessage ?? '(no failure message recorded)').slice(0, 400);
+    const fence = fenceFor(message);
+    out.push(`${fence}text`, message, fence, '');
     out.push('Quarantine it:', '');
     out.push('```bash');
     out.push(`flakefinder quarantine add ${v.testId}`);
