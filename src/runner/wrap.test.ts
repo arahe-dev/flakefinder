@@ -514,3 +514,60 @@ describe('unstartable commands (QA A11)', () => {
     expect(result.finalExitCode).toBe(1);
   });
 });
+
+describe('shell operator detection (R5 bug 1)', () => {
+  it('plain numbers are arguments, not operators', async () => {
+    const { isShellOperator } = await import('./wrap.js');
+    for (const t of ['2', '4', '1', '0', '42']) expect(isShellOperator(t)).toBe(false);
+    for (const t of [
+      '>',
+      '>>',
+      '<',
+      '2>',
+      '2>>',
+      '2>&1',
+      '>&2',
+      '&>',
+      '&>>',
+      '|',
+      '||',
+      '|&',
+      '&',
+      '&&',
+      ';',
+    ]) {
+      expect(isShellOperator(t)).toBe(true);
+    }
+    for (const t of ['w1&&w2', '-t', 'a|b', '>out.txt']) expect(isShellOperator(t)).toBe(false);
+  });
+
+  it('flags are appended AFTER numeric option values', async () => {
+    const { insertRunnerArgs } = await import('./wrap.js');
+    expect(insertRunnerArgs(['jest', '--maxWorkers', '2'], ['-t', 'p'])).toEqual([
+      'jest',
+      '--maxWorkers',
+      '2',
+      '-t',
+      'p',
+    ]);
+    expect(insertRunnerArgs(['pytest', '-n', '4'], ['--lf'])).toEqual([
+      'pytest',
+      '-n',
+      '4',
+      '--lf',
+    ]);
+    expect(insertRunnerArgs(['go', 'test', '-p', '1', './...'], ['-run', '^(A)$'])).toEqual([
+      'go',
+      'test',
+      '-p',
+      '1',
+      './...',
+      '-run',
+      '^(A)$',
+    ]);
+    // real fd redirects still split the command
+    expect(
+      insertRunnerArgs(['go', 'test', '-p', '1', '2>&1', '|', 'tee', 'x'], ['-run', 'A']),
+    ).toEqual(['go', 'test', '-p', '1', '-run', 'A', '2>&1', '|', 'tee', 'x']);
+  });
+});

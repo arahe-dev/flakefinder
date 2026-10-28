@@ -74,12 +74,17 @@ function snapshotReports(
 
 /** Tokens that only a shell can interpret (redirects, pipes, command chaining). */
 function needsShell(command: string[]): boolean {
-  return command.some((t) => /[<>|&]/.test(t));
+  return command.some((t) => /[<>|&]/.test(t) || isShellOperator(t));
 }
 
-/** A token that IS a shell operator (must stay unquoted in shell mode). */
-function isShellOperator(token: string): boolean {
-  return /^[<>|&\d]+$/.test(token);
+/**
+ * A token that IS a shell operator (must stay unquoted in shell mode): control
+ * operators (`|`, `||`, `|&`, `&`, `&&`, `;`) and redirects, where digits are
+ * only allowed as an fd prefix or dup target (`>`, `>>`, `2>`, `2>&1`, `>&2`,
+ * `&>`, `<`). A bare number like the `2` in `--maxWorkers 2` is an argument.
+ */
+export function isShellOperator(token: string): boolean {
+  return /^(?:\|\|?|\|&|&&?|;|&>>?|\d*(?:<<?|>>?|>\||<>)(?:&(?:\d+|-))?)$/.test(token);
 }
 
 /**
@@ -89,7 +94,7 @@ function isShellOperator(token: string): boolean {
  * not the last shell word. Injection matches whole operator tokens only, so
  * an argument VALUE like `w1&&w2` is never mistaken for a segment boundary.
  */
-function insertRunnerArgs(command: string[], args: string[]): string[] {
+export function insertRunnerArgs(command: string[], args: string[]): string[] {
   if (args.length === 0) return [...command];
   const separator = isPackageManagerWrapper(command) ? ['--'] : [];
   const opIdx = command.findIndex((t) => isShellOperator(t));
