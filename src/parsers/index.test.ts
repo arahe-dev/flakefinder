@@ -27,6 +27,15 @@ describe('detectParser', () => {
     ['go-count2.jsonl', 'go'],
     ['go124-build-fail.jsonl', 'go'],
     ['go-stderr-merged.jsonl', 'go'],
+    ['tap-node.jsonl', 'tap'],
+    ['tap-ttest.jsonl', 'tap'],
+    ['tap-node20-multiline.tap', 'tap'],
+    ['tap-node20-parents.tap', 'tap'],
+    ['trx-dotnet.trx', 'trx'],
+    ['trx-mstest3.trx', 'trx'],
+    ['trx-mstest2-datarows.trx', 'trx'],
+    ['junit-surefire-reruns.xml', 'junit'],
+    ['mocha-same-title-hook.json', 'mocha'],
   ];
 
   for (const [fixture, expected] of cases) {

@@ -52,19 +52,16 @@ describe('tapParser', () => {
     expect(root).toMatchObject({ status: 'pass', suite: 'node:test' });
   });
 
-  it('keeps the LAST 2000 chars of oversized test output', () => {
-    const lines = [
-      JSON.stringify({ Action: 'run', Package: 'big', Test: 'TestBig' }),
-      JSON.stringify({
-        Action: 'output',
-        Package: 'big',
-        Test: 'TestBig',
-        Output: 'x'.repeat(3000),
-      }),
-      JSON.stringify({ Action: 'fail', Package: 'big', Test: 'TestBig', Elapsed: 0.4 }),
-    ];
-    const { results } = tapParser.parse(lines.join('\n'), 'inline');
-    expect(results).toEqual([]); // go-format lines are not TAP — sniff rejects the file
+  it('truncates oversized error messages to 2000 chars', () => {
+    const content = [
+      'TAP version 13',
+      'not ok 1 - huge',
+      '  ---',
+      `  error: '${'x'.repeat(3000)}'`,
+      '  ...',
+    ].join('\n');
+    const { results } = tapParser.parse(content, 'inline');
+    expect(results[0]!.message).toBe('x'.repeat(2000));
   });
 
   it('truncated stream: emits a warning for unclosed subtests', () => {
