@@ -28,6 +28,18 @@ jobs:
         if: always()                        # analyze even when tests fail
 ```
 
+> [!WARNING]
+> **Never run this action under `pull_request_target` on untrusted (fork)
+> PRs.** `pull_request_target` runs with a write-scoped `GITHUB_TOKEN`, with
+> repository secrets, and with access to the base branch's cache. To feed
+> flakefinder you have to check out and execute the fork's code (its tests
+> write the reports). That code could then steal the token, post or edit
+> comments as your bot, and poison the shared history cache. Use the plain
+> `pull_request` trigger (shown above): fork PRs get a read-only token, so
+> the comment step just warns and the rest of the analysis still runs. If you
+> need comments on fork PRs, upload the reports as an artifact and post them
+> from a separate `workflow_run` workflow that never executes PR code.
+
 Before the first run, create a `flakefinder.config.json` in your repo (or run
 `npx flakefinder init` locally and commit the result) pointing `reports` at the
 files your test runner writes, e.g.:
@@ -117,13 +129,19 @@ No — the input overrides it. The config file is still useful for local runs.
 
 **Private repos?** Yes; the default `GITHUB_TOKEN` works. PR comments need the
 `pull-requests: write` permission. Comment on fork PRs may fail (token
-restrictions) — the action warns and continues.
+restrictions) — the action warns and continues. Don't switch to
+`pull_request_target` to get around this (see the warning at the top).
 
 **Monorepo?** Set `working-directory` to the package root, or give absolute-ish
 globs like `packages/api/junit.xml` relative to the repo root.
 
 **Which report formats?** JUnit XML (pytest, jest-junit, surefire, go-junit…),
-Jest/vitest JSON, Mocha JSON, and `go test -json` output.
+Jest/vitest JSON, Mocha JSON, `go test -json` output, **TAP** (e.g.
+`node --test --test-reporter=tap > results.tap`; nested subtests become
+`parent > child` suites, `# SKIP`/`# TODO` count as skipped) and **TRX**
+(.NET, `dotnet test --logger trx`; the suite is the test class name). The
+format is detected from file content, so a glob like
+`"reports": ["results.tap", "**/TestResults/*.trx"]` is all it takes.
 
 **What if my tests fail?** Add `if: always()` to the flakefinder step so it
 still analyzes the reports (that's usually exactly when you want it).
