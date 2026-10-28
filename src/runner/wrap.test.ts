@@ -685,3 +685,35 @@ describe('shell-mode quoting (R5 bug 2)', () => {
     expect(argv[1]).toContain(evil.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   }, 60_000);
 });
+
+describe('package-manager separator (R5 bug 3)', () => {
+  it('does not add a second -- when the wrapper command already has one', async () => {
+    const { insertRunnerArgs } = await import('./wrap.js');
+    expect(insertRunnerArgs(['npm', 'test', '--', '--ci'], ['-t', 'p'])).toEqual([
+      'npm',
+      'test',
+      '--',
+      '--ci',
+      '-t',
+      'p',
+    ]);
+    expect(insertRunnerArgs(['npm', 'test'], ['-t', 'p'])).toEqual([
+      'npm',
+      'test',
+      '--',
+      '-t',
+      'p',
+    ]);
+    // a `--` in a LATER shell segment does not count for the runner's segment
+    expect(insertRunnerArgs(['npm', 'test', '&&', 'x', '--'], ['-t', 'p'])).toEqual([
+      'npm',
+      'test',
+      '--',
+      '-t',
+      'p',
+      '&&',
+      'x',
+      '--',
+    ]);
+  });
+});

@@ -89,16 +89,20 @@ export function isShellOperator(token: string): boolean {
 
 /**
  * Insert runner args (flag/value pairs) into the command: package-manager
- * wrappers get a `--` separator first, and shell operators split the command
+ * wrappers get a `--` separator first (unless the command already has one),
+ * and shell operators split the command
  * into segments — the args must join the RUNNER's segment (the first one),
  * not the last shell word. Injection matches whole operator tokens only, so
  * an argument VALUE like `w1&&w2` is never mistaken for a segment boundary.
  */
 export function insertRunnerArgs(command: string[], args: string[]): string[] {
   if (args.length === 0) return [...command];
-  const separator = isPackageManagerWrapper(command) ? ['--'] : [];
   const opIdx = command.findIndex((t) => isShellOperator(t));
   const insertAt = opIdx === -1 ? command.length : opIdx;
+  // `npm test -- --ci` already forwards everything after its `--`: a second
+  // separator would reach the runner as a literal `--` argument
+  const hasSeparator = command.slice(1, insertAt).includes('--');
+  const separator = isPackageManagerWrapper(command) && !hasSeparator ? ['--'] : [];
   return [...command.slice(0, insertAt), ...separator, ...args, ...command.slice(insertAt)];
 }
 
