@@ -321,7 +321,8 @@ surefire…; a Surefire rerun that passed after `<flakyFailure>`/`<flakyError>`
 stays a pass but is flagged with a `flaky: failed k of n attempts` message and
 a warning), **Jest JSON** (jest + vitest), **Mocha JSON**, **`go test -json`**
 (NDJSON; with `-count=N` a test that failed in any run is reported as a fail,
-noted `flaky: failed k of n runs` when other runs passed), **TAP** (node:test `--test-reporter=tap`; nested subtests become
+noted `flaky: failed k of n runs` when other runs passed; a parent test with
+`t.Run` subtests is only reported when it failed on its own), **TAP** (node:test `--test-reporter=tap`; nested subtests become
 `ancestor > …` suites, `# SKIP`/`# TODO` map to skip), and **TRX**
 (.NET `dotnet test --logger trx`; suite = the test class name).
 

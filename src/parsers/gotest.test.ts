@@ -253,3 +253,56 @@ describe('go test -count=N (r5 #2)', () => {
     expect(warnings).toEqual([]);
   });
 });
+
+describe('go subtest parents (r5 #3)', () => {
+  it('does not emit parents whose failure is just their subtest failing', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const names = results.map((r) => r.name);
+    expect(names).toEqual([
+      'TestFlaky',
+      'TestStable',
+      'TestTable/one',
+      'TestTable/two',
+      'TestParentOwnFailure',
+      'TestParentOwnFailure/child',
+    ]);
+    // the failing child is the one failure — no duplicate on TestTable
+    expect(results.filter((r) => r.status === 'fail').map((r) => r.name)).toEqual([
+      'TestFlaky',
+      'TestTable/two',
+      'TestParentOwnFailure',
+    ]);
+  });
+
+  it('keeps a parent that failed on its own, with no failing child', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const parent = results.find((r) => r.name === 'TestParentOwnFailure')!;
+    expect(parent.status).toBe('fail');
+    expect(parent.message).toContain('parent assertion after children');
+  });
+
+  it('suppresses passing parents and intermediate levels of nested subtests', () => {
+    const ev = (action: string, test: string) =>
+      JSON.stringify({ Action: action, Package: 'p', Test: test });
+    const content = [
+      ev('run', 'TestA'),
+      ev('run', 'TestA/b'),
+      ev('run', 'TestA/b/c'),
+      ev('fail', 'TestA/b/c'),
+      ev('fail', 'TestA/b'),
+      ev('fail', 'TestA'),
+      ev('run', 'TestB'),
+      ev('run', 'TestB/x'),
+      ev('pass', 'TestB/x'),
+      ev('pass', 'TestB'),
+      ev('run', 'TestBravo'), // shares a prefix with TestB but is not its child
+      ev('pass', 'TestBravo'),
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'TestA/b/c:fail',
+      'TestB/x:pass',
+      'TestBravo:pass',
+    ]);
+  });
+});

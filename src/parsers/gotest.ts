@@ -20,6 +20,11 @@
  * blank lines dropped, and the LAST 2000 characters of the joined text are kept (failure
  * details come at the end, after t.Log noise).
  *
+ * Subtests: `TestA/sub` is emitted with its full name. A parent (`TestA`) that has subtests is
+ * NOT emitted — its status only mirrors its children and would double-count their failures —
+ * unless the parent itself failed while none of its descendants did (t.Error after t.Run, a
+ * panic in the parent body); that failure exists nowhere else, so the parent row is kept.
+ *
  * Package-level events (no Test) are ignored. Lines that fail JSON.parse produce warnings —
  * at most 5 individually, then a single '…and N more' summary.
  *
@@ -47,6 +52,10 @@ interface TestAccumulator {
   test: string;
   /** Chronological runs; the last one is the run currently receiving events. */
   runs: RunState[];
+}
+
+function isFailFamily(status: TestStatus): boolean {
+  return status === 'fail' || status === 'error';
 }
 
 function newRun(): RunState {
@@ -167,15 +176,19 @@ export const goTestParser: ReportParser = {
       warnings.push(`…and ${malformed - MAX_MALFORMED_DETAILS} more malformed lines`);
     }
 
-    let dangling = 0;
-    const flaky: string[] = [];
+    // One aggregated row per test, in first-seen order.
+    const rows: Array<{
+      acc: TestAccumulator;
+      result: TestCaseResult;
+      dangling: boolean;
+      flaky: boolean;
+    }> = [];
     for (const acc of tests.values()) {
       const last = acc.runs[acc.runs.length - 1]!;
       if (last.status === undefined) {
         // Test started (run event) but never reported pass/fail/skip — the test
         // binary crashed mid-run (panic, OOM, killed). Synthesize an error so
         // the crash is visible in verdicts instead of silently vanishing.
-        dangling++;
         const result: TestCaseResult = {
           testId: makeTestId(acc.pkg, acc.test),
           suite: acc.pkg,
@@ -188,7 +201,7 @@ export const goTestParser: ReportParser = {
         // the synthetic explanation.
         const output = messageFromOutputs(last.outputs);
         if (output !== undefined) result.message = `${result.message}\n${output}`;
-        results.push(result);
+        rows.push({ acc, result, dangling: true, flaky: false });
         continue;
       }
       const failed = acc.runs.filter((r) => r.status === 'fail');
@@ -201,13 +214,39 @@ export const goTestParser: ReportParser = {
         durationMs: reported.durationMs,
       };
       let message = messageFromOutputs(reported.outputs);
-      if (failed.length > 0 && failed.length < acc.runs.length) {
+      const isFlaky = failed.length > 0 && failed.length < acc.runs.length;
+      if (isFlaky) {
         const note = `flaky: failed ${failed.length} of ${acc.runs.length} runs in this report`;
         message = message !== undefined ? `${note}\n${message}` : note;
-        flaky.push(`${acc.pkg} ${acc.test}`);
       }
       if (message !== undefined) result.message = message;
-      results.push(result);
+      rows.push({ acc, result, dangling: false, flaky: isFlaky });
+    }
+
+    // Subtest parents (TestA for TestA/sub): their status just mirrors their
+    // children, so emitting both double-counts a failure. Drop a parent unless
+    // it failed with NO failing descendant (its own t.Error after t.Run, a
+    // panic in the parent body…) — that failure exists nowhere else.
+    const hasChildren = new Set<string>();
+    const hasFailingChild = new Set<string>();
+    for (const { acc, result } of rows) {
+      const parts = acc.test.split('/');
+      for (let depth = 1; depth < parts.length; depth++) {
+        const ancestor = `${acc.pkg}\u0000${parts.slice(0, depth).join('/')}`;
+        hasChildren.add(ancestor);
+        if (isFailFamily(result.status)) hasFailingChild.add(ancestor);
+      }
+    }
+    let dangling = 0;
+    const flaky: string[] = [];
+    for (const row of rows) {
+      const key = `${row.acc.pkg}\u0000${row.acc.test}`;
+      if (hasChildren.has(key) && (hasFailingChild.has(key) || !isFailFamily(row.result.status))) {
+        continue;
+      }
+      if (row.dangling) dangling++;
+      if (row.flaky) flaky.push(`${row.acc.pkg} ${row.acc.test}`);
+      results.push(row.result);
     }
     if (flaky.length > 0) {
       const shown = flaky.slice(0, MAX_FLAKY_NAMES).join(', ');
