@@ -119,3 +119,26 @@ describe('upsertPrComment ownership (R5 #10)', () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe('API timeouts (QA ACT-6)', () => {
+  /** Never answers; rejects only when the request's AbortSignal fires. */
+  const hanging = (async (_url: string | URL, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return; // no signal → would hang forever (the bug)
+      signal.addEventListener('abort', () => reject(signal.reason));
+    })) as typeof fetch;
+
+  it('a hung GitHub API is abandoned after the timeout with a warning', async () => {
+    const warnings: string[] = [];
+    const t0 = Date.now();
+    const r = await upsertPrComment('t', 'b', ctx, {
+      fetchImpl: hanging,
+      warn: (m) => warnings.push(m),
+      timeoutMs: 50,
+    });
+    expect(r).toBe('failed');
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(warnings[0]).toMatch(/PR comment request failed \(TimeoutError/);
+  }, 5000);
+});

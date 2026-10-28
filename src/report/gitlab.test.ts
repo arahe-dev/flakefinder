@@ -102,3 +102,20 @@ describe('upsertMrNote', () => {
     expect(await upsertMrNote(gl, 'x', throwing, quiet)).toBe('unavailable');
   });
 });
+
+describe('GitLab API timeouts (QA ACT-6)', () => {
+  it('a hung GitLab API returns unavailable after the timeout with a warning', async () => {
+    const gl = gitlabEnvFromProcess(ENV)!;
+    const hanging = (async (_url: string | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return;
+        signal.addEventListener('abort', () => reject(signal.reason));
+      })) as typeof fetch;
+    const warnings: string[] = [];
+    const t0 = Date.now();
+    expect(await upsertMrNote(gl, 'b', hanging, (m) => warnings.push(m), 50)).toBe('unavailable');
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(warnings[0]).toContain('TimeoutError');
+  }, 5000);
+});

@@ -46,7 +46,11 @@ export async function upsertMrNote(
   body: string,
   fetchImpl: typeof fetch = fetch,
   warn: (message: string) => void = (m) => console.warn(`flakefinder: ${m}`),
+  timeoutMs = 15_000,
 ): Promise<'created' | 'updated' | 'unavailable'> {
+  // per-request timeout: a hung API must not block the job
+  const call = (url: string, init: RequestInit = {}): Promise<Response> =>
+    fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   const headers = {
     'PRIVATE-TOKEN': gl.token,
     'Content-Type': 'application/json',
@@ -56,7 +60,7 @@ export async function upsertMrNote(
 
   try {
     // the token's own user: only notes it authored are candidates for update
-    const userRes = await fetchImpl(`${gl.apiV4}/user`, { headers });
+    const userRes = await call(`${gl.apiV4}/user`, { headers });
     if (!userRes.ok) {
       warn(`GitLab: resolving the token's user failed: HTTP ${userRes.status}`);
       return 'unavailable';
@@ -65,7 +69,7 @@ export async function upsertMrNote(
     if (typeof me.id !== 'number') return 'unavailable';
 
     // find an existing flakefinder note (first page of 100 is plenty in practice)
-    const listRes = await fetchImpl(notesUrl, { headers });
+    const listRes = await call(notesUrl, { headers });
     if (!listRes.ok) {
       warn(`GitLab: listing MR notes failed: HTTP ${listRes.status}`);
       return 'unavailable';
@@ -76,7 +80,7 @@ export async function upsertMrNote(
       (n) => n.author?.id === me.id && (n.body ?? '').includes(PR_COMMENT_MARKER),
     );
     if (existing) {
-      const res = await fetchImpl(`${mrUrl}/notes/${existing.id}`, {
+      const res = await call(`${mrUrl}/notes/${existing.id}`, {
         method: 'PUT',
         headers,
         body: JSON.stringify({ body }),
@@ -85,7 +89,7 @@ export async function upsertMrNote(
       warn(`GitLab: updating MR note ${existing.id} failed: HTTP ${res.status}`);
       return 'unavailable';
     }
-    const res = await fetchImpl(notesUrl, {
+    const res = await call(notesUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify({ body }),
@@ -93,7 +97,10 @@ export async function upsertMrNote(
     if (res.ok) return 'created';
     warn(`GitLab: creating MR note failed: HTTP ${res.status}`);
     return 'unavailable';
-  } catch {
-    return 'unavailable'; // network errors must never fail the CI job
+  } catch (err) {
+    // network errors and timeouts must never fail the CI job
+    const e = err as Error;
+    warn(`GitLab: MR note request failed (${e.name}: ${e.message})`);
+    return 'unavailable';
   }
 }

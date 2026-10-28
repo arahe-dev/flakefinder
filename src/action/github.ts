@@ -58,7 +58,14 @@ interface GhComment {
 export interface UpsertDeps {
   fetchImpl?: typeof fetch;
   warn?: (message: string) => void;
+  /** Per-request timeout; a hung API must not block the job (default 15 s). */
+  timeoutMs?: number;
 }
+
+/** Per-request timeout for GitHub/GitLab API calls. */
+export const API_TIMEOUT_MS = 15_000;
+
+type Call = (url: string, init?: RequestInit) => Promise<Response>;
 
 function ghHeaders(token: string): Record<string, string> {
   return {
@@ -74,13 +81,9 @@ function ghHeaders(token: string): Record<string, string> {
  * the default GITHUB_TOKEN and GitHub App installation tokens get 403 there;
  * their comments are authored by a Bot account.
  */
-async function tokenLogin(
-  apiUrl: string,
-  token: string,
-  fetchImpl: typeof fetch,
-): Promise<string | null> {
+async function tokenLogin(apiUrl: string, token: string, call: Call): Promise<string | null> {
   try {
-    const res = await fetchImpl(`${apiUrl}/user`, { headers: ghHeaders(token) });
+    const res = await call(`${apiUrl}/user`, { headers: ghHeaders(token) });
     if (!res.ok) return null;
     const user = (await res.json()) as { login?: unknown };
     return typeof user.login === 'string' ? user.login : null;
@@ -103,8 +106,8 @@ function isOurComment(c: GhComment, login: string | null): boolean {
 
 /**
  * Upsert the flakefinder PR comment (plain REST — marker-scoped, single
- * comment, owned by us). Non-2xx responses are reported via `warn`, never
- * thrown; returns what happened.
+ * comment, owned by us). Non-2xx responses, network errors and timeouts are
+ * reported via `warn`, never thrown; returns what happened.
  */
 export async function upsertPrComment(
   token: string,
@@ -114,14 +117,33 @@ export async function upsertPrComment(
 ): Promise<'created' | 'updated' | 'skipped' | 'failed'> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const warn = deps.warn ?? ((m: string) => core.warning(m));
+  const timeoutMs = deps.timeoutMs ?? API_TIMEOUT_MS;
   if (!ctx.isPr || ctx.prNumber === null) return 'skipped';
+  const call: Call = (url, init = {}) =>
+    fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  try {
+    return await upsert(call, warn, token, body, ctx);
+  } catch (err) {
+    const e = err as Error;
+    warn(`PR comment request failed (${e.name}: ${e.message})`);
+    return 'failed';
+  }
+}
+
+async function upsert(
+  call: Call,
+  warn: (message: string) => void,
+  token: string,
+  body: string,
+  ctx: GithubContext,
+): Promise<'created' | 'updated' | 'failed'> {
   const repoPath = `${ctx.apiUrl}/repos/${ctx.owner}/${ctx.repo}`;
 
   // collect all comment pages
   const comments: GhComment[] = [];
   let url: string | null = `${repoPath}/issues/${ctx.prNumber}/comments?per_page=100`;
   while (url) {
-    const res = await fetchImpl(url, { headers: ghHeaders(token) });
+    const res = await call(url, { headers: ghHeaders(token) });
     if (!res.ok) {
       warn(`listing PR comments failed: HTTP ${res.status}`);
       return 'failed';
@@ -131,10 +153,10 @@ export async function upsertPrComment(
     url = res.headers.get('link')?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
   }
 
-  const login = await tokenLogin(ctx.apiUrl, token, fetchImpl);
+  const login = await tokenLogin(ctx.apiUrl, token, call);
   const existing = comments.find((c) => isOurComment(c, login));
   if (existing) {
-    const res = await fetchImpl(`${repoPath}/issues/comments/${existing.id}`, {
+    const res = await call(`${repoPath}/issues/comments/${existing.id}`, {
       method: 'PATCH',
       headers: ghHeaders(token),
       body: JSON.stringify({ body }),
@@ -144,7 +166,7 @@ export async function upsertPrComment(
       `updating PR comment ${existing.id} failed: HTTP ${res.status} — posting a new comment instead`,
     );
   }
-  const res = await fetchImpl(`${repoPath}/issues/${ctx.prNumber}/comments`, {
+  const res = await call(`${repoPath}/issues/${ctx.prNumber}/comments`, {
     method: 'POST',
     headers: ghHeaders(token),
     body: JSON.stringify({ body }),
