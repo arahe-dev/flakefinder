@@ -75,6 +75,14 @@ function storeFor(g: Globals, cfg: ResolvedConfig): HistoryStore {
 }
 
 /**
+ * Store problems (unreadable file, corrupt lines, newer format) go to stderr:
+ * otherwise a broken store reads as "no history yet". Call after a read.
+ */
+function printStoreWarnings(store: HistoryStore): void {
+  for (const w of store.warnings) console.warn(`flakefinder: ${w}`);
+}
+
+/**
  * Validates an integer flag (QA A7/A8). On failure prints an error naming the
  * flag and the accepted range and returns null — the caller sets exit 2. Runs
  * BEFORE resolveConfig so a bad override is blamed on the flag, not the config.
@@ -399,7 +407,9 @@ export async function main(argv: string[]): Promise<number> {
         threshold = n;
       }
       const cfg = resolveCfg(g);
-      const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
+      const store = storeFor(g, cfg);
+      const verdicts = classifyAll(store.runs(), cfg);
+      printStoreWarnings(store);
       if (opts.format === 'json') {
         console.log(renderJson(verdicts, cfg));
         return;
@@ -438,6 +448,7 @@ export async function main(argv: string[]): Promise<number> {
       const cfg = resolveCfg(g);
       const store = storeFor(g, cfg);
       const verdicts = classifyAll(store.runs(), cfg);
+      printStoreWarnings(store);
       const runs = store
         .runs()
         .slice(-50)
@@ -611,6 +622,7 @@ export async function main(argv: string[]): Promise<number> {
       }
       store.prune(cfg.maxRuns);
       const verdicts = classifyAll(store.runs(), cfg);
+      printStoreWarnings(store);
 
       console.log(renderTerminal(verdicts, { color: false, flakesOnly: false }));
 

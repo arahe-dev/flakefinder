@@ -212,3 +212,34 @@ describe('config found in a parent dir anchors storeDir/quarantineFile (R5 #6)',
     expect(existsSync(path.join(cfgDir, 'store', 'history.jsonl'))).toBe(true);
   });
 });
+
+describe('report/html/ci surface store warnings on stderr (R5 #7)', () => {
+  it('report on a directory-shaped store says it is unreadable instead of silently empty', () => {
+    const d = tmp();
+    mkdirSync(path.join(d, '.flakefinder', 'history.jsonl'), { recursive: true });
+    const r = cli(['report', '--format', 'json'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('history store unreadable (EISDIR)');
+    expect(() => JSON.parse(r.stdout)).not.toThrow(); // stdout stays machine-readable
+  });
+
+  it('report and html print corrupt-line warnings', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    writeFileSync(path.join(d, '.flakefinder', 'history.jsonl'), '{ nope\n', { flag: 'a' });
+    expect(cli(['report'], d).stderr).toContain('skipping corrupt line');
+    expect(cli(['html', '-o', 'out.html'], d).stderr).toContain('skipping corrupt line');
+  });
+
+  it('ci prints corrupt-line warnings', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{"reports": ["r.xml"]}', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    writeFileSync(path.join(d, '.flakefinder', 'history.jsonl'), '{ nope\n', { flag: 'a' });
+    const r = cli(['ci'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('skipping corrupt line');
+  });
+});
