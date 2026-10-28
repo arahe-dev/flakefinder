@@ -140,3 +140,72 @@ describe('TAP name unescaping (QA B-F4)', () => {
     });
   });
 });
+
+// tap-node20-multiline.tap: REAL `node --test --test-reporter=tap` output from
+// node 20.20 for tests/tap-sample/multiline.test.mjs (paths rewritten to /repo).
+describe('TAP YAML block scalars (r5 #5)', () => {
+  it("keeps node's multi-line assertion errors (error: |-) instead of the literal '|-'", () => {
+    const { results, warnings } = tapParser.parse(
+      load('tap-node20-multiline.tap'),
+      'tap-node20-multiline.tap',
+    );
+    expect(warnings).toEqual([]);
+    const byName = new Map(results.map((r) => [r.name, r]));
+
+    const objects = byName.get('strict equal objects')!;
+    expect(objects.status).toBe('fail');
+    expect(objects.message).not.toBe('|-');
+    expect(objects.message).toBe(
+      [
+        'Expected "actual" to be reference-equal to "expected":',
+        '+ actual - expected',
+        '',
+        '  {',
+        '    a: 1,',
+        '    b: [',
+        '      1,',
+        '+     2',
+        '-     3',
+        '    ]',
+        '  }',
+      ].join('\n'),
+    );
+    expect(objects.stack).toMatch(/^TestContext\.<anonymous> \(file:\/\/\/repo\//);
+
+    const strings = byName.get('strict equal strings')!;
+    expect(strings.message).toContain('Expected values to be strictly equal:');
+    expect(strings.message).toContain("- 'line one\\nline 2\\nline three'");
+    // block content stops at the next key — `code:`/`expected:` are not swallowed
+    expect(strings.message).not.toContain('ERR_ASSERTION');
+  });
+
+  it('handles |, |-, > and >- scalars (folded style joins lines)', () => {
+    const block = (indicator: string, n: number) => [
+      `not ok ${n} - t${n}`,
+      '  ---',
+      `  error: ${indicator}`,
+      '    first line',
+      '    second line',
+      '',
+      '    after blank',
+      "  code: 'ERR_X'",
+      '  ...',
+    ];
+    const content = [
+      'TAP version 13',
+      ...block('|', 1),
+      ...block('|-', 2),
+      ...block('>', 3),
+      ...block('>-', 4),
+      ...block('|+', 5),
+    ].join('\n');
+    const { results } = tapParser.parse(content, 'inline');
+    expect(results.map((r) => r.message)).toEqual([
+      'first line\nsecond line\n\nafter blank',
+      'first line\nsecond line\n\nafter blank',
+      'first line second line\nafter blank',
+      'first line second line\nafter blank',
+      'first line\nsecond line\n\nafter blank',
+    ]);
+  });
+});

@@ -11,7 +11,9 @@
  *   results — emitting both would double-count failures in the engine).
  * - Directives: `# SKIP reason` → skip, `# TODO` → skip.
  * - YAML blocks between --- and ... carry diagnostics: `error:` → message,
- *   `stack: |-` → stack.
+ *   `stack:` → stack. Both may be plain/quoted scalars or block scalars
+ *   (`|`, `|-`, `>`, `>-` …) — node writes multi-line assertion diffs as
+ *   `error: |-` followed by indented lines.
  * - Identity: suite = ancestor chain joined by ' > '; root-level tests get
  *   suite 'node:test' (TAP carries no file names).
  *
@@ -142,39 +144,69 @@ export const tapParser: ReportParser = {
   },
 };
 
-/** Minimal YAML diagnostics extraction for node:test's blocks (flat keys + `key: |-` scalars). */
+/**
+ * Minimal YAML diagnostics extraction for node:test's blocks: top-level
+ * `key: value` scalars plus block scalars (`key: |`, `|-`, `|+`, `>`, `>-`, `>+`).
+ * Nested mappings (node's `expected:`/`actual:` objects) are skipped whole.
+ */
 function parseYamlBlock(block: string[], sourcePath: string, warnings: string[]): YamlBlock {
   const out: YamlBlock = { isSuite: false };
   try {
+    const keyIndent = Math.min(
+      ...block.filter((l) => l.trim() !== '').map((l) => indentOf(l)),
+      Number.POSITIVE_INFINITY,
+    );
     for (let k = 0; k < block.length; k++) {
       const line = block[k]!;
-      const errorMatch = line.match(/^\s*error:\s*(.+)$/);
-      if (errorMatch && out.error === undefined) {
-        out.error = unquote(errorMatch[1]!);
-        continue;
-      }
-      const typeMatch = line.match(/^\s*type:\s*'suite'/);
-      if (typeMatch) out.isSuite = true;
-      const stackMatch = line.match(/^\s*stack:\s*\|[-+]?\s*$/);
-      if (stackMatch) {
-        const stackLines: string[] = [];
-        let m = k + 1;
-        const baseIndent = block[m]?.match(/^\s*/)?.[0].length ?? 0;
-        while (
-          m < block.length &&
-          (block[m]!.trim() === '' || (block[m]!.match(/^\s*/)?.[0].length ?? 0) >= baseIndent)
-        ) {
-          stackLines.push(block[m]!.slice(baseIndent));
-          m++;
-        }
-        out.stack = stackLines.join('\n').trimEnd();
-        k = m - 1;
-      }
+      if (indentOf(line) !== keyIndent) continue;
+      const keyMatch = line.match(/^\s*([A-Za-z_][\w-]*):(?:\s+(.*?))?\s*$/);
+      if (!keyMatch) continue;
+      const [, key, rawValue = ''] = keyMatch;
+      // the key's value continues on more-indented (or blank) lines
+      let m = k + 1;
+      while (m < block.length && (block[m]!.trim() === '' || indentOf(block[m]!) > keyIndent)) m++;
+      const continuation = block.slice(k + 1, m);
+      k = m - 1;
+
+      let value: string | undefined;
+      const scalar = rawValue.match(/^([|>])([-+]?)\d*$/);
+      if (scalar) value = readBlockScalar(continuation, scalar[1] === '>');
+      else if (rawValue !== '') value = unquote(rawValue);
+      if (value === undefined) continue; // nested mapping / empty value
+
+      if (key === 'error' && out.error === undefined) out.error = value;
+      else if (key === 'stack' && out.stack === undefined) out.stack = value;
+      else if (key === 'type' && value === 'suite') out.isSuite = true;
     }
   } catch (err) {
     warnings.push(`tap: ${sourcePath}: diagnostic block parse skipped (${errorMessage(err)})`);
   }
   return out;
+}
+
+function indentOf(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
+/**
+ * Body of a YAML block scalar. Literal (`|`) keeps line breaks; folded (`>`)
+ * joins adjacent non-blank lines with a space and keeps blank lines as breaks.
+ * Chomping indicators only affect trailing newlines, which callers trim anyway.
+ */
+function readBlockScalar(lines: string[], folded: boolean): string {
+  const firstContent = lines.find((l) => l.trim() !== '');
+  if (firstContent === undefined) return '';
+  const base = indentOf(firstContent);
+  const body = lines.map((l) => (l.trim() === '' ? '' : l.slice(Math.min(base, indentOf(l)))));
+  while (body.length > 0 && body[body.length - 1] === '') body.pop();
+  if (!folded) return body.join('\n');
+  let text = '';
+  for (let n = 0; n < body.length; n++) {
+    const cur = body[n]!;
+    if (n > 0) text += cur === '' || body[n - 1] === '' ? '\n' : ' ';
+    text += cur;
+  }
+  return text.replace(/\n\n/g, '\n');
 }
 
 function unquote(s: string): string {
