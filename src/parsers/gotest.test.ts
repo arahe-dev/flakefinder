@@ -110,7 +110,8 @@ describe('goTestParser', () => {
     expect(results[0]?.message).toBe('something logged');
   });
 
-  it('lets the last terminal action win for a repeated test', () => {
+  it('a repeated test that failed once is NOT reported as a plain pass (r5 #2)', () => {
+    // previously "last terminal action wins" turned fail→pass into a clean pass
     const content = [
       '{"Action":"run","Package":"p","Test":"T"}',
       '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.01}',
@@ -118,11 +119,13 @@ describe('goTestParser', () => {
     ].join('\n');
     const { results } = goTestParser.parse(content, 'inline');
     expect(results).toHaveLength(1);
-    expect(results[0]).toMatchObject({ status: 'pass', durationMs: 20 });
+    expect(results[0]).toMatchObject({ status: 'fail', durationMs: 10 });
+    expect(results[0]!.message).toBe('flaky: failed 1 of 2 runs in this report');
   });
 
   it('reports at most 5 malformed lines then a summary', () => {
-    const lines = Array.from({ length: 7 }, (_, i) => `garbage line ${i} {{`);
+    // JSON-looking lines that fail to parse (plain-text lines are summarised separately, r5 #4)
+    const lines = Array.from({ length: 7 }, (_, i) => `{garbage line ${i} {{`);
     lines.push('{"Action":"pass","Package":"p","Test":"Ok","Elapsed":0.001}');
     const { results, warnings } = goTestParser.parse(lines.join('\n'), 'inline');
     expect(results).toHaveLength(1);
@@ -210,5 +213,187 @@ describe('go parser robustness (review round)', () => {
     const { results } = goTestParser.parse(content, 'mixed.jsonl');
     expect(results).toHaveLength(1); // dangling TestA only, no (package) row
     expect(results[0]!.name).toBe('TestA');
+  });
+});
+
+// go-count2.jsonl: REAL `go test -json -count=2 ./flaky` output (go 1.23.4).
+// TestFlaky fails on the first run and passes on the second; TestTable has a
+// failing subtest; TestParentOwnFailure fails itself after a passing child.
+describe('go test -count=N (r5 #2)', () => {
+  it('does not erase a failure that a later repeated run passed', () => {
+    const { results, warnings } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const flaky = results.find((r) => r.name === 'TestFlaky')!;
+    expect(flaky.status).toBe('fail');
+    expect(flaky.message).toMatch(/^flaky: failed 1 of 2 runs/);
+    expect(flaky.message).toContain('first attempt fails: got 1, want 2');
+    // the passing run's output is not glued onto the failing run's
+    expect(flaky.message).not.toContain('marker present');
+    expect(warnings.some((w) => w.includes('1 test(s)') && w.includes('TestFlaky'))).toBe(true);
+  });
+
+  it('keeps per-run output: a stable test reports one run, not both concatenated', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const stable = results.find((r) => r.name === 'TestStable')!;
+    expect(stable.status).toBe('pass');
+    expect(stable.message?.match(/=== RUN/g)).toHaveLength(1);
+    expect(stable.message?.match(/always fine/g)).toHaveLength(1);
+  });
+
+  it('failing on every repeated run is a plain failure (no flaky note, no warning)', () => {
+    const content = [
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"boom 1\\n"}',
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.01}',
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"boom 2\\n"}',
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.02}',
+    ].join('\n');
+    const { results, warnings } = goTestParser.parse(content, 'inline');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ status: 'fail', message: 'boom 1' });
+    expect(warnings).toEqual([]);
+  });
+});
+
+describe('go subtest parents (r5 #3)', () => {
+  it('does not emit parents whose failure is just their subtest failing', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const names = results.map((r) => r.name);
+    expect(names).toEqual([
+      'TestFlaky',
+      'TestStable',
+      'TestTable/one',
+      'TestTable/two',
+      'TestParentOwnFailure',
+      'TestParentOwnFailure/child',
+    ]);
+    // the failing child is the one failure — no duplicate on TestTable
+    expect(results.filter((r) => r.status === 'fail').map((r) => r.name)).toEqual([
+      'TestFlaky',
+      'TestTable/two',
+      'TestParentOwnFailure',
+    ]);
+  });
+
+  it('keeps a parent that failed on its own, with no failing child', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const parent = results.find((r) => r.name === 'TestParentOwnFailure')!;
+    expect(parent.status).toBe('fail');
+    expect(parent.message).toContain('parent assertion after children');
+  });
+
+  it('suppresses passing parents and intermediate levels of nested subtests', () => {
+    const ev = (action: string, test: string) =>
+      JSON.stringify({ Action: action, Package: 'p', Test: test });
+    const content = [
+      ev('run', 'TestA'),
+      ev('run', 'TestA/b'),
+      ev('run', 'TestA/b/c'),
+      ev('fail', 'TestA/b/c'),
+      ev('fail', 'TestA/b'),
+      ev('fail', 'TestA'),
+      ev('run', 'TestB'),
+      ev('run', 'TestB/x'),
+      ev('pass', 'TestB/x'),
+      ev('pass', 'TestB'),
+      ev('run', 'TestBravo'), // shares a prefix with TestB but is not its child
+      ev('pass', 'TestBravo'),
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'TestA/b/c:fail',
+      'TestB/x:pass',
+      'TestBravo:pass',
+    ]);
+  });
+});
+
+// go124-build-fail.jsonl: REAL `go test -json -count=2 ./...` from go 1.24.4 —
+// the stream OPENS with build-output/build-fail events (ImportPath, no Package)
+// for a package that does not compile.
+// go-stderr-merged.jsonl: REAL go 1.23.4 `go test -json ./broken 2>&1` — the
+// compiler's stderr lands BEFORE the first JSON event.
+describe('go sniff + build failures (r5 #4)', () => {
+  it('sniffs streams that open with build events or stray stderr lines', () => {
+    expect(goTestParser.sniff(load('go124-build-fail.jsonl'))).toBe(true);
+    expect(goTestParser.sniff(load('go-stderr-merged.jsonl'))).toBe(true);
+    expect(
+      goTestParser.sniff('{"ImportPath":"p [p.test]","Action":"build-output","Output":"# p\\n"}'),
+    ).toBe(true);
+    // still rejects non-go content and JSON without the event keys
+    expect(goTestParser.sniff('# just a comment\nnot json\n')).toBe(false);
+    expect(goTestParser.sniff('{"Output":"x"}\n{"Action":"pass"}')).toBe(false);
+  });
+
+  it('surfaces go 1.24 build-fail events as a warning and in the (package) error', () => {
+    const { results, warnings } = goTestParser.parse(
+      load('go124-build-fail.jsonl'),
+      'go124-build-fail.jsonl',
+    );
+    const pkg = results.find((r) => r.suite === 'example.com/ffdemo/broken')!;
+    expect(pkg).toMatchObject({ name: '(package)', status: 'error' });
+    expect(pkg.message).toContain('undefined: undefinedThing');
+    const build = warnings.filter((w) => w.includes('build failed'));
+    expect(build).toHaveLength(1);
+    expect(build[0]).toContain('example.com/ffdemo/broken');
+    expect(build[0]).toContain('undefined: undefinedThing');
+    // the build failure is reported once, not again as a generic "(package)" warning
+    expect(warnings.some((w) => w.includes('failed with no test results'))).toBe(false);
+    expect(warnings.some((w) => w.includes('invalid JSON'))).toBe(false);
+    // the compiling package's tests still parse
+    expect(results.find((r) => r.name === 'TestStable')).toMatchObject({ status: 'pass' });
+  });
+
+  it('turns leading stderr text into one warning instead of invalid-JSON noise', () => {
+    const { results, warnings } = goTestParser.parse(
+      load('go-stderr-merged.jsonl'),
+      'go-stderr-merged.jsonl',
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ name: '(package)', status: 'error' });
+    expect(warnings.some((w) => w.includes('invalid JSON'))).toBe(false);
+    const text = warnings.find((w) => w.includes('non-JSON'));
+    expect(text).toContain('2 non-JSON line(s)');
+    expect(text).toContain('undefined: undefinedThing');
+  });
+});
+
+// go-bench-pass.jsonl / go-bench.jsonl: REAL `go test -json -bench=.` (QA
+// fixtures, go 1.23). test2json emits NO terminal `pass` for a benchmark —
+// only its result line (`BenchmarkX-4  10  21.00 ns/op`) — while a failing
+// benchmark does get `fail`.
+describe('go benchmarks (QA PAR-2)', () => {
+  it('passing benchmarks are passes, not "never reported a result" errors', () => {
+    const { results, warnings } = goTestParser.parse(load('go-bench-pass.jsonl'), 'bench.jsonl');
+    expect(warnings).toEqual([]);
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'TestA:pass',
+      'ExampleHello:pass',
+      'BenchmarkX:pass',
+      'BenchmarkSub/size=10:pass',
+    ]);
+    expect(results[2]!.message).toContain('ns/op');
+  });
+
+  it('a failing benchmark still fails; its passing siblings do not turn into errors', () => {
+    const { results, warnings } = goTestParser.parse(load('go-bench.jsonl'), 'bench.jsonl');
+    expect(warnings).toEqual([]);
+    expect(Object.fromEntries(results.map((r) => [r.name, r.status]))).toEqual({
+      TestA: 'pass',
+      ExampleHello: 'pass',
+      BenchmarkX: 'pass',
+      'BenchmarkSub/size=10': 'pass',
+      BenchmarkFails: 'fail',
+    });
+  });
+
+  it('a benchmark that crashed (no result line, package failed) is still an error', () => {
+    const content = [
+      '{"Action":"run","Package":"p","Test":"BenchmarkBoom"}',
+      '{"Action":"output","Package":"p","Test":"BenchmarkBoom","Output":"panic: boom\\n"}',
+      '{"Action":"fail","Package":"p","Elapsed":0.01}',
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    expect(results[0]).toMatchObject({ name: 'BenchmarkBoom', status: 'error' });
   });
 });

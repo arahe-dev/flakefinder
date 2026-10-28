@@ -334,10 +334,29 @@ These are stable and scriptable — gate CI on `run`'s exit code directly.
 ## Report formats
 
 Supported parsers (auto-detected per file): **JUnit XML** (pytest, jest-junit,
-surefire…), **Jest JSON** (jest + vitest), **Mocha JSON**, **`go test -json`**
-(NDJSON), **TAP** (node:test `--test-reporter=tap`; nested subtests become
-`ancestor > …` suites, `# SKIP`/`# TODO` map to skip), and **TRX**
-(.NET `dotnet test --logger trx`; suite = the test class name).
+surefire…; a Surefire rerun that passed after `<flakyFailure>`/`<flakyError>`,
+or a pytest-rerunfailures rerun, stays a pass but is flagged with a
+`flaky: failed k of n attempts` message and a warning; `<skipped>` +
+`<failure>` (a failing TODO) is a skip), **Jest JSON** (jest + vitest; a test that passed only on a retry —
+`retryTimes`/vitest `retry` — stays a pass flagged `flaky: failed k of n
+attempts` plus a warning, as does a mocha test with `currentRetry` > 0; a file that failed outside any test — e.g.
+an `afterAll` that threw — is recorded as a `(suite)` failure), **Mocha JSON** (`--reporter json` or mochawesome; statuses matched
+per file + full title; a failing `before`/`after` hook is recorded as a
+failure named e.g. `"before all" hook`), **`go test -json`**
+(NDJSON; with `-count=N` a test that failed in any run is reported as a fail,
+noted `flaky: failed k of n runs` when other runs passed; a parent test with
+`t.Run` subtests is only reported when it failed on its own; build failures —
+go 1.24 `build-fail` events or compiler errors on merged stderr — become
+warnings), **TAP** (node:test `--test-reporter=tap`, plain TAP13/14, and headerless
+TAP12 from Perl/prove/bats when every line is TAP-shaped; nested
+subtests — by indentation, with or without `# Subtest:` headers — become
+`ancestor > …` suites, a parent is only reported when it failed on its own,
+`# SKIP`/`# TODO` map to skip, multi-line YAML `error: |-` diagnostics and
+`duration_ms` are read), and **TRX**
+(.NET `dotnet test --logger trx`; suite = the test class name, joined by
+test id so same-named methods in different classes stay distinct;
+Timeout → fail, Error/Aborted → error, NotExecuted/Inconclusive → skip;
+data-driven rows are reported individually).
 
 - **table** — sections per classification (`FLAKY (confirmed)`,
   `FLAKY (retry-rescued)`, `FLAKY (suspected)`, `FAILING`, `NEW FAILURE`),
