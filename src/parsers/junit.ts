@@ -11,8 +11,20 @@
  * - suite  = @_classname when present, else the nearest enclosing testsuite's @_name
  * - status = fail (child <failure>) | error (child <error>) | skip (child <skipped>) | pass
  * - durationMs = round(@_time * 1000) when @_time parses as a finite number, else null
- * - message = failure/error @_message or its text content, trimmed to 500 chars
+ * - message = failure/error @_message or its text content, trimmed to 2000 chars
  * - stack   = failure/error text content, trimmed to 1000 chars
+ *
+ * Maven Surefire/Failsafe reruns (`-Dsurefire.rerunFailingTestsCount=N`):
+ * - `<flakyFailure>`/`<flakyError>` on a testcase without `<failure>`/`<error>`
+ *   means it failed, was re-run, and finally passed. The result stays 'pass'
+ *   (that is the build's verdict, and `flakefinder run` must not turn a green
+ *   build red), but the message records "flaky: failed k of n attempts" with
+ *   the first failure's message/stackTrace, and one warning per file lists
+ *   the affected tests. The parser output has no attempt dimension and the
+ *   engine collapses same-testId results within a run (last wins), so extra
+ *   'fail' rows could not carry the signal — see the parser report notes.
+ * - `<rerunFailure>`/`<rerunError>` next to `<failure>`/`<error>`: it failed on
+ *   every attempt — still 'fail'/'error', message notes the attempt count.
  *
  * Never throws: malformed input produces warnings.
  */
@@ -23,10 +35,17 @@ import { errorMessage, isObj, stripBom, trimTo } from './internal.js';
 
 const xml = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
+const MESSAGE_MAX_CHARS = 2000;
+const STACK_MAX_CHARS = 1000;
+/** How many flaky test names one Surefire warning lists before summarising. */
+const MAX_FLAKY_NAMES = 10;
+
 interface Ctx {
   sourcePath: string;
   results: TestCaseResult[];
   warnings: string[];
+  /** `suite.name` of tests that passed only after a Surefire rerun. */
+  flaky: string[];
 }
 
 /** Attribute value as a non-empty string (whitespace-only counts as absent). */
@@ -50,6 +69,23 @@ function durationOf(timeAttr: string | undefined): number | null {
   if (timeAttr === undefined) return null;
   const seconds = Number.parseFloat(timeAttr);
   return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : null;
+}
+
+/** message attribute, else text content, else the Surefire `<stackTrace>` child's text. */
+function detailMessage(detail: unknown): string | undefined {
+  const fromAttr = isObj(detail) ? attr(detail, '@_message') : undefined;
+  return trimTo(fromAttr, MESSAGE_MAX_CHARS) ?? trimTo(detailStack(detail), MESSAGE_MAX_CHARS);
+}
+
+/** Text content, else the Surefire `<stackTrace>` child (rerun/flaky elements nest it). */
+function detailStack(detail: unknown): string | undefined {
+  const text = textOf(detail);
+  if (text !== undefined && text.trim() !== '') return text;
+  if (isObj(detail)) {
+    const nested = children(detail, 'stackTrace')[0];
+    return textOf(nested);
+  }
+  return undefined;
 }
 
 function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
@@ -81,11 +117,32 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
     durationMs: durationOf(attr(tc, '@_time')),
   };
   if (detail !== undefined) {
-    const detailMessage = isObj(detail) ? attr(detail, '@_message') : undefined;
-    const message = trimTo(detailMessage, 2000) ?? trimTo(textOf(detail), 2000);
-    const stack = trimTo(textOf(detail), 1000);
+    const message = detailMessage(detail);
+    const stack = trimTo(textOf(detail), STACK_MAX_CHARS);
     if (message !== undefined) result.message = message;
     if (stack !== undefined) result.stack = stack;
+  }
+
+  // Surefire rerun evidence (see the header comment for the representation).
+  const reruns = [...children(tc, 'rerunFailure'), ...children(tc, 'rerunError')];
+  const flakes = [...children(tc, 'flakyFailure'), ...children(tc, 'flakyError')];
+  if ((status === 'fail' || status === 'error') && reruns.length > 0) {
+    const note = `(Surefire: failed all ${reruns.length + 1} attempts)`;
+    result.message = trimTo(
+      result.message !== undefined ? `${result.message}\n${note}` : note,
+      MESSAGE_MAX_CHARS,
+    );
+  } else if (status === 'pass' && flakes.length > 0) {
+    const first = flakes[0];
+    const firstMessage = detailMessage(first);
+    const header = `flaky: failed ${flakes.length} of ${flakes.length + 1} attempts before passing on Surefire rerun`;
+    result.message = trimTo(
+      firstMessage !== undefined ? `${header} — first failure: ${firstMessage}` : header,
+      MESSAGE_MAX_CHARS,
+    );
+    const stack = trimTo(detailStack(first), STACK_MAX_CHARS);
+    if (stack !== undefined) result.stack = stack;
+    ctx.flaky.push(`${suite}.${name}`);
   }
   ctx.results.push(result);
 }
@@ -126,7 +183,7 @@ export const junitParser: ReportParser = {
   },
 
   parse(content: string, sourcePath: string): { results: TestCaseResult[]; warnings: string[] } {
-    const ctx: Ctx = { sourcePath, results: [], warnings: [] };
+    const ctx: Ctx = { sourcePath, results: [], warnings: [], flaky: [] };
     const body = stripBom(content);
 
     if (body.trim() === '') {
@@ -165,6 +222,16 @@ export const junitParser: ReportParser = {
       return { results: ctx.results, warnings: ctx.warnings };
     }
     walk(root, 'unknown', ctx);
+    if (ctx.flaky.length > 0) {
+      const shown = ctx.flaky.slice(0, MAX_FLAKY_NAMES).join(', ');
+      const more =
+        ctx.flaky.length > MAX_FLAKY_NAMES
+          ? ` …and ${ctx.flaky.length - MAX_FLAKY_NAMES} more`
+          : '';
+      ctx.warnings.push(
+        `junit: ${sourcePath}: ${ctx.flaky.length} test(s) FLAKY — failed, then passed on Surefire rerun (recorded as pass with the failure in the message): ${shown}${more}`,
+      );
+    }
     return { results: ctx.results, warnings: ctx.warnings };
   },
 };

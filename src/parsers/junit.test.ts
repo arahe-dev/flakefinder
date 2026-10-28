@@ -208,3 +208,44 @@ describe('duplicate roots (QA B-F6)', () => {
     expect(warnings.some((w) => w.includes('multiple <testsuites> roots'))).toBe(true);
   });
 });
+
+describe('Surefire reruns (r5 #1)', () => {
+  it('keeps the flaky signal of flakyFailure/flakyError instead of a plain pass', () => {
+    const { results, warnings } = junitParser.parse(
+      load('junit-surefire-reruns.xml'),
+      'junit-surefire-reruns.xml',
+    );
+    expect(results).toHaveLength(4);
+    const byName = new Map(results.map((r) => [r.name, r]));
+
+    // never-failed test stays a plain pass with no message
+    expect(byName.get('addsItem')).toMatchObject({ status: 'pass' });
+    expect(byName.get('addsItem')).not.toHaveProperty('message');
+
+    // final outcome is pass (the build was green), but the earlier failure survives
+    const discount = byName.get('appliesDiscount')!;
+    expect(discount.status).toBe('pass');
+    expect(discount.message).toContain('flaky');
+    expect(discount.message).toContain('failed 1 of 2 attempts');
+    expect(discount.message).toContain('expected: <90> but was: <100>');
+    expect(discount.stack).toContain('CartTest.java:42');
+
+    const sync = byName.get('syncsInventory')!;
+    expect(sync.status).toBe('pass');
+    expect(sync.message).toContain('failed 2 of 3 attempts');
+    expect(sync.message).toContain('Connection refused');
+
+    // failed on every rerun: still a failure, with the attempt count noted
+    const checkout = byName.get('checksOut')!;
+    expect(checkout.status).toBe('fail');
+    expect(checkout.message).toContain('total mismatch');
+    expect(checkout.message).toContain('failed all 3 attempts');
+
+    // the flake is called out loudly — warnings are what the CLI prints
+    const flakyWarning = warnings.find((w) => w.includes('Surefire rerun'));
+    expect(flakyWarning).toBeDefined();
+    expect(flakyWarning).toContain('com.example.CartTest.appliesDiscount');
+    expect(flakyWarning).toContain('com.example.CartTest.syncsInventory');
+    expect(warnings).toHaveLength(1);
+  });
+});
