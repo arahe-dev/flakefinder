@@ -163,7 +163,7 @@ accordingly.
 ### `ingest`
 
 ```console
-$ npx flakefinder ingest [files…] [--attempt <n>] [--source <live|report|action>]
+$ npx flakefinder ingest [files…] [--attempt <n>] [--source <live|report|action>] [--run-id <id>]
 ```
 
 Parses report files into the history store without running anything. With no
@@ -173,12 +173,21 @@ per file from content.
 - `--attempt <n>` — attempt number to record (default 1; an integer
   1–1000000). Useful for reconstructing a retry sequence from CI artifacts.
 - `--source <source>` — provenance tag stored on the run (default `report`).
+- `--run-id <id>` — reuse one `runId` across several `ingest` invocations, so
+  a fail on `--attempt 1` followed by a pass on `--attempt 2` counts as a
+  retry rescue exactly as it would under `run` (+40 score; `flaky-retry`, or
+  `flaky-confirmed` when the same commit also flipped). Use one id per
+  CI job (e.g. `--run-id "$GITHUB_RUN_ID"` or a `uuidgen`); it must be at
+  least 10 characters of hex digits and dashes (a UUID or a numeric CI run
+  id), otherwise `ingest` exits `2`.
 
-**Same-runId note:** each `ingest` invocation creates its **own** `runId`.
-Retry-rescue classification (`flaky-retry`) requires attempts 1→2 to share a
-runId, which only `run` produces. Two separate `ingest` calls can still flag a
-flake — via the same-commit-flip rule — but it will classify as
-`flaky-confirmed` rather than `flaky-retry`. Exits `2` if nothing matched.
+**Same-runId note:** without `--run-id`, each `ingest` invocation creates its
+**own** `runId`. Retry-rescue detection requires attempts 1→2 to share a runId
+— which `run` does automatically, and `ingest` does only when you pass the
+same `--run-id` to each call. Separate `ingest` calls without it can still flag
+a flake in a git repo — via the same-commit-flip rule (`flaky-confirmed`) — but
+without the retry-rescue evidence; outside git they cannot flag it at all.
+Exits `2` if nothing matched.
 
 ### `report`
 
