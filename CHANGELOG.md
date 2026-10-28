@@ -1,25 +1,74 @@
-## 1.1.0
-
-- **feat: TAP parser** — `node --test --test-reporter=tap` (fixture verified
-  against real node 22 output) and generic TAP14. Nested subtests become
-  `ancestor > …` suites; `# SKIP`/`# TODO` directives map to skip; YAML
-  diagnostic blocks are harvested for failure messages/stacks; suite
-  aggregates are de-duplicated against their children so failures never
-  double-count.
-- **feat: TRX parser** — .NET `dotnet test` results. Suite = the test class
-  (`TestMethod/@className`), `duration` (`HH:MM:SS.f`) parsed to ms,
-  `ErrorInfo` → error status with message/stack, `NotExecuted` → skip.
-- **feat: GitLab MR notes** — on GitLab CI, `flakefinder ci` upserts one
-  marker-scoped merge-request note (env-driven: `GITLAB_TOKEN`,
-  `CI_MERGE_REQUEST_IID`); posting failures never fail the job.
-- Parsers are now six: JUnit XML, Jest JSON, Mocha JSON, `go test -json`,
-  TAP, TRX.
-
-## 1.0.0
-
-- _(fill in before tagging — this stub is created by scripts/release.mjs)_
-
 # Changelog
+
+## 1.1.1
+
+Bug-fix release from QA round 4. No new features; one stricter-input change
+(numeric flags) and one exit-code change (unstartable commands → 2).
+
+**Runner (`run`)**
+
+- **fix: retry re-record semantics** — retry attempts re-record *every*
+  matched report, even byte-identical ones: a fail-fail-pass sequence with a
+  deterministic report is now detected as a retry rescue (attempt 1 still
+  skips stale pre-existing reports).
+- **fix: unstartable command exits 2, not 1** — `run -- not-installed` used
+  to retry and exit 1 like a test failure; it now stops after attempt 1 with
+  `command not found: …`, records nothing, and exits 2 (usage/environment
+  error). A test command that itself exits 2 or 127 is unaffected.
+
+**Engine**
+
+- **fix: runId-grouped chronological ordering** — retry pairs are no longer
+  split by same-timestamp interleaving across runs, which silently lost
+  retry rescues.
+
+**History store**
+
+- **fix: prune concurrency** — `prune` re-reads the store fresh under the
+  write lock (and decides its early return from that fresh count), so a
+  concurrent writer's appends are no longer deleted.
+- **fix: read paths never create directories** — `report`/`doctor` on a
+  missing store leave nothing behind; write paths create the store dir
+  before taking the lock.
+- **fix: `history.jsonl` as a directory (EISDIR) / unreadable (EACCES)** —
+  reads degrade to an empty history with a warning; writes fail with an
+  error naming the path instead of a raw `EISDIR`; `doctor` reports FAIL.
+
+**CLI**
+
+- **fix: `init --runner`** is validated against the runner enum.
+- **fix: `ingest r.xml r.xml`** no longer double-counts — explicit files are
+  resolved, then deduplicated.
+- **fix: strict numeric flags** — `-R/--retries` (0–10), `--timeout`
+  (1–2147483 s), `ingest --attempt` (1–1000000) and `report --threshold`
+  (0–100) reject `2.5`, `2x`, `50abc`, `abc`, `0`/negatives where invalid,
+  with an error naming the flag and range (exit 2). `-R 50` now blames the
+  flag, not the config.
+- **fix: usage errors print once** (commander's message was repeated).
+
+**Doctor**
+
+- **fix: resilience** — a corrupt quarantine file is a FAIL instead of a
+  crash; the git probe is bounded by a 5 s timeout; an unreadable history
+  store is a FAIL (exit 1) instead of `ok "0 run(s)"`.
+
+**Parsers**
+
+- **fix: TAP `t.test()` parents** no longer double-emit (children-count
+  aggregate detection, verified against real output).
+- **fix: TAP directives** (`# SKIP`/`# TODO`) are case-insensitive per spec;
+  node's backslash-escaped `#` in names is unescaped consistently.
+- **fix: mocha** parses the passes/failures-only JSON shape the sniffer
+  already accepted.
+- **fix: TRX** day-inclusive durations (`d.hh:mm:ss.f`); duplicate XML roots
+  (JUnit/TRX) warn and use the first root instead of yielding zero results.
+
+**Docs**
+
+- USAGE: `doctor` section and exit-code rows, run re-record semantics,
+  `ingest --run-id`, numeric flag ranges, unstartable-command exit code,
+  unreadable-store behavior, and the symlink/junction limitation of report
+  globs (deliberate, for cycle safety).
 
 ## 1.1.0
 
