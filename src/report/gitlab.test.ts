@@ -37,45 +37,68 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
 describe('upsertMrNote', () => {
   const gl = gitlabEnvFromProcess(ENV)!;
   const URL = 'https://gitlab.example/api/v4/projects/42/merge_requests/7/notes?per_page=100';
+  const ME = { id: 77, username: 'flakefinder-bot' };
+
+  /** Routes GET /user and GET notes; everything else answers `write`. */
+  function mock(
+    notes: unknown,
+    write: Response = jsonResponse({ id: 2 }, true, 201),
+  ): { impl: typeof fetch; calls: Array<{ url: string; init?: RequestInit }> } {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      if (String(url).endsWith('/api/v4/user')) return jsonResponse(ME);
+      if (!init?.method || init.method === 'GET') return jsonResponse(notes);
+      return write;
+    }) as typeof fetch;
+    return { impl, calls };
+  }
 
   it('creates a note when none exists', async () => {
-    const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const impl = (async (url: string | URL, init?: RequestInit) => {
-      calls.push({ url: String(url), init });
-      if (calls.length === 1) return jsonResponse([{ id: 1, body: 'other bot' }]);
-      return jsonResponse({ id: 2 }, true, 201);
-    }) as typeof fetch;
+    const { impl, calls } = mock([{ id: 1, body: 'other bot', author: { id: 5 } }]);
     const verdict = await upsertMrNote(gl, '<!-- flakefinder:report -->\nhi', impl);
     expect(verdict).toBe('created');
-    expect(calls[0]!.url).toBe(URL);
-    expect(calls[1]!.init?.method).toBe('POST');
-    expect(JSON.parse(String(calls[1]!.init?.body)).body).toContain('flakefinder:report');
+    const post = calls.find((c) => c.init?.method === 'POST')!;
+    expect(post.url).toBe(URL);
+    expect(JSON.parse(String(post.init?.body)).body).toContain('flakefinder:report');
   });
 
-  it('updates the existing flakefinder note (marker-scoped)', async () => {
-    const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const impl = (async (url: string | URL, init?: RequestInit) => {
-      calls.push({ url: String(url), init });
-      if (calls.length === 1) {
-        return jsonResponse([
-          { id: 1, body: 'unrelated' },
-          { id: 9, body: 'x <!-- flakefinder:report --> y' },
-        ]);
-      }
-      return jsonResponse({ id: 9 });
-    }) as typeof fetch;
+  it('updates the existing flakefinder note (marker-scoped, own author)', async () => {
+    const { impl, calls } = mock(
+      [
+        { id: 1, body: 'unrelated', author: { id: 77 } },
+        { id: 9, body: 'x <!-- flakefinder:report --> y', author: { id: 77 } },
+      ],
+      jsonResponse({ id: 9 }),
+    );
     const verdict = await upsertMrNote(gl, 'new body', impl);
     expect(verdict).toBe('updated');
-    expect(calls[1]!.url).toContain('/notes/9');
-    expect(calls[1]!.init?.method).toBe('PUT');
+    const put = calls.find((c) => c.init?.method === 'PUT')!;
+    expect(put.url).toContain('/notes/9');
+  });
+
+  it("never updates a marker planted in someone else's note (R5 #10)", async () => {
+    const { impl, calls } = mock([
+      { id: 3, body: '<!-- flakefinder:report --> planted', author: { id: 1234 } },
+    ]);
+    expect(await upsertMrNote(gl, 'body', impl)).toBe('created');
+    expect(calls.some((c) => c.init?.method === 'PUT')).toBe(false);
+  });
+
+  it('reports non-2xx writes with the HTTP status (R5 #10)', async () => {
+    const warnings: string[] = [];
+    const { impl } = mock([], new Response('nope', { status: 422 }));
+    expect(await upsertMrNote(gl, 'b', impl, (m) => warnings.push(m))).toBe('unavailable');
+    expect(warnings.join('\n')).toContain('HTTP 422');
   });
 
   it('returns unavailable (never throws) on API errors or network failures', async () => {
+    const quiet = (): void => {};
     const failing = (async () => jsonResponse([], false, 403)) as unknown as typeof fetch;
-    expect(await upsertMrNote(gl, 'x', failing)).toBe('unavailable');
+    expect(await upsertMrNote(gl, 'x', failing, quiet)).toBe('unavailable');
     const throwing = (async () => {
       throw new Error('network down');
     }) as unknown as typeof fetch;
-    expect(await upsertMrNote(gl, 'x', throwing)).toBe('unavailable');
+    expect(await upsertMrNote(gl, 'x', throwing, quiet)).toBe('unavailable');
   });
 });
