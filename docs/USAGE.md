@@ -129,8 +129,11 @@ observed in this invocation.
 - `--timeout <seconds>` — kill the attempt (whole process tree) after N
   seconds (an integer 1–2147483); the attempt counts as failed (exit 124, GNU-timeout convention)
   and the retry loop proceeds. Default: config `timeoutSeconds`, itself
-  unlimited. SIGINT/SIGTERM (Ctrl-C) kill the current tree, stop the loop,
-  and exit 130 while keeping everything observed so far in history.
+  unlimited. SIGINT/SIGTERM (Ctrl-C) are forwarded to the current tree, stop
+  the loop, and exit 130 while keeping everything observed so far in history.
+  On POSIX each attempt runs in its own process group (that is how the whole
+  tree is reached), so when stdin is a terminal the test command gets an empty
+  stdin — interactive/watch modes are not supported under `run`.
 - `--retry-mode auto|failed|full` — retry strategy (default: config `retryMode`,
   itself default `auto`). `auto`: attempt 1 runs everything; each re-run
   executes **only the tests that failed on the previous attempt** (a test that

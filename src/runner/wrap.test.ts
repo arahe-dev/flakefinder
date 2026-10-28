@@ -755,3 +755,74 @@ process.exit(1);
     expect(argv3[1]).not.toContain('recovers');
   }, 60_000);
 });
+
+describe('process-tree kill (R5 bug 5)', () => {
+  // parent.js spawns a grandchild (stdio ignored, so the attempt can close
+  // even if the grandchild survives) and records its pid, then hangs
+  const PARENT = `
+const { spawn } = require('child_process');
+const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+require('fs').writeFileSync('gc.pid', String(gc.pid));
+setInterval(() => {}, 1000);
+`;
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const waitDead = async (pid: number): Promise<boolean> => {
+    for (let i = 0; i < 40 && alive(pid); i++) await new Promise((r) => setTimeout(r, 50));
+    return !alive(pid);
+  };
+  const waitFile = async (file: string): Promise<void> => {
+    for (let i = 0; i < 200 && !existsSync(file); i++) await new Promise((r) => setTimeout(r, 25));
+  };
+
+  it('a timeout kills grandchildren too, not just the direct child', async () => {
+    if (process.platform === 'win32') return;
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'parent.js'), PARENT, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let gcPid = 0;
+    try {
+      const result = await runLive(['node', 'parent.js'], cfg({ reports: [], timeoutSeconds: 1 }), {
+        retries: 0,
+        cwd,
+        applyQuarantine: false,
+      });
+      gcPid = Number(readFileSync(path.join(cwd, 'gc.pid'), 'utf8'));
+      expect(result.finalExitCode).toBe(1);
+      expect(await waitDead(gcPid)).toBe(true);
+    } finally {
+      if (gcPid && alive(gcPid)) process.kill(gcPid, 'SIGKILL');
+    }
+  }, 30_000);
+
+  it('SIGINT forwards to the whole tree, stops the loop and exits 130', async () => {
+    if (process.platform === 'win32') return;
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'parent.js'), PARENT, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let gcPid = 0;
+    try {
+      const pending = runLive(['node', 'parent.js'], cfg({ reports: [] }), {
+        retries: 2,
+        cwd,
+        applyQuarantine: false,
+      });
+      await waitFile(path.join(cwd, 'gc.pid'));
+      gcPid = Number(readFileSync(path.join(cwd, 'gc.pid'), 'utf8'));
+      process.emit('SIGINT', 'SIGINT');
+      const result = await pending;
+      expect(result.finalExitCode).toBe(130);
+      expect(await waitDead(gcPid)).toBe(true);
+    } finally {
+      if (gcPid && alive(gcPid)) process.kill(gcPid, 'SIGKILL');
+    }
+  }, 30_000);
+});

@@ -114,17 +114,49 @@ export function insertRunnerArgs(command: string[], args: string[]): string[] {
  * shell-quoted EXCEPT operator tokens — so user values with metacharacters
  * (e.g. `w1&&w2`) and injected regex patterns (with `^!()`) survive cmd.exe.
  */
-/** Kill a child and its whole process tree, cross-platform. */
-function killTree(child: ReturnType<typeof spawn>): void {
+/**
+ * POSIX: every attempt runs in its OWN process group (spawn `detached`), so a
+ * timeout or Ctrl-C can signal the whole tree — `npm` → `sh` → `jest` →
+ * workers — not just the direct child (killing only `npm` orphans the rest,
+ * which keep running and, holding the inherited stdio, keep the attempt from
+ * ever closing). Windows has no process groups; taskkill /T walks the tree.
+ */
+const USE_PROCESS_GROUP = process.platform !== 'win32';
+
+/** Send `signal` to the child's process group, falling back to the child alone. */
+function signalTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
+  if (USE_PROCESS_GROUP) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // group already gone (ESRCH) or not ours — try the direct child
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // already exited
+  }
+}
+
+/**
+ * Kill a child and its whole process tree, cross-platform. POSIX sends
+ * `signal` (SIGTERM for timeouts; Ctrl-C forwards SIGINT so runners can
+ * clean up) to the process group, escalating to SIGKILL after 3s.
+ */
+function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = 'SIGTERM'): void {
   if (child.pid === undefined) return;
   if (process.platform === 'win32') {
     // child.kill() only reaches the direct process — cmd chains survive it
-    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-  } else {
-    child.kill('SIGTERM');
-    const escalated = setTimeout(() => child.kill('SIGKILL'), 3000);
-    escalated.unref();
+    const r = spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    if (r.error || r.status !== 0) child.kill();
+    return;
   }
+  signalTree(child, signal);
+  const escalated = setTimeout(() => signalTree(child, 'SIGKILL'), 3000);
+  escalated.unref();
 }
 
 /**
@@ -159,7 +191,18 @@ function spawnCommand(
       let timedOut = false;
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(argv[0]!, argv.slice(1), { shell: useShell, cwd, stdio: 'inherit' });
+        child = spawn(argv[0]!, argv.slice(1), {
+          shell: useShell,
+          cwd,
+          detached: USE_PROCESS_GROUP,
+          // a background process group that reads the terminal is stopped
+          // (SIGTTIN) — test runs get EOF on stdin instead of hanging
+          stdio: [
+            USE_PROCESS_GROUP && process.stdin.isTTY ? 'ignore' : 'inherit',
+            'inherit',
+            'inherit',
+          ],
+        });
       } catch (err) {
         // synchronous EINVAL for Windows batch shims without a shell
         if (!useShell) {
@@ -276,9 +319,11 @@ export async function runLive(
   const maxAttempts = Math.max(1, opts.retries + 1);
   const currentChild: { ref: ReturnType<typeof spawn> | null } = { ref: null };
   let interrupted = false;
-  const onInterrupt = (): void => {
+  // the child runs in its own process group (POSIX), so the terminal's Ctrl-C
+  // reaches only us: forward the signal to the whole tree ourselves
+  const onInterrupt = (signal: NodeJS.Signals): void => {
     interrupted = true;
-    if (currentChild.ref) killTree(currentChild.ref);
+    if (currentChild.ref) killTree(currentChild.ref, signal);
   };
   process.on('SIGINT', onInterrupt);
   process.on('SIGTERM', onInterrupt);
