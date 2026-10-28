@@ -12,6 +12,7 @@ import { FLAKEFINDER_VERSION } from '../types.js';
 import { cacheKeys, recordBaseline, resolveBaseline } from './baseline.js';
 import { computeNewFlakes } from './diff.js';
 import { githubEnv, upsertPrComment } from './github.js';
+import { cacheUsable, restoreHistory, saveHistory } from './history-cache.js';
 import { ingestReports } from './ingest.js';
 import { newFlakesFailure, summaryRows } from './output.js';
 
@@ -42,12 +43,8 @@ async function actionMain(): Promise<void> {
   // 1. restore history cache (best-effort — miss on first run is normal).
   // Saved per run attempt + job, restored by prefix: see baseline.ts.
   const { saveKey, restoreKeys } = cacheKeys(gh);
-  try {
-    const hit = await cache.restoreCache([storeDir], saveKey, restoreKeys);
-    if (hit) core.info(`history cache restored from ${hit}`);
-  } catch (err) {
-    core.warning(`history cache restore failed (continuing): ${(err as Error).message}`);
-  }
+  const useCache = cacheUsable(cache, core);
+  if (useCache) await restoreHistory(cache, core, storeDir, saveKey, restoreKeys);
 
   // 2. pick the "previous verdicts" baseline BEFORE ingesting today's runs —
   // never this run's own earlier attempt (re-runs must not bypass the gate)
@@ -90,17 +87,7 @@ async function actionMain(): Promise<void> {
   recordBaseline(storeDir, gh.runId, previous);
 
   // 5. save history cache under this attempt's own key
-  // (@actions/cache reports most save failures by returning -1, not by throwing)
-  try {
-    const id = await cache.saveCache([storeDir], saveKey);
-    if (id === -1) {
-      core.warning(
-        `history cache was not saved under ${saveKey} (key taken — e.g. matrix legs of one job — or cache unavailable); this run's history will not carry over`,
-      );
-    }
-  } catch (err) {
-    core.warning(`history cache save failed: ${(err as Error).message}`);
-  }
+  if (useCache) await saveHistory(cache, core, storeDir, saveKey);
 
   // 6. outputs + summary
   const flakyCount = verdicts.filter((v) => v.classification.startsWith('flaky-')).length;
