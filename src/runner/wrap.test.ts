@@ -850,3 +850,48 @@ describe('corrupt quarantine file (R5 bug 9)', () => {
     ).toBe(true);
   }, 60_000);
 });
+
+describe('user-supplied name selector (R5 optional)', () => {
+  it('detects a selector the injected flag would override', async () => {
+    const { userSelectorClash } = await import('./wrap.js');
+    expect(userSelectorClash(['jest', '-t', 'foo'], ['-t', 'x'])).toBe(true);
+    expect(userSelectorClash(['jest', '--testNamePattern=foo'], ['-t', 'x'])).toBe(true);
+    expect(userSelectorClash(['mocha', '-g', 'foo'], ['--grep', 'x'])).toBe(true);
+    expect(userSelectorClash(['go', 'test', '-run=TestA', './...'], ['-run', 'x'])).toBe(true);
+    expect(userSelectorClash(['jest', '--ci'], ['-t', 'x'])).toBe(false);
+    expect(userSelectorClash(['pytest', '-k', 'foo'], ['--lf'])).toBe(false);
+    expect(userSelectorClash(['jest'], [])).toBe(false);
+    // a -t in a later shell segment belongs to another command
+    expect(userSelectorClash(['jest', '|', 'grep', '-t', 'x'], ['-t', 'x'])).toBe(false);
+  });
+
+  it('runLive warns once when the user command already has -t', async () => {
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'script.js'), SCRIPT_ALL_PASS, 'utf8');
+    writeFileSync(
+      path.join(cwd, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: 'x',
+            suite: 's.test.js',
+            name: 'q',
+            reason: 'flaky',
+            quarantinedAt: new Date().toISOString(),
+            flakeScore: 90,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runLive(['node', 'script.js', '-t', 'mine'], cfg({ runner: 'jest' }), {
+      retries: 0,
+      cwd,
+      applyQuarantine: true,
+    });
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('name selector'))).toHaveLength(1);
+  }, 60_000);
+});

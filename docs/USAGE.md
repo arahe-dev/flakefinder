@@ -154,7 +154,10 @@ names as space-delimited final segments of the full name (a failure named
 excluded from re-runs even on name collisions. pytest's `--lf` trusts pytest's
 own last-failed cache — a stale cache from a *manual* pytest run outside
 flakefinder could re-run a quarantined test once; clear it with
-`pytest --cache-clear` if that ever bites.
+`pytest --cache-clear` if that ever bites. If your command already passes
+its own name selector (`-t`/`--testNamePattern`, mocha `--grep`/`-g`, go
+`-run`), flakefinder warns once: its injected selector comes later and most
+runners keep only the last one.
 
 If quarantined entries exist and the runner supports exclusion, the exclusion
 flags are appended automatically (with a notice); see

@@ -317,6 +317,7 @@ export async function runLive(
   const maxAttempts = Math.max(1, opts.retries + 1);
   const currentChild: { ref: ReturnType<typeof spawn> | null } = { ref: null };
   let interrupted = false;
+  let warnedSelectorClash = false;
   // the child runs in its own process group (POSIX), so the terminal's Ctrl-C
   // reaches only us: forward the signal to the whole tree ourselves
   const onInterrupt = (signal: NodeJS.Signals): void => {
@@ -352,6 +353,12 @@ export async function runLive(
           }
           note = 'full re-run (no targeted adapter)';
         }
+      }
+      if (!warnedSelectorClash && userSelectorClash(command, extraArgs)) {
+        warnedSelectorClash = true;
+        console.warn(
+          `flakefinder: your command already passes a name selector; flakefinder's injected ${extraArgs[0]!} (quarantine exclusion / targeted re-run) is appended after it and most runners keep only the LAST one — combine them yourself or use --no-quarantine / --retry-mode full`,
+        );
       }
       const built = insertRunnerArgs(command, extraArgs);
       console.log(
@@ -470,6 +477,25 @@ export async function runLive(
     usedReportFiles: [...usedReportFiles],
     suiteFlake,
   };
+}
+
+/** Name-selector flags per injected flag: jest -t, mocha --grep, go -run. */
+const SELECTOR_ALIASES: Record<string, string[]> = {
+  '-t': ['-t', '--testNamePattern'],
+  '--grep': ['--grep', '-g', '--fgrep', '-f'],
+  '-run': ['-run', '--run'],
+};
+
+/**
+ * True when flakefinder is about to inject a name selector that the user's
+ * command (runner segment) already sets — runners keep only one of them.
+ */
+export function userSelectorClash(command: string[], extraArgs: string[]): boolean {
+  const aliases = SELECTOR_ALIASES[extraArgs[0] ?? ''];
+  if (!aliases) return false;
+  const opIdx = command.findIndex((t) => isShellOperator(t));
+  const segment = command.slice(1, opIdx === -1 ? command.length : opIdx);
+  return segment.some((t) => aliases.some((a) => t === a || t.startsWith(`${a}=`)));
 }
 
 /**
