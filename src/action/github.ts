@@ -67,6 +67,14 @@ export const API_TIMEOUT_MS = 15_000;
 
 type Call = (url: string, init?: RequestInit) => Promise<Response>;
 
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
 function ghHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
@@ -119,8 +127,10 @@ export async function upsertPrComment(
   const warn = deps.warn ?? ((m: string) => core.warning(m));
   const timeoutMs = deps.timeoutMs ?? API_TIMEOUT_MS;
   if (!ctx.isPr || ctx.prNumber === null) return 'skipped';
+  // redirect: 'manual' — a redirect (even to another origin) would resend
+  // the Authorization header; a 3xx is handled like any other non-2xx
   const call: Call = (url, init = {}) =>
-    fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    fetchImpl(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
   try {
     return await upsert(call, warn, token, body, ctx);
   } catch (err) {
@@ -151,6 +161,11 @@ async function upsert(
     const page = (await res.json()) as unknown;
     if (Array.isArray(page)) comments.push(...(page as GhComment[]));
     url = res.headers.get('link')?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
+    // never follow pagination to another origin with our token
+    if (url !== null && !sameOrigin(url, ctx.apiUrl)) {
+      warn(`PR comment pagination points to another origin — not followed: ${url}`);
+      return 'failed';
+    }
   }
 
   const login = await tokenLogin(ctx.apiUrl, token, call);

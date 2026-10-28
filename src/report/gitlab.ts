@@ -48,9 +48,11 @@ export async function upsertMrNote(
   warn: (message: string) => void = (m) => console.warn(`flakefinder: ${m}`),
   timeoutMs = 15_000,
 ): Promise<'created' | 'updated' | 'unavailable'> {
-  // per-request timeout: a hung API must not block the job
+  // per-request timeout: a hung API must not block the job. redirect:
+  // 'manual': following a redirect (e.g. a 302 to another origin) would
+  // resend PRIVATE-TOKEN — a 3xx is reported like any other non-2xx
   const call = (url: string, init: RequestInit = {}): Promise<Response> =>
-    fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    fetchImpl(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
   const headers = {
     'PRIVATE-TOKEN': gl.token,
     'Content-Type': 'application/json',

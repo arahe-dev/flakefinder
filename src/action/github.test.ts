@@ -142,3 +142,69 @@ describe('API timeouts (QA ACT-6)', () => {
     expect(warnings[0]).toMatch(/PR comment request failed \(TimeoutError/);
   }, 5000);
 });
+
+describe('tokens never leave the API origin (QA ACT-11)', () => {
+  it('every request is sent with redirect: manual', async () => {
+    const inits: RequestInit[] = [];
+    const impl = (async (_url: string | URL, init?: RequestInit) => {
+      inits.push(init ?? {});
+      return init?.method ? json({ id: 1 }, 201) : json([]);
+    }) as typeof fetch;
+    await upsertPrComment('t', 'b', ctx, { fetchImpl: impl, warn: () => {} });
+    expect(inits.length).toBeGreaterThan(0);
+    for (const i of inits) expect(i.redirect).toBe('manual');
+  });
+
+  it('a 302 is a failure, not followed', async () => {
+    const warnings: string[] = [];
+    const impl = (async () =>
+      new Response(null, {
+        status: 302,
+        headers: { location: 'https://evil.example/steal' },
+      })) as unknown as typeof fetch;
+    const r = await upsertPrComment('t', 'b', ctx, {
+      fetchImpl: impl,
+      warn: (m) => warnings.push(m),
+    });
+    expect(r).toBe('failed');
+    expect(warnings[0]).toContain('HTTP 302');
+  });
+
+  it('a cross-origin Link: next is not followed with the token', async () => {
+    const urls: string[] = [];
+    const warnings: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+      urls.push(String(url));
+      if (init?.method) return json({ id: 1 }, 201);
+      return new Response('[]', {
+        status: 200,
+        headers: { link: '<https://evil.example/page2>; rel="next"' },
+      });
+    }) as typeof fetch;
+    const r = await upsertPrComment('t', 'b', ctx, {
+      fetchImpl: impl,
+      warn: (m) => warnings.push(m),
+    });
+    expect(r).toBe('failed');
+    expect(urls.some((u) => u.includes('evil.example'))).toBe(false);
+    expect(warnings[0]).toContain('another origin');
+  });
+
+  it('a same-origin Link: next is still followed', async () => {
+    const urls: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+      urls.push(String(url));
+      if (init?.method) return json({ id: 1 }, 201);
+      if (String(url).endsWith('/user')) return json({}, 403);
+      if (String(url).includes('page=2')) return json([]);
+      return new Response('[]', {
+        status: 200,
+        headers: { link: '<https://api.example/repos/o/r/issues/5/comments?page=2>; rel="next"' },
+      });
+    }) as typeof fetch;
+    expect(await upsertPrComment('t', 'b', ctx, { fetchImpl: impl, warn: () => {} })).toBe(
+      'created',
+    );
+    expect(urls.some((u) => u.includes('page=2'))).toBe(true);
+  });
+});

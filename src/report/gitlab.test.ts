@@ -119,3 +119,21 @@ describe('GitLab API timeouts (QA ACT-6)', () => {
     expect(warnings[0]).toContain('TimeoutError');
   }, 5000);
 });
+
+describe('GitLab token never follows redirects (QA ACT-11)', () => {
+  it('requests use redirect: manual and a 302 is reported, not followed', async () => {
+    const gl = gitlabEnvFromProcess(ENV)!;
+    const inits: RequestInit[] = [];
+    const urls: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+      urls.push(String(url));
+      inits.push(init ?? {});
+      return new Response(null, { status: 302, headers: { location: 'https://evil.example/' } });
+    }) as unknown as typeof fetch;
+    const warnings: string[] = [];
+    expect(await upsertMrNote(gl, 'b', impl, (m) => warnings.push(m))).toBe('unavailable');
+    expect(inits.every((i) => i.redirect === 'manual')).toBe(true);
+    expect(urls.some((u) => u.includes('evil.example'))).toBe(false);
+    expect(warnings[0]).toContain('HTTP 302');
+  });
+});
