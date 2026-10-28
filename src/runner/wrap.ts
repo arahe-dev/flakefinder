@@ -13,6 +13,11 @@ import { failedNamesOf, failedOnlyArgs } from './adapters.js';
 
 export interface LiveRunResult {
   attempts: RunRecord[];
+  /**
+   * 0 clean/flakes-only, 1 deterministic failure (or flakes with
+   * failOnFlakes), 2 the test command could not be started at all (usage /
+   * environment error — nothing was recorded), 130 interrupted.
+   */
   finalExitCode: number;
   verdicts: TestVerdict[];
   usedReportFiles: string[];
@@ -113,6 +118,16 @@ function killTree(child: ReturnType<typeof spawn>): void {
   }
 }
 
+/**
+ * Sentinel resolved by spawnCommand when the command could not be started at
+ * all — distinct from every real exit code (a test command may legitimately
+ * exit 2). Never stored or compared as an exit code.
+ */
+export const SPAWN_FAILED = -2;
+
+/** Exit code a shell uses for "command not found" (POSIX sh 127, cmd.exe 9009). */
+const SHELL_NOT_FOUND = process.platform === 'win32' ? 9009 : 127;
+
 function spawnCommand(
   command: string[],
   cwd: string,
@@ -125,6 +140,11 @@ function spawnCommand(
       if (currentChild.ref) currentChild.ref = null;
       resolve(code);
     };
+    // set when the direct (no-shell) spawn failed with ENOENT and we retried
+    // through the shell: if the shell then also reports "not found", the
+    // command genuinely does not exist — that is a could-not-start, not a
+    // test failure.
+    let directNotFound = false;
     const start = (argv: string[], useShell: boolean): void => {
       let abandoned = false; // once we fall back to shell mode, ignore this attempt's events
       let timedOut = false;
@@ -138,7 +158,7 @@ function spawnCommand(
           return;
         }
         console.error(`flakefinder: failed to start command: ${(err as Error).message}`);
-        done(2);
+        done(SPAWN_FAILED);
         return;
       }
       currentChild.ref = child;
@@ -159,6 +179,7 @@ function spawnCommand(
       child.on('error', (err: NodeJS.ErrnoException) => {
         if (!useShell && (err.code === 'ENOENT' || err.code === 'EINVAL')) {
           abandoned = true;
+          if (err.code === 'ENOENT') directNotFound = true;
           if (timer) clearTimeout(timer);
           start(shellArgv, true);
           return;
@@ -170,10 +191,19 @@ function spawnCommand(
         } else {
           console.error(`flakefinder: failed to start command: ${err.message}`);
         }
-        finish(2);
+        if (timer) clearTimeout(timer);
+        done(SPAWN_FAILED);
       });
       child.on('close', (code) => {
         if (abandoned) return; // superseded by the shell fallback
+        if (useShell && directNotFound && code === SHELL_NOT_FOUND && !timedOut) {
+          if (timer) clearTimeout(timer);
+          console.error(
+            `flakefinder: command not found: ${command[0]!} — is it installed and on PATH?`,
+          );
+          done(SPAWN_FAILED);
+          return;
+        }
         finish(code ?? 1);
       });
     };
@@ -274,7 +304,26 @@ export async function runLive(
           `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ''} → ${built.join(' ')}`,
         ),
       );
-      const code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
+      let code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
+      if (code === SPAWN_FAILED) {
+        if (attempt === 1) {
+          // nothing ran, so there is nothing to record or classify: this is a
+          // usage/environment error (exit 2), not a test failure (exit 1)
+          return {
+            attempts: [],
+            finalExitCode: 2,
+            verdicts: [],
+            usedReportFiles: [],
+            suiteFlake: false,
+          };
+        }
+        // a RETRY could not start (binary removed mid-run?): count it as a
+        // failed attempt — the sentinel must never reach the exit-code math —
+        // and stop retrying; earlier attempts' evidence is still recorded
+        code = 1;
+        exitCodes.push(code);
+        break;
+      }
       if (code === 127 || code === 9009) {
         console.error(
           `flakefinder: exit ${code} usually means the command was not found — check spelling and PATH`,

@@ -3610,6 +3610,8 @@ function killTree(child) {
     escalated.unref();
   }
 }
+var SPAWN_FAILED = -2;
+var SHELL_NOT_FOUND = process.platform === "win32" ? 9009 : 127;
 function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
   const shellArgv = command.map((t) => isShellOperator(t) ? t : shellQuote(t));
   return new Promise((resolve) => {
@@ -3617,6 +3619,7 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
       if (currentChild.ref) currentChild.ref = null;
       resolve(code);
     };
+    let directNotFound = false;
     const start = (argv, useShell2) => {
       let abandoned = false;
       let timedOut = false;
@@ -3629,7 +3632,7 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
           return;
         }
         console.error(`flakefinder: failed to start command: ${err.message}`);
-        done(2);
+        done(SPAWN_FAILED);
         return;
       }
       currentChild.ref = child;
@@ -3647,6 +3650,7 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
       child.on("error", (err) => {
         if (!useShell2 && (err.code === "ENOENT" || err.code === "EINVAL")) {
           abandoned = true;
+          if (err.code === "ENOENT") directNotFound = true;
           if (timer) clearTimeout(timer);
           start(shellArgv, true);
           return;
@@ -3658,10 +3662,19 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
         } else {
           console.error(`flakefinder: failed to start command: ${err.message}`);
         }
-        finish(2);
+        if (timer) clearTimeout(timer);
+        done(SPAWN_FAILED);
       });
       child.on("close", (code) => {
         if (abandoned) return;
+        if (useShell2 && directNotFound && code === SHELL_NOT_FOUND && !timedOut) {
+          if (timer) clearTimeout(timer);
+          console.error(
+            `flakefinder: command not found: ${command[0]} \u2014 is it installed and on PATH?`
+          );
+          done(SPAWN_FAILED);
+          return;
+        }
         finish(code ?? 1);
       });
     };
@@ -3743,7 +3756,21 @@ async function runLive(command, cfg, opts) {
           `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ""} \u2192 ${built.join(" ")}`
         )
       );
-      const code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
+      let code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
+      if (code === SPAWN_FAILED) {
+        if (attempt === 1) {
+          return {
+            attempts: [],
+            finalExitCode: 2,
+            verdicts: [],
+            usedReportFiles: [],
+            suiteFlake: false
+          };
+        }
+        code = 1;
+        exitCodes.push(code);
+        break;
+      }
       if (code === 127 || code === 9009) {
         console.error(
           `flakefinder: exit ${code} usually means the command was not found \u2014 check spelling and PATH`
@@ -3830,6 +3857,14 @@ function shellQuote(s) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+// src/util/strict-int.ts
+function parseStrictInt(value, min, max) {
+  if (!/^-?\d+$/.test(value)) return null;
+  const n = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(n) || n < min || n > max) return null;
+  return n;
+}
+
 // src/cli/index.ts
 var PROBLEM_ALWAYS = ["flaky-confirmed", "flaky-retry", "failing", "new-failure"];
 function resolveCfg(g, overrides = {}) {
@@ -3858,6 +3893,15 @@ function gitSha(cwd) {
 function storeFor(g, cfg) {
   return new HistoryStore(path7.resolve(g.cwd, cfg.storeDir));
 }
+function flagInt(flag, value, min, max, unit = "") {
+  const n = parseStrictInt(value, min, max);
+  if (n === null) {
+    console.error(`flakefinder: ${flag} must be an integer ${min}\u2013${max}${unit} (got ${value})`);
+  }
+  return n;
+}
+var RETRIES_MAX = 10;
+var TIMEOUT_MAX_SECONDS = 2147483;
 function filterVerdicts(verdicts, opts, cfg) {
   if (opts.all) return verdicts;
   const threshold = opts.threshold ?? cfg.flakeScoreThreshold;
@@ -3963,11 +4007,14 @@ async function main(argv) {
   ).argument("<command...>", "the test command, placed after --").action(
     async (command, opts) => {
       const g = globals();
-      const retries = opts.retries != null ? Number.parseInt(opts.retries, 10) : void 0;
-      if (opts.retries != null && (Number.isNaN(retries) || retries < 0)) {
-        console.error("flakefinder: --retries must be a non-negative integer");
-        exitCode = 2;
-        return;
+      let retries;
+      if (opts.retries != null) {
+        const n = flagInt("run -R/--retries", opts.retries, 0, RETRIES_MAX);
+        if (n === null) {
+          exitCode = 2;
+          return;
+        }
+        retries = n;
       }
       if (opts.retryMode != null && !["auto", "failed", "full"].includes(opts.retryMode)) {
         console.error(
@@ -3983,11 +4030,14 @@ async function main(argv) {
         overrides.retryMode = opts.retryMode;
       }
       if (opts.timeout != null) {
-        const seconds = Number.parseInt(opts.timeout, 10);
-        if (Number.isNaN(seconds) || seconds <= 0) {
-          console.error(
-            `flakefinder: --timeout must be a positive number of seconds (got "${opts.timeout}")`
-          );
+        const seconds = flagInt(
+          "run --timeout",
+          opts.timeout,
+          1,
+          TIMEOUT_MAX_SECONDS,
+          " (seconds)"
+        );
+        if (seconds === null) {
           exitCode = 2;
           return;
         }
@@ -3999,6 +4049,10 @@ async function main(argv) {
         cwd: g.cwd,
         applyQuarantine: opts.quarantine !== false
       });
+      if (result.finalExitCode === 2 && result.attempts.length === 0) {
+        exitCode = 2;
+        return;
+      }
       console.log(
         renderTerminal(result.verdicts, {
           color: g.color && process.stdout.isTTY === true,
@@ -4013,14 +4067,18 @@ async function main(argv) {
     "share a runId across ingests so fail\u2192pass counts as a retry rescue (e.g. per CI job)"
   ).action((files, opts) => {
     const g = globals();
+    const attempt = flagInt("ingest --attempt", opts.attempt, 1, 1e6);
+    if (attempt === null) {
+      exitCode = 2;
+      return;
+    }
     const cfg = resolveCfg(g);
-    const attempt = Number.parseInt(opts.attempt, 10) || 1;
     if (!["live", "report", "action"].includes(opts.source)) {
       console.error(`flakefinder: --source must be live|report|action (got ${opts.source})`);
       exitCode = 2;
       return;
     }
-    const targets = files.length > 0 ? files.map((f) => path7.resolve(g.cwd, f)) : matchGlobs(g.cwd, cfg.reports);
+    const targets = files.length > 0 ? [...new Set(files.map((f) => path7.resolve(g.cwd, f)))] : matchGlobs(g.cwd, cfg.reports);
     if (targets.length === 0) {
       console.error(
         'flakefinder: no report files matched \u2014 pass files explicitly or set "reports" globs (see flakefinder init)'
@@ -4081,19 +4139,17 @@ async function main(argv) {
   });
   program.command("report").description("show flake verdicts from accumulated history").option("--format <fmt>", "table | json | md", "table").option("--flakes-only", "problem classes only").option("--all", "include passing/skipped/gone entries").option("--threshold <n>", "minimum score for suspected flakes", void 0).action((opts) => {
     const g = globals();
-    const cfg = resolveCfg(g);
-    const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
     let threshold;
     if (opts.threshold != null) {
-      threshold = Number.parseInt(opts.threshold, 10);
-      if (Number.isNaN(threshold) || threshold < 0 || threshold > 100) {
-        console.error(
-          `flakefinder: --threshold must be an integer 0-100 (got "${opts.threshold}")`
-        );
+      const n = flagInt("report --threshold", opts.threshold, 0, 100);
+      if (n === null) {
         exitCode = 2;
         return;
       }
+      threshold = n;
     }
+    const cfg = resolveCfg(g);
+    const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
     if (opts.format === "json") {
       console.log(renderJson(verdicts, cfg));
       return;
@@ -4343,6 +4399,7 @@ async function main(argv) {
     if (e.code === "commander.help" || e.code === "commander.version" || e.code === "commander.helpDisplayed") {
       return 0;
     }
+    if (e.code?.startsWith("commander.")) return 2;
     console.error(`flakefinder: ${e.message ?? "unknown error"}`);
     return 2;
   }

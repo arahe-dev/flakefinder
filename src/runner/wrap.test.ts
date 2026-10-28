@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -462,4 +462,55 @@ process.exit(failed ? 1 : 0);
     expect(flaky.classification.startsWith('flaky-')).toBe(true);
     expect(result.finalExitCode).toBe(0);
   }, 60_000);
+});
+
+describe('unstartable commands (QA A11)', () => {
+  it('a command that does not exist exits 2 (usage error), records nothing', async () => {
+    const cwd = tmpCwd();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await runLive(['definitely-not-a-cmd-xyz'], cfg(), {
+      retries: 2,
+      cwd,
+      applyQuarantine: false,
+    });
+    expect(result.finalExitCode).toBe(2);
+    expect(result.attempts).toEqual([]);
+    expect(result.verdicts).toEqual([]);
+    expect(err.mock.calls.flat().join('\n')).toContain(
+      'command not found: definitely-not-a-cmd-xyz',
+    );
+    // no retries were attempted and no store was created
+    const logged = (console.log as unknown as { mock: { calls: unknown[][] } }).mock.calls.flat();
+    expect(logged.filter((l) => String(l).includes('attempt ')).length).toBe(1);
+    expect(existsSync(path.join(cwd, '.ffstore'))).toBe(false);
+  });
+
+  it('a real command exiting 2 is still a test failure (exit 1), not "could not start"', async () => {
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'two.js'), 'process.exit(2);', 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await runLive(['node', 'two.js'], cfg({ reports: [] }), {
+      retries: 1,
+      cwd,
+      applyQuarantine: false,
+    });
+    expect(result.finalExitCode).toBe(1);
+  });
+
+  it('a script exiting 127 from a command that DOES exist is not treated as unstartable', async () => {
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'nf.js'), 'process.exit(127);', 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await runLive(['node', 'nf.js'], cfg({ reports: [] }), {
+      retries: 0,
+      cwd,
+      applyQuarantine: false,
+    });
+    expect(result.finalExitCode).toBe(1);
+  });
 });

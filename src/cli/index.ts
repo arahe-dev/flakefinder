@@ -272,6 +272,12 @@ export async function main(argv: string[]): Promise<number> {
           cwd: g.cwd,
           applyQuarantine: opts.quarantine !== false,
         });
+        if (result.finalExitCode === 2 && result.attempts.length === 0) {
+          // the command could not be started — runLive already said why; a
+          // "no test history yet" report here would only mislead
+          exitCode = 2;
+          return;
+        }
         console.log(
           renderTerminal(result.verdicts, {
             color: g.color && process.stdout.isTTY === true,

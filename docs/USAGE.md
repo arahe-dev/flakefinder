@@ -301,7 +301,7 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 | `0` | Clean run, **or** failures that were all proven flakes (unless `--fail-on-flake` / `failOnFlakes`) |
 | `1` | A deterministic failure persisted to the final attempt (`run`); a quarantined testId wasn't found; `ci --fail-on-new-flakes` saw new flakes |
 | `1` (doctor) | `doctor` found at least one FAIL-level problem (e.g. invalid config, unreadable quarantine file, unreadable `history.jsonl`) |
-| `2` | Usage or environment error: bad flags, unreadable config, no report files matched for `ingest`/`ci`, unknown quarantine action |
+| `2` | Usage or environment error: bad flags, unreadable config, no report files matched for `ingest`/`ci`, unknown quarantine action, test command could not be started (`run` — e.g. not installed / not on PATH; nothing is retried or recorded) |
 
 These are stable and scriptable — gate CI on `run`'s exit code directly.
 
@@ -552,7 +552,8 @@ manually (e.g. `-run` in your own scripts) until Go grows a selector.
 
 **Exit code 2** — a flag/config problem, not a test result: check the error
 message above the exit (unreadable config, invalid `--retries`, empty
-quarantine action, no matching reports for `ingest`/`ci`). Numeric flags
+quarantine action, no matching reports for `ingest`/`ci`, or a `run` test
+command that could not be started — `command not found: …`). Numeric flags
 (`-R`, `--timeout`, `--attempt`, `--threshold`) accept plain integers only —
 `2.5`, `2x` or `50abc` are rejected with the flag's accepted range rather than
 silently truncated.

@@ -174,3 +174,16 @@ describe('commander usage errors print once (QA A10)', () => {
     expect(v.stderr).toBe('');
   });
 });
+
+describe('unstartable test command (QA A11)', () => {
+  it('run -- <missing binary> exits 2 with one clear message and no report', () => {
+    const d = tmp();
+    const r = cli(['run', '--', 'definitely-not-a-cmd-xyz'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain(
+      'flakefinder: command not found: definitely-not-a-cmd-xyz — is it installed and on PATH?',
+    );
+    expect(r.stdout).not.toContain('no test history yet');
+    expect(r.stdout.match(/attempt \d+\/\d+/g)).toEqual(['attempt 1/3']); // no retries
+  });
+});
