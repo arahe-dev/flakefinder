@@ -129,6 +129,11 @@ export const PR_COMMENT_MAX_CHARS = 60_000;
 export interface PrCommentOptions {
   maxRows?: number;
   maxChars?: number;
+  /**
+   * Name of the dashboard artifact, set only when it WAS uploaded for this
+   * run; the comment then points at it. Omitted → no dashboard claim.
+   */
+  dashboardArtifact?: string;
 }
 
 /**
@@ -170,10 +175,14 @@ export function buildPrComment(
   head.push(summary);
   if (previous === null && flaky.length > 0) head.push('_first run — building history_');
   head.push('');
+  const dashboard = opts.dashboardArtifact;
   const footer = [
     '---',
-    '_📊 HTML dashboard uploaded as artifact `flakefinder-dashboard` · docs: `docs/github-action.md`_',
+    dashboard
+      ? `_📊 HTML dashboard uploaded as artifact \`${dashboard}\` · docs: \`docs/github-action.md\`_`
+      : '_docs: `docs/github-action.md`_',
   ];
+  const seeMore = dashboard ? ' — see the dashboard artifact' : '';
 
   // budget for everything between head and footer, leaving room for the
   // two "…and K more" notes (each < 200 chars)
@@ -195,7 +204,10 @@ export function buildPrComment(
     }
     body.push(...tableLines);
     if (flaky.length > shown) {
-      body.push('', `_…and ${flaky.length - shown} more flaky test(s) not shown in this table._`);
+      body.push(
+        '',
+        `_…and ${flaky.length - shown} more flaky test(s) not shown in this table${seeMore}._`,
+      );
     }
     body.push('');
   }
@@ -231,7 +243,7 @@ export function buildPrComment(
   }
   if (newFlakes.length > detailCount) {
     body.push(
-      `_…and ${newFlakes.length - detailCount} more new flake(s) — see the dashboard artifact._`,
+      `_…and ${newFlakes.length - detailCount} more new flake(s)${seeMore || ' without details here'}._`,
       '',
     );
   }

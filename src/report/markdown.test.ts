@@ -205,3 +205,23 @@ describe('PR comment size cap (QA ACT-1)', () => {
     expect(body.split('\n').filter((l) => l.startsWith('| flaky test number'))).toHaveLength(3);
   });
 });
+
+describe('dashboard footer only when uploaded (QA ACT-13)', () => {
+  it('no artifact → no claim that a dashboard was uploaded', () => {
+    const body = buildPrComment([verdict()], null);
+    expect(body).not.toContain('uploaded as artifact');
+    expect(body).not.toContain('dashboard artifact');
+    expect(body.endsWith('_docs: `docs/github-action.md`_')).toBe(true);
+  });
+  it('uploaded artifact → footer names it', () => {
+    const body = buildPrComment([verdict()], null, { dashboardArtifact: 'flakefinder-dashboard' });
+    expect(body).toContain('HTML dashboard uploaded as artifact `flakefinder-dashboard`');
+  });
+  it('overflow notes only point at the dashboard when it exists', () => {
+    const flakes = Array.from({ length: 7 }, (_, i) => verdict({ testId: `t${i}`, name: `f${i}` }));
+    expect(buildPrComment(flakes, null)).toContain('…and 2 more new flake(s) without details here');
+    expect(buildPrComment(flakes, null, { dashboardArtifact: 'd' })).toContain(
+      '…and 2 more new flake(s) — see the dashboard artifact',
+    );
+  });
+});

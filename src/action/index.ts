@@ -116,18 +116,9 @@ async function actionMain(): Promise<void> {
     ])
     .write();
 
-  // 7. PR comment
-  if (core.getBooleanInput('comment') && gh.isPr) {
-    const token = core.getInput('github-token');
-    try {
-      const result = await upsertPrComment(token, buildPrComment(verdicts, previous), gh);
-      core.info(`PR comment: ${result}`);
-    } catch (err) {
-      core.warning(`PR comment failed (check token permissions): ${(err as Error).message}`);
-    }
-  }
-
-  // 8. dashboard artifact
+  // 7. dashboard artifact — BEFORE the comment, which only mentions it if
+  // the upload actually happened
+  let dashboardArtifact: string | undefined;
   if (core.getBooleanInput('upload-dashboard')) {
     try {
       const runs = outcome.store
@@ -152,8 +143,24 @@ async function actionMain(): Promise<void> {
       await client.uploadArtifact('flakefinder-dashboard', [htmlPath], cwd, {
         retentionDays: 30,
       });
+      dashboardArtifact = 'flakefinder-dashboard';
     } catch (err) {
       core.warning(`dashboard upload failed: ${(err as Error).message}`);
+    }
+  }
+
+  // 8. PR comment
+  if (core.getBooleanInput('comment') && gh.isPr) {
+    const token = core.getInput('github-token');
+    try {
+      const result = await upsertPrComment(
+        token,
+        buildPrComment(verdicts, previous, { dashboardArtifact }),
+        gh,
+      );
+      core.info(`PR comment: ${result}`);
+    } catch (err) {
+      core.warning(`PR comment failed (check token permissions): ${(err as Error).message}`);
     }
   }
 
