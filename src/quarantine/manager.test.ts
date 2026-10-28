@@ -116,6 +116,20 @@ describe('QuarantineManager', () => {
     expect(qm.list().map((e) => e.testId)).toEqual(['still-flaky']);
   });
 
+  it('prune ignores health evidence from before the quarantine (QA CLI-24)', () => {
+    const qm = new QuarantineManager(tmpFile());
+    qm.add(entry('just-quarantined', 'n', { quarantinedAt: new Date().toISOString() }));
+    const removed = qm.prune([
+      verdict('just-quarantined', {
+        classification: 'passing',
+        runsObserved: 12,
+        lastSeen: new Date(Date.now() - 3_600_000).toISOString(), // last ran an hour BEFORE
+      }),
+    ]);
+    expect(removed).toEqual([]);
+    expect(qm.list()).toHaveLength(1);
+  });
+
   it('prune does NOT remove unseen tests (quarantine excludes them from runs)', () => {
     const qm = new QuarantineManager(tmpFile());
     qm.add(entry('excluded')); // never appears in verdicts because it is excluded

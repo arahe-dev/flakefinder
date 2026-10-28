@@ -158,8 +158,8 @@ export class QuarantineManager {
    * conservative: quarantined tests are excluded from runs, so "not seen
    * lately" is NOT evidence of health (that would silently un-quarantine
    * everything). An entry leaves quarantine only on positive evidence —
-   * the test ran (quarantine disabled or full-suite run) and passed stably —
-   * or when the entry is older than 90 days and the test is gone from
+   * the test ran (quarantine disabled or full-suite run) since it was
+   * quarantined and passed stably — or when the entry is older than 90 days and the test is gone from
    * history. Returns the removed entries.
    */
   prune(verdicts: TestVerdict[], maxAgeDays = 90): QuarantineEntry[] {
@@ -168,8 +168,13 @@ export class QuarantineManager {
     const removed: QuarantineEntry[] = [];
     for (const entry of this.file.entries) {
       const v = byId.get(entry.testId);
-      const healthy = v !== undefined && v.classification === 'passing' && v.runsObserved >= 10;
       const quarantinedMs = Date.parse(entry.quarantinedAt);
+      // health evidence must include a run AFTER the quarantine: passes from
+      // before it are exactly the history that got the test quarantined
+      const seenSince =
+        v !== undefined && (Number.isNaN(quarantinedMs) || Date.parse(v.lastSeen) >= quarantinedMs);
+      const healthy =
+        v !== undefined && seenSince && v.classification === 'passing' && v.runsObserved >= 10;
       const agedOut =
         v?.classification === 'gone' &&
         !Number.isNaN(quarantinedMs) &&

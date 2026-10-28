@@ -442,8 +442,8 @@ Per runner:
 
 **Prune policy (deliberately conservative).** `quarantine prune` removes an
 entry only on *positive* evidence: the verdict is `passing` with ≥ 10 runs
-observed (i.e. it ran — with quarantine disabled or a full-suite run — and
-was stable), or the test is `gone` while the entry is older than 90 days.
+observed and the test was last seen *after* it was quarantined (i.e. it ran —
+with quarantine disabled or a full-suite run — and was stable), or the test is `gone` while the entry is older than 90 days.
 Why so strict: a quarantined test is excluded from runs, so "not seen lately"
 is exactly what quarantine looks like when it's working. Treating absence as
 health would silently un-quarantine the entire list. Empty history → no-op.
