@@ -329,7 +329,10 @@ subtests — by indentation, with or without `# Subtest:` headers — become
 `ancestor > …` suites, a parent is only reported when it failed on its own,
 `# SKIP`/`# TODO` map to skip, multi-line YAML `error: |-` diagnostics and
 `duration_ms` are read), and **TRX**
-(.NET `dotnet test --logger trx`; suite = the test class name).
+(.NET `dotnet test --logger trx`; suite = the test class name, joined by
+test id so same-named methods in different classes stay distinct;
+Timeout → fail, Error/Aborted → error, NotExecuted/Inconclusive → skip;
+data-driven rows are reported individually).
 
 - **table** — sections per classification (`FLAKY (confirmed)`,
   `FLAKY (retry-rescued)`, `FLAKY (suspected)`, `FAILING`, `NEW FAILURE`),
