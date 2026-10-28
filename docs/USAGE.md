@@ -117,8 +117,11 @@ fail-fail-pass sequence with a deterministic report is detected as a rescue.
 Then it classifies and prints a terminal report restricted to the tests
 observed in this invocation.
 
-- `-R, --retries <n>` — extra attempts (default: config `liveRetries`, itself
-  default 2). `-R 0` runs once with no retries but still records history.
+- `-R, --retries <n>` — extra attempts, an integer 0–10 (default: config
+  `liveRetries`, itself default 2; the same 0–10 range applies to both the
+  flag and the config key). `-R 0` runs once with no retries but still
+  records history. An out-of-range flag is reported against the flag
+  (`run -R/--retries must be an integer 0–10 (got 50)`), not the config.
 - `--fail-on-flake` — exit non-zero when *flakes* (not just real failures) are
   detected. Default behavior: flakes alone exit 0, so known flakes don't fail
   your CI gate.
