@@ -319,7 +319,8 @@ These are stable and scriptable — gate CI on `run`'s exit code directly.
 Supported parsers (auto-detected per file): **JUnit XML** (pytest, jest-junit,
 surefire…; a Surefire rerun that passed after `<flakyFailure>`/`<flakyError>`
 stays a pass but is flagged with a `flaky: failed k of n attempts` message and
-a warning), **Jest JSON** (jest + vitest), **Mocha JSON** (statuses matched
+a warning), **Jest JSON** (jest + vitest; a file that failed outside any test — e.g.
+an `afterAll` that threw — is recorded as a `(suite)` failure), **Mocha JSON** (statuses matched
 per file + full title; a failing `before`/`after` hook is recorded as a
 failure named e.g. `"before all" hook`), **`go test -json`**
 (NDJSON; with `-count=N` a test that failed in any run is reported as a fail,

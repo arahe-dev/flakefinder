@@ -19,6 +19,8 @@ describe('detectParser', () => {
     ['malformed-xml.xml', 'junit'],
     ['jest.json', 'jest'],
     ['jest-minimal.json', 'jest'],
+    ['jest-suite-failure.json', 'jest'],
+    ['jest-no-tests.json', 'jest'],
     ['mocha.json', 'mocha'],
     ['go-test.jsonl', 'go'],
     ['go-test-old.jsonl', 'go'],
@@ -48,7 +50,7 @@ describe('detectParser', () => {
 
   it('returns null for JSON without any known report shape', () => {
     expect(detectParser('{"stats": {}}')).toBeNull();
-    expect(detectParser('{"testResults": []}')).toBeNull();
+    expect(detectParser('{"testResults": [{"name": "x"}]}')).toBeNull();
     expect(detectParser('{"results": [1, 2, 3]}')).toBeNull();
   });
 

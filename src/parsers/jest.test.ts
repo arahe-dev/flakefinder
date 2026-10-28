@@ -146,7 +146,9 @@ describe('jestParser', () => {
     expect(jestParser.sniff(load('jest.json'))).toBe(true);
     expect(jestParser.sniff(load('jest-minimal.json'))).toBe(true);
     expect(jestParser.sniff('hello world')).toBe(false);
-    expect(jestParser.sniff('{"testResults": []}')).toBe(false);
+    // an EMPTY testResults array is a jest run with no tests (r5 #10); a non-empty
+    // one still needs assertionResults
+    expect(jestParser.sniff('{"testResults": [{"name": "x"}]}')).toBe(false);
     expect(jestParser.sniff(load('mocha.json'))).toBe(false);
   });
 });
@@ -174,5 +176,71 @@ describe('vitest compatibility (QA round 2)', () => {
     expect(warnings).toEqual([]);
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ name: 'vs', status: 'skip', suite: 'VS' });
+  });
+});
+
+// jest-suite-failure.json / jest-no-tests.json: REAL `jest --json` (jest 29.7)
+// output, paths rewritten to /repo. Files: only.test.js (test.only → the other
+// test is pending, file status "focused"), statuses.test.js (pass, skip, todo,
+// fail), after.test.js (afterAll throws; its only test PASSED), empty.test.js
+// (no tests). jest-no-tests.json is `jest --json --passWithNoTests` on an
+// empty tree.
+describe('jest statuses + suite failures (r5 #10)', () => {
+  it('maps disabled → skip and focused by its failure messages', () => {
+    const a = (title: string, status: string, failureMessages: string[] = []) => ({
+      title,
+      status,
+      ancestorTitles: ['s'],
+      failureMessages,
+    });
+    const content = JSON.stringify({
+      testResults: [
+        {
+          name: '/repo/x.test.js',
+          status: 'passed',
+          assertionResults: [
+            a('dis', 'disabled'),
+            a('foc', 'focused'),
+            a('foc-bad', 'focused', ['boom']),
+            a('todo', 'todo'),
+          ],
+        },
+      ],
+    });
+    const { results, warnings } = jestParser.parse(content, 'inline');
+    expect(warnings).toEqual([]);
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'dis:skip',
+      'foc:pass',
+      'foc-bad:fail',
+      'todo:skip',
+    ]);
+  });
+
+  it('recognises {"testResults":[]} as jest with zero results and no warnings', () => {
+    expect(jestParser.sniff(load('jest-no-tests.json'))).toBe(true);
+    expect(jestParser.sniff('{"testResults":[]}')).toBe(true);
+    expect(jestParser.parse(load('jest-no-tests.json'), 'x')).toEqual({
+      results: [],
+      warnings: [],
+    });
+  });
+
+  it('surfaces a suite failure (afterAll threw) even though every test passed', () => {
+    const { results, warnings } = jestParser.parse(load('jest-suite-failure.json'), 'jest.json');
+    expect(warnings).toEqual([]);
+    const after = results.filter((r) => r.suite.endsWith('after.test.js') || r.suite === 'db');
+    expect(after.map((r) => `${r.suite} :: ${r.name}:${r.status}`)).toEqual([
+      'db :: reads:pass',
+      '/repo/j/after.test.js :: (suite):fail',
+    ]);
+    expect(after[1]!.message).toContain('teardown exploded');
+    // a file whose failure is already carried by a failing test gets no extra row
+    expect(results.filter((r) => r.name === '(suite)').map((r) => r.suite)).toEqual([
+      '/repo/j/after.test.js',
+      '/repo/j/empty.test.js',
+    ]);
+    // focused file: the non-.only test is pending → skip
+    expect(results.find((r) => r.name === 'not focused')!.status).toBe('skip');
   });
 });
