@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -240,4 +241,93 @@ describe('pytestNodeId (R5 bug 6)', () => {
       'Tests/Unit/TestApi.py::TestGet::test_ok',
     );
   });
+});
+
+describe('concurrent writers (QA CLI-2)', () => {
+  it('two managers loaded from the same file both keep their changes', () => {
+    const file = tmpFile();
+    const seed = new QuarantineManager(file);
+    seed.add(entry('old'));
+    seed.add(entry('gone-soon'));
+    seed.save();
+    const a = new QuarantineManager(file);
+    const b = new QuarantineManager(file);
+    a.add(entry('a'));
+    b.add(entry('b'));
+    b.remove('gone-soon');
+    a.save();
+    b.save(); // must not overwrite a's add with its stale snapshot
+    const ids = new QuarantineManager(file)
+      .list()
+      .map((e) => e.testId)
+      .sort();
+    expect(ids).toEqual(['a', 'b', 'old']);
+    expect(b.list().map((e) => e.testId)).toContain('a'); // save refreshes the view
+  });
+
+  it('a stale lock from a dead process is taken over', async () => {
+    const file = tmpFile();
+    const { spawnSync } = await import('node:child_process');
+    const dead = spawnSync(process.execPath, ['-e', '0']).pid!;
+    writeFileSync(`${file}.lock`, String(dead), 'utf8');
+    const qm = new QuarantineManager(file);
+    qm.add(entry('a'));
+    qm.save();
+    expect(new QuarantineManager(file).list()).toHaveLength(1);
+    expect(readdirSync(path.dirname(file))).toEqual(['flakefinder.quarantine.json']);
+  });
+
+  it('8 parallel processes adding distinct ids lose nothing', async () => {
+    const { buildSync } = await import('esbuild');
+    const { spawn } = await import('node:child_process');
+    const file = tmpFile();
+    const dir = path.dirname(file);
+    const bundle = path.join(dir, 'manager.cjs');
+    buildSync({
+      entryPoints: [path.join(__dirname, 'manager.ts')],
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      outfile: bundle,
+      logLevel: 'silent',
+    });
+    // each worker snapshots the file (constructor), signals ready, waits for
+    // the barrier, then adds + saves — every save races on the same snapshot
+    const worker = `
+const fs = require('fs');
+const { QuarantineManager } = require(${JSON.stringify(bundle)});
+const [file, id, dir] = process.argv.slice(1);
+const qm = new QuarantineManager(file);
+fs.writeFileSync(dir + '/ready-' + id, '');
+const until = Date.now() + 20000;
+while (!fs.existsSync(dir + '/go')) {
+  if (Date.now() > until) process.exit(3);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+}
+qm.add({ testId: id, suite: 's', name: id, reason: 'r', quarantinedAt: new Date().toISOString(), flakeScore: 1 });
+qm.save();
+`;
+    const ids = Array.from({ length: 8 }, (_, i) => `id${i}`);
+    const exits = ids.map(
+      (id) =>
+        new Promise<number | null>((resolve) => {
+          spawn(process.execPath, ['-e', worker, file, id, dir], { stdio: 'inherit' }).on(
+            'close',
+            resolve,
+          );
+        }),
+    );
+    for (let i = 0; i < 400; i++) {
+      if (ids.every((id) => existsSync(path.join(dir, `ready-${id}`)))) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    writeFileSync(path.join(dir, 'go'), '', 'utf8');
+    expect(await Promise.all(exits)).toEqual(ids.map(() => 0));
+    const got = new QuarantineManager(file)
+      .list()
+      .map((e) => e.testId)
+      .sort();
+    expect(got).toEqual(ids);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+  }, 60_000);
 });

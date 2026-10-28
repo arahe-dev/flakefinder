@@ -1,4 +1,14 @@
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import path from 'node:path';
 import type { QuarantineEntry, RunnerKind, TestVerdict } from '../types.js';
 
@@ -9,14 +19,96 @@ interface QuarantineFile {
 
 const EMPTY: QuarantineFile = { version: 1, entries: [] };
 
+/** A mutation made through this manager, replayed onto the fresh file at save time. */
+type QuarantineOp = { kind: 'add'; entry: QuarantineEntry } | { kind: 'remove'; testId: string };
+
+function applyOp(entries: QuarantineEntry[], op: QuarantineOp): QuarantineEntry[] {
+  if (op.kind === 'remove') return entries.filter((e) => e.testId !== op.testId);
+  return [...entries.filter((e) => e.testId !== op.entry.testId), op.entry];
+}
+
+/** How long save() waits for another process's lock before giving up. */
+const LOCK_TIMEOUT_MS = 10_000;
+/** A lock older than this is treated as abandoned even if its pid looks alive. */
+const LOCK_STALE_MS = 30_000;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** A lock left behind by a crashed process: owner pid gone, or simply too old. */
+function lockIsStale(lockPath: string): boolean {
+  let pid: number;
+  let mtimeMs: number;
+  try {
+    pid = Number.parseInt(readFileSync(lockPath, 'utf8'), 10);
+    mtimeMs = statSync(lockPath).mtimeMs;
+  } catch {
+    return true; // vanished meanwhile: just retry the create
+  }
+  if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return true;
+    }
+  }
+  return Date.now() - mtimeMs > LOCK_STALE_MS;
+}
+
+/**
+ * Run `fn` holding `<target>.lock` — an O_EXCL lockfile holding our pid, so
+ * concurrent flakefinder processes serialize their read-modify-write of the
+ * quarantine file. Kept local to this module on purpose (independent of the
+ * history store's locking).
+ */
+function withFileLock<T>(target: string, fn: () => T): T {
+  const lockPath = `${target}.lock`;
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx');
+      try {
+        writeSync(fd, String(process.pid));
+      } finally {
+        closeSync(fd);
+      }
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      if (lockIsStale(lockPath)) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `quarantine file is locked by another flakefinder process (${lockPath}) — delete the lock if no other flakefinder is running`,
+        );
+      }
+      sleepSync(10 + Math.floor(Math.random() * 20));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lockPath, { force: true });
+  }
+}
+
 /**
  * Manages flakefinder.quarantine.json — the list of tests excluded from runs.
  * Quarantine never edits test source files; exclusion happens via runner
  * flags (see exclusionArgs).
+ *
+ * Concurrency: the constructor's read is only a snapshot. Mutations are
+ * recorded as operations and save() replays them, under a lockfile, onto a
+ * FRESH read of the file — so parallel `quarantine add`s never lose each
+ * other's entries.
  */
 export class QuarantineManager {
   private filePath: string;
   private file: QuarantineFile;
+  private pending: QuarantineOp[] = [];
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -34,20 +126,24 @@ export class QuarantineManager {
     }
   }
 
+  private apply(op: QuarantineOp): void {
+    this.pending.push(op);
+    this.file.entries = applyOp(this.file.entries, op);
+  }
+
   list(): QuarantineEntry[] {
     return [...this.file.entries];
   }
 
   /** Add or replace an entry (same testId). */
   add(entry: QuarantineEntry): void {
-    this.file.entries = this.file.entries.filter((e) => e.testId !== entry.testId);
-    this.file.entries.push(entry);
+    this.apply({ kind: 'add', entry });
   }
 
   remove(testId: string): boolean {
-    const before = this.file.entries.length;
-    this.file.entries = this.file.entries.filter((e) => e.testId !== testId);
-    return this.file.entries.length < before;
+    const existed = this.file.entries.some((e) => e.testId === testId);
+    if (existed) this.apply({ kind: 'remove', testId });
+    return existed;
   }
 
   /**
@@ -63,7 +159,6 @@ export class QuarantineManager {
     if (verdicts.length === 0) return [];
     const byId = new Map(verdicts.map((v) => [v.testId, v]));
     const removed: QuarantineEntry[] = [];
-    const kept: QuarantineEntry[] = [];
     for (const entry of this.file.entries) {
       const v = byId.get(entry.testId);
       const healthy = v !== undefined && v.classification === 'passing' && v.runsObserved >= 10;
@@ -73,26 +168,33 @@ export class QuarantineManager {
         !Number.isNaN(quarantinedMs) &&
         Date.now() - quarantinedMs > maxAgeDays * 86_400_000;
       if (healthy || agedOut) removed.push(entry);
-      else kept.push(entry);
     }
-    this.file.entries = kept;
+    for (const entry of removed) this.apply({ kind: 'remove', testId: entry.testId });
     return removed;
   }
 
   /**
-   * Atomic write: a temp file in the same directory, then rename over the
-   * target — a crash or a concurrent reader never sees a torn/half-written
-   * quarantine file (rename replaces the directory entry in one step).
+   * Persist this manager's changes. Under the lockfile: re-read the file
+   * (another process may have saved since our constructor ran), replay our
+   * pending operations onto it, then write atomically — a temp file in the
+   * same directory renamed over the target, so neither a crash nor a
+   * concurrent reader ever sees a torn file.
    */
   save(): void {
-    const tmp = `${this.filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
-    try {
-      writeFileSync(tmp, `${JSON.stringify(this.file, null, 2)}\n`, 'utf8');
-      renameSync(tmp, this.filePath);
-    } catch (err) {
-      rmSync(tmp, { force: true });
-      throw err;
-    }
+    withFileLock(this.filePath, () => {
+      const fresh = this.load();
+      for (const op of this.pending) fresh.entries = applyOp(fresh.entries, op);
+      const tmp = `${this.filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+      try {
+        writeFileSync(tmp, `${JSON.stringify(fresh, null, 2)}\n`, 'utf8');
+        renameSync(tmp, this.filePath);
+      } catch (err) {
+        rmSync(tmp, { force: true });
+        throw err;
+      }
+      this.file = fresh;
+      this.pending = [];
+    });
   }
 }
 
