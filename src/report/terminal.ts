@@ -1,4 +1,5 @@
 import type { Classification, TestVerdict } from '../types.js';
+import { redact } from '../util/redact.js';
 import { escapeControlChars } from './text.js';
 
 interface ClassMeta {
@@ -74,8 +75,9 @@ export function renderTerminal(
     list.push(v);
     byClass.set(v.classification, list);
   }
-  // untrusted strings: render control characters visibly (no raw ESC/CR/LF)
-  const safe = (s: string): string => escapeControlChars(s);
+  // untrusted strings: secrets redacted (CI logs leave the machine), control
+  // characters rendered visibly (no raw ESC/CR/LF)
+  const safe = (s: string): string => escapeControlChars(redact(s));
   for (const [, list] of byClass) {
     list.sort((a, b) => b.flakeScore - a.flakeScore || a.name.localeCompare(b.name));
   }

@@ -308,3 +308,26 @@ describe('ci output cannot inject workflow commands or terminal escapes (QA ACT-
     expect(r.stdout).toContain('x\\x0a::error::Rotate creds');
   });
 });
+
+describe('ci annotations and table are redacted (QA ACT-3)', () => {
+  it('a ghp_ token in a flaky test name never reaches ci output', () => {
+    const d = tmp();
+    const tok = 'ghp_0123456789abcdefABCDEF0123456789abcd';
+    const junit = (fail: boolean): string =>
+      `<testsuites><testsuite name="s"><testcase classname="s" name="auth ${tok}">${fail ? '<failure message="boom"/>' : ''}</testcase></testsuite></testsuites>`;
+    writeFileSync(
+      path.join(d, 'flakefinder.config.json'),
+      '{"reports": ["r.xml"], "minRuns": 2}',
+      'utf8',
+    );
+    let out = '';
+    for (const fail of [false, true, false, true]) {
+      writeFileSync(path.join(d, 'r.xml'), junit(fail), 'utf8');
+      const r = cli(['ci', '--fail-on-new-flakes'], d);
+      out = `${r.stdout}\n${r.stderr}`;
+    }
+    expect(out).toContain('::warning title=flakefinder::');
+    expect(out).toContain('ghp_[REDACTED]');
+    expect(out).not.toContain(tok);
+  });
+});

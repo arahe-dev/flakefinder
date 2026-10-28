@@ -33,6 +33,7 @@ import type {
 } from '../types.js';
 import { FLAKEFINDER_VERSION } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
+import { redact } from '../util/redact.js';
 import { parseStrictInt } from '../util/strict-int.js';
 
 interface Globals {
@@ -630,7 +631,7 @@ export async function main(argv: string[]): Promise<number> {
 
       for (const v of verdicts.filter((x) => x.classification.startsWith('flaky-'))) {
         console.log(
-          `::warning title=flakefinder::${ghEscape(escapeControlChars(`${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`))}`,
+          `::warning title=flakefinder::${ghEscape(escapeControlChars(`${redact(v.suite)} :: ${redact(v.name)} (${v.classification}, score ${v.flakeScore})`))}`,
         );
       }
 
@@ -672,7 +673,7 @@ export async function main(argv: string[]): Promise<number> {
         console.error(`flakefinder ci: ${newFlakes.length} NEW flake(s):`);
         for (const v of newFlakes)
           console.error(
-            `  ${escapeControlChars(v.suite)} :: ${escapeControlChars(v.name)} (score ${v.flakeScore})`,
+            `  ${escapeControlChars(redact(v.suite))} :: ${escapeControlChars(redact(v.name))} (score ${v.flakeScore})`,
           );
         exitCode = 1;
       }

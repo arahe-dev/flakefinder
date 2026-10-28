@@ -196,3 +196,16 @@ describe('terminal output escapes control characters (QA ACT-2)', () => {
     expect(stripped).toContain('slow\\x1b]8;;http://evil\\x07');
   });
 });
+
+describe('terminal output is redacted (QA ACT-3)', () => {
+  it('a token in a test name or suite is not printed verbatim', () => {
+    const tok = 'ghp_0123456789abcdefABCDEF0123456789abcd';
+    const out = renderTerminal(
+      [verdict({ name: `uses ${tok}`, suite: 'password=hunter2', classification: 'failing' })],
+      { color: false, flakesOnly: false },
+    );
+    expect(out).not.toContain(tok);
+    expect(out).not.toContain('hunter2');
+    expect(out).toContain('ghp_[REDACTED]');
+  });
+});
