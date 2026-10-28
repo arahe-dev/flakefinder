@@ -276,9 +276,11 @@ export async function main(argv: string[]): Promise<number> {
         exitCode = 2;
         return;
       }
+      // resolve BEFORE dedupe: `r.xml ./r.xml` is one file, ingesting it
+      // twice would double-count every result in the same run (QA A6)
       const targets =
         files.length > 0
-          ? files.map((f) => path.resolve(g.cwd, f))
+          ? [...new Set(files.map((f) => path.resolve(g.cwd, f)))]
           : matchGlobs(g.cwd, cfg.reports);
       if (targets.length === 0) {
         console.error(
