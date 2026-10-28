@@ -153,3 +153,24 @@ describe('strict integer flags (QA A7/A8)', () => {
     expect(cli(['report', '--threshold', '0'], d).status).toBe(0);
   });
 });
+
+describe('commander usage errors print once (QA A10)', () => {
+  it.each([
+    [['frobnicate'], "error: unknown command 'frobnicate'"],
+    [['report', '--bogus'], "error: unknown option '--bogus'"],
+    [['ingest', '--attempt'], "error: option '--attempt <n>' argument missing"],
+  ])('%j prints ONE error line and exits 2', (args, message) => {
+    const r = cli(args, tmp());
+    expect(r.status).toBe(2);
+    const lines = r.stderr.split('\n').filter((l) => l.trim() !== '');
+    expect(lines).toEqual([message]);
+  });
+
+  it('--help and --version still exit 0', () => {
+    const d = tmp();
+    expect(cli(['--help'], d).status).toBe(0);
+    const v = cli(['--version'], d);
+    expect(v.status).toBe(0);
+    expect(v.stderr).toBe('');
+  });
+});

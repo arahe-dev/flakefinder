@@ -691,6 +691,9 @@ export async function main(argv: string[]): Promise<number> {
     ) {
       return 0;
     }
+    // commander already printed its own `error: …` line for usage errors
+    // (unknown command/option, missing argument) — printing again doubled it
+    if (e.code?.startsWith('commander.')) return 2;
     console.error(`flakefinder: ${e.message ?? 'unknown error'}`);
     return 2;
   }
