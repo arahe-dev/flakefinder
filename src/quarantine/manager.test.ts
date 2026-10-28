@@ -156,11 +156,20 @@ describe('exclusionArgs', () => {
       entry('c', 'plain'),
     ]);
     expect(args[0]).toBe('-t');
-    expect(args[1]).toBe('^(?!.*(?:does \\(x\\)|plain))');
+    expect(args[1]).toBe('^(?!(?:.* )?(?:does \\(x\\)|plain)$)');
   });
   it('mocha: --grep with the same construction', () => {
     const args = exclusionArgs('mocha', [entry('a', 'one')]);
-    expect(args).toEqual(['--grep', '^(?!.*(?:one))']);
+    expect(args).toEqual(['--grep', '^(?!(?:.* )?(?:one)$)']);
+  });
+  it('jest/mocha: excludes the quarantined title only, not names that merely contain it (R5 bug 7)', () => {
+    const re = new RegExp(exclusionArgs('jest', [entry('a', 'login')])[1]!);
+    // full names as jest -t / mocha --grep see them: describe chain + title, space-joined
+    expect(re.test('login')).toBe(false); // excluded
+    expect(re.test('ui login')).toBe(false); // excluded (same title under a describe)
+    expect(re.test('login ok works')).toBe(true); // kept
+    expect(re.test('relogin')).toBe(true); // kept
+    expect(re.test('ui relogin')).toBe(true); // kept
   });
   it('go and generic: no exclusion support', () => {
     expect(exclusionArgs('go', [entry('a')])).toEqual([]);

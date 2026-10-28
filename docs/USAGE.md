@@ -414,9 +414,12 @@ Per runner:
   matches `--deselect` as a node-id *prefix*, so quarantining `test_mod` also
   deselects a sibling named `test_mod2` in the same module/class.
 - **Jest** — a single `-t "<pattern>"` where pattern is
-  `^(?!.*(?:name1|name2))` (names regex-escaped, deduped): a negative
+  `^(?!(?:.* )?(?:name1|name2)$)` (names regex-escaped, deduped): a negative
   lookahead that matches every test name *except* the quarantined ones, so
-  Jest's name filter keeps everything else.
+  Jest's name filter keeps everything else. `-t` sees the full name
+  (describe chain + title, space-joined), and each quarantined title must be
+  its whole final segment: quarantining `login` excludes `login` and
+  `ui login`, but not `login ok works` or `relogin`.
 - **Mocha** — same construction via `--grep`.
 - **Go / generic** — **no per-test exclusion exists** in `go test`; entries
   are stored and reported (you'll see exactly which tests are quarantined)

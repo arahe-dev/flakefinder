@@ -181,10 +181,9 @@ describe('quarantine forwarding mechanics', () => {
   it('shellQuote wraps arguments containing spaces/metacharacters', async () => {
     const { shellQuote, isPackageManagerWrapper } = await import('./wrap.js');
     expect(shellQuote('safe-token_1.txt')).toBe('safe-token_1.txt');
-    const quoted = shellQuote('^(?!.*(?:annoying flake))');
-    expect(
-      quoted === '"^(?!.*(?:annoying flake))"' || quoted === "'^(?!.*(?:annoying flake))'",
-    ).toBe(true);
+    expect(shellQuote('^(?!(?:.* )?(?:annoying flake)$)', { platform: 'linux' })).toBe(
+      "'^(?!(?:.* )?(?:annoying flake)$)'",
+    );
     expect(isPackageManagerWrapper(['npm', 'test'])).toBe(true);
     expect(isPackageManagerWrapper(['npm.cmd', 'test'])).toBe(true);
     expect(isPackageManagerWrapper(['yarn', 'jest'])).toBe(true);
@@ -231,7 +230,7 @@ describe('quarantine forwarding mechanics', () => {
     });
     const received = JSON.parse(readFileSync(path.join(cwd, 'received.json'), 'utf8')) as string[];
     expect(received).toContain('-t');
-    expect(received).toContain('^(?!.*(?:annoying flake))'); // one intact arg, not split
+    expect(received).toContain('^(?!(?:.* )?(?:annoying flake)$)'); // one intact arg, not split
   }, 60_000);
 });
 
@@ -325,7 +324,7 @@ process.exit(n === 1 ? 1 : 0);
     );
     const argv = JSON.parse(readFileSync(path.join(cwd, 'argv.json'), 'utf8')) as string[];
     expect(argv).toContain('-t');
-    expect(argv).toContain('^(?!.*(?:test_x))');
+    expect(argv).toContain('^(?!(?:.* )?(?:test_x)$)');
   }, 60_000);
 });
 

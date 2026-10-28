@@ -162,10 +162,14 @@ export function exclusionArgs(
     }
     case 'jest':
     case 'mocha': {
-      // -t/--grep with a negative lookahead that skips any matching test name
+      // jest -t / mocha --grep match against the FULL test name (describe
+      // chain + title, space-joined). Anchor each quarantined title as a
+      // space-delimited FINAL segment — the same anchoring adapters.ts uses
+      // for targeted re-runs — so quarantining "login" excludes "login" and
+      // "ui login", but not "login ok works" or "relogin".
       const names = [...new Set(entries.map((e) => escapeRegExp(e.name)))];
       const flag = runner === 'jest' ? '-t' : '--grep';
-      return [flag, `^(?!.*(?:${names.join('|')}))`];
+      return [flag, `^(?!(?:.* )?(?:${names.join('|')})$)`];
     }
     // go / generic: no per-test exclusion — callers must warn
     default:
