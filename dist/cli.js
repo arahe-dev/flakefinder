@@ -3,7 +3,7 @@
 // src/cli/index.ts
 import { spawn as spawn2, spawnSync as spawnSync3 } from "child_process";
 import { randomUUID as randomUUID2 } from "crypto";
-import { existsSync as existsSync5, mkdirSync as mkdirSync2, readFileSync as readFileSync5, writeFileSync as writeFileSync3 } from "fs";
+import { existsSync as existsSync6, mkdirSync as mkdirSync2, readFileSync as readFileSync5, writeFileSync as writeFileSync3 } from "fs";
 import path7 from "path";
 import { Command } from "commander";
 
@@ -59,7 +59,35 @@ function stripJsonComments(text) {
     out += c;
     i++;
   }
-  return out.replace(/,(\s*[}\]])/g, "$1");
+  return stripTrailingCommas(out);
+}
+function stripTrailingCommas(text) {
+  let out = "";
+  let inString = false;
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (c === "\\") {
+        out += text[i + 1] ?? "";
+        i++;
+      } else if (c === quote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inString = true;
+      quote = c;
+    } else if (c === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === "}" || text[j] === "]") continue;
+    }
+    out += c;
+  }
+  return out;
 }
 var ConfigValidationError = class extends Error {
 };
@@ -174,6 +202,17 @@ function resolveConfig(config = {}, overrides = {}) {
     ...overrides
   };
 }
+function anchorConfigPaths(config, configDir) {
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return config;
+  const out = { ...config };
+  for (const key of ["storeDir", "quarantineFile"]) {
+    const v = out[key];
+    if (typeof v === "string" && v.trim() !== "" && !path.isAbsolute(v)) {
+      out[key] = path.resolve(configDir, v);
+    }
+  }
+  return out;
+}
 function loadConfig(cwd) {
   let dir = path.resolve(cwd);
   for (let depth = 0; depth <= 3; depth++) {
@@ -189,7 +228,7 @@ function loadConfig(cwd) {
         const parsed = JSON.parse(
           stripJsonComments(raw.replace(/^\uFEFF/, ""))
         );
-        return { config: parsed, path: candidate };
+        return { config: anchorConfigPaths(parsed, dir), path: candidate };
       } catch (err) {
         throw new Error(`invalid config in ${candidate}: ${err.message}`);
       }
@@ -229,16 +268,129 @@ function detectRunner(cwd) {
 
 // src/doctor.ts
 import { spawnSync } from "child_process";
-import { existsSync as existsSync4, statSync as statSync3 } from "fs";
+import { existsSync as existsSync4, statSync as statSync4 } from "fs";
 import path5 from "path";
 
 // src/quarantine/manager.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2, writeFileSync } from "fs";
+import {
+  closeSync,
+  existsSync as existsSync2,
+  openSync,
+  readFileSync as readFileSync2,
+  renameSync,
+  rmSync,
+  statSync as statSync2,
+  writeFileSync,
+  writeSync
+} from "fs";
 import path2 from "path";
+
+// src/runner/adapters.ts
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function titleAlternation(names) {
+  const alts = names.map((n) => escapeRegExp(n.trim()).replace(/ > /g, "(?: > | )"));
+  return [...new Set(alts)].join("|");
+}
+function failedNamesOf(records) {
+  const names = /* @__PURE__ */ new Set();
+  for (const r of records) {
+    for (const t of r.results) {
+      if (t.status === "fail" || t.status === "error") names.add(t.name);
+    }
+  }
+  return [...names];
+}
+function failedOnlyArgs(runner, failedNames, quarantinedNames = []) {
+  if (failedNames.length === 0) return null;
+  switch (runner) {
+    case "jest":
+    case "mocha": {
+      const include = titleAlternation(failedNames);
+      const exclude = titleAlternation(quarantinedNames);
+      const pattern = exclude !== "" ? `^(?=(?:.* )?(?:${include})\\s*$)(?!(?:.* )?(?:${exclude})\\s*$)` : `^(?:.* )?(?:${include})\\s*$`;
+      return runner === "jest" ? ["-t", pattern] : ["--grep", pattern];
+    }
+    case "go": {
+      const parents = new Set(failedNames.map((n) => n.includes("/") ? n.split("/")[0] : n));
+      const pattern = `^(${[...parents].map(escapeRegExp).join("|")})$`;
+      return ["-run", pattern];
+    }
+    case "pytest":
+      return ["--lf"];
+    default:
+      return null;
+  }
+}
+
+// src/quarantine/manager.ts
 var EMPTY = { version: 1, entries: [] };
+function applyOp(entries, op) {
+  if (op.kind === "remove") return entries.filter((e) => e.testId !== op.testId);
+  const prior = entries.find((e) => e.testId === op.entry.testId);
+  const entry = prior?.quarantinedAt ? { ...op.entry, quarantinedAt: prior.quarantinedAt } : op.entry;
+  return [...entries.filter((e) => e.testId !== op.entry.testId), entry];
+}
+var LOCK_TIMEOUT_MS = 1e4;
+var LOCK_STALE_MS = 3e4;
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+function lockIsStale(lockPath) {
+  let pid;
+  let mtimeMs;
+  try {
+    pid = Number.parseInt(readFileSync2(lockPath, "utf8"), 10);
+    mtimeMs = statSync2(lockPath).mtimeMs;
+  } catch {
+    return true;
+  }
+  if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if (err.code === "ESRCH") return true;
+    }
+  }
+  return Date.now() - mtimeMs > LOCK_STALE_MS;
+}
+function withFileLock(target, fn) {
+  const lockPath = `${target}.lock`;
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (; ; ) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeSync(fd, String(process.pid));
+      } finally {
+        closeSync(fd);
+      }
+      break;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      if (lockIsStale(lockPath)) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `quarantine file is locked by another flakefinder process (${lockPath}) \u2014 delete the lock if no other flakefinder is running`
+        );
+      }
+      sleepSync(10 + Math.floor(Math.random() * 20));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lockPath, { force: true });
+  }
+}
 var QuarantineManager = class {
   filePath;
   file;
+  pending = [];
   constructor(filePath) {
     this.filePath = filePath;
     this.file = this.load();
@@ -247,71 +399,139 @@ var QuarantineManager = class {
     if (!existsSync2(this.filePath)) return { ...EMPTY, entries: [] };
     try {
       const parsed = JSON.parse(readFileSync2(this.filePath, "utf8"));
-      if (!Array.isArray(parsed.entries)) throw new Error('missing "entries" array');
-      return { version: 1, entries: parsed.entries };
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("expected a JSON object");
+      }
+      const obj = parsed;
+      if (!Array.isArray(obj.entries)) throw new Error('missing "entries" array');
+      obj.entries.forEach((e, i) => {
+        if (typeof e !== "object" || e === null || Array.isArray(e)) {
+          throw new Error(`entry #${i + 1} is not an object`);
+        }
+        for (const field of ["testId", "suite", "name"]) {
+          const value = e[field];
+          if (typeof value !== "string" || value === "") {
+            throw new Error(`entry #${i + 1} has no string "${field}"`);
+          }
+        }
+      });
+      return { ...obj, version: 1, entries: obj.entries };
     } catch (err) {
       throw new Error(`invalid quarantine file ${this.filePath}: ${err.message}`);
     }
   }
+  apply(op) {
+    this.pending.push(op);
+    this.file.entries = applyOp(this.file.entries, op);
+  }
   list() {
     return [...this.file.entries];
   }
-  /** Add or replace an entry (same testId). */
+  /** Add or replace an entry (same testId); a re-add keeps the original quarantinedAt. */
   add(entry) {
-    this.file.entries = this.file.entries.filter((e) => e.testId !== entry.testId);
-    this.file.entries.push(entry);
+    this.apply({ kind: "add", entry });
   }
   remove(testId) {
-    const before = this.file.entries.length;
-    this.file.entries = this.file.entries.filter((e) => e.testId !== testId);
-    return this.file.entries.length < before;
+    const existed = this.file.entries.some((e) => e.testId === testId);
+    if (existed) this.apply({ kind: "remove", testId });
+    return existed;
   }
   /**
    * Drop entries that no longer deserve quarantine. Deliberately
    * conservative: quarantined tests are excluded from runs, so "not seen
    * lately" is NOT evidence of health (that would silently un-quarantine
    * everything). An entry leaves quarantine only on positive evidence —
-   * the test ran (quarantine disabled or full-suite run) and passed stably —
-   * or when the entry is older than 90 days and the test is gone from
+   * the test ran (quarantine disabled or full-suite run) since it was
+   * quarantined and passed stably — or when the entry is older than 90 days and the test is gone from
    * history. Returns the removed entries.
    */
   prune(verdicts, maxAgeDays = 90) {
     if (verdicts.length === 0) return [];
     const byId = new Map(verdicts.map((v) => [v.testId, v]));
     const removed = [];
-    const kept = [];
     for (const entry of this.file.entries) {
       const v = byId.get(entry.testId);
-      const healthy = v !== void 0 && v.classification === "passing" && v.runsObserved >= 10;
       const quarantinedMs = Date.parse(entry.quarantinedAt);
+      const seenSince = v !== void 0 && (Number.isNaN(quarantinedMs) || Date.parse(v.lastSeen) >= quarantinedMs);
+      const healthy = v !== void 0 && seenSince && v.classification === "passing" && v.runsObserved >= 10;
       const agedOut = v?.classification === "gone" && !Number.isNaN(quarantinedMs) && Date.now() - quarantinedMs > maxAgeDays * 864e5;
       if (healthy || agedOut) removed.push(entry);
-      else kept.push(entry);
     }
-    this.file.entries = kept;
+    for (const entry of removed) this.apply({ kind: "remove", testId: entry.testId });
     return removed;
   }
+  /**
+   * Persist this manager's changes. Under the lockfile: re-read the file
+   * (another process may have saved since our constructor ran), replay our
+   * pending operations onto it, then write atomically — a temp file in the
+   * same directory renamed over the target, so neither a crash nor a
+   * concurrent reader ever sees a torn file.
+   */
   save() {
-    writeFileSync(this.filePath, `${JSON.stringify(this.file, null, 2)}
+    withFileLock(this.filePath, () => {
+      const fresh = this.load();
+      for (const op of this.pending) fresh.entries = applyOp(fresh.entries, op);
+      const tmp = `${this.filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+      try {
+        writeFileSync(tmp, `${JSON.stringify(fresh, null, 2)}
 `, "utf8");
+        renameSync(tmp, this.filePath);
+      } catch (err) {
+        rmSync(tmp, { force: true });
+        throw err;
+      }
+      this.file = fresh;
+      this.pending = [];
+    });
   }
 };
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var ROOT_MARKERS = ["pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg", "setup.py", ".git"];
+function existsUpward(cwd, rel) {
+  let dir = path2.resolve(cwd);
+  for (; ; ) {
+    if (existsSync2(path2.join(dir, rel))) return true;
+    const parent = path2.dirname(dir);
+    if (parent === dir || ROOT_MARKERS.some((m) => existsSync2(path2.join(dir, m)))) return false;
+    dir = parent;
+  }
 }
-function exclusionArgs(runner, entries) {
+function pytestNodeId(suite, name, cwd) {
+  if (/[\\/]|::|\.py$/.test(suite)) return `${suite.replace(/\\/g, "/")}::${name}`;
+  const parts = suite.split(".").filter((p) => p !== "");
+  if (parts.length === 0) return name;
+  let moduleEnd = 0;
+  if (cwd !== void 0) {
+    for (let i = parts.length; i >= 1; i--) {
+      if (existsUpward(cwd, `${parts.slice(0, i).join("/")}.py`)) {
+        moduleEnd = i;
+        break;
+      }
+    }
+  }
+  if (moduleEnd === 0) {
+    moduleEnd = 1;
+    for (let i = parts.length - 1; i >= 1; i--) {
+      if (!/^[A-Z]/.test(parts[i])) {
+        moduleEnd = i + 1;
+        break;
+      }
+    }
+  }
+  const file = `${parts.slice(0, moduleEnd).join("/")}.py`;
+  return [file, ...parts.slice(moduleEnd), name].join("::");
+}
+function exclusionArgs(runner, entries, cwd) {
   if (entries.length === 0) return [];
   switch (runner) {
     case "pytest": {
       const args = [];
-      for (const e of entries) args.push("--deselect", `${e.suite}::${e.name}`);
+      for (const e of entries) args.push("--deselect", pytestNodeId(e.suite, e.name, cwd));
       return args;
     }
     case "jest":
     case "mocha": {
-      const names = [...new Set(entries.map((e) => escapeRegExp(e.name)))];
       const flag = runner === "jest" ? "-t" : "--grep";
-      return [flag, `^(?!.*(?:${names.join("|")}))`];
+      return [flag, `^(?!(?:.* )?(?:${titleAlternation(entries.map((e) => e.name))})\\s*$)`];
     }
     // go / generic: no per-test exclusion — callers must warn
     default:
@@ -320,22 +540,73 @@ function exclusionArgs(runner, entries) {
 }
 
 // src/store/history-store.ts
+import { randomBytes } from "crypto";
 import {
   appendFileSync,
+  closeSync as closeSync2,
   existsSync as existsSync3,
+  linkSync,
   mkdirSync,
+  openSync as openSync2,
   readFileSync as readFileSync3,
-  renameSync,
-  rmSync,
-  statSync as statSync2,
-  writeFileSync as writeFileSync2
+  renameSync as renameSync2,
+  rmSync as rmSync2,
+  statSync as statSync3,
+  writeFileSync as writeFileSync2,
+  writeSync as writeSync2
 } from "fs";
 import path3 from "path";
 function snapshotPath(storeDir) {
   return path3.join(storeDir, "verdicts-snapshot.json");
 }
 var STORE_FORMAT_VERSION = 1;
-var HistoryStore = class {
+var StoreBusyError = class extends Error {
+};
+var LOCK_STALE_MS2 = 3e4;
+function uniqueSuffix() {
+  return `${process.pid}-${randomBytes(6).toString("hex")}`;
+}
+function lockAgeMs(lockPath, content) {
+  if (content) {
+    try {
+      const holder = JSON.parse(content);
+      if (typeof holder.epoch === "number" && Number.isFinite(holder.epoch)) {
+        return Date.now() - holder.epoch;
+      }
+    } catch {
+    }
+  }
+  try {
+    return Date.now() - statSync3(lockPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+function breakStaleLock(lockPath, observed) {
+  const aside = `${lockPath}.stale-${uniqueSuffix()}`;
+  try {
+    renameSync2(lockPath, aside);
+  } catch {
+    return false;
+  }
+  let moved = null;
+  try {
+    moved = readFileSync3(aside, "utf8");
+  } catch {
+  }
+  const age = lockAgeMs(aside, moved);
+  if (moved === observed && age !== null && age > LOCK_STALE_MS2) {
+    rmSync2(aside, { force: true });
+    return true;
+  }
+  try {
+    linkSync(aside, lockPath);
+  } catch {
+  }
+  rmSync2(aside, { force: true });
+  return false;
+}
+var HistoryStore = class _HistoryStore {
   path;
   warnings = [];
   /** Schema version read from the file header; null for legacy header-less stores. */
@@ -349,6 +620,8 @@ var HistoryStore = class {
   unreadable = null;
   loaded = false;
   records = [];
+  /** Content of the lock file this instance wrote; release only removes a lock that still matches. */
+  lockToken = null;
   constructor(storeDir) {
     this.path = path3.join(storeDir, "history.jsonl");
   }
@@ -418,7 +691,7 @@ var HistoryStore = class {
     this.records.push(parsed);
   }
   ensureHeader() {
-    if (existsSync3(this.path) && statSync2(this.path).size > 0) return;
+    if (existsSync3(this.path) && statSync3(this.path).size > 0) return;
     appendFileSync(this.path, `${JSON.stringify({ version: STORE_FORMAT_VERSION })}
 `, "utf8");
     this.formatVersion = STORE_FORMAT_VERSION;
@@ -432,37 +705,87 @@ var HistoryStore = class {
    * lock serializes them. Busy-waits in ≤50 ms slices (Atomics.wait) up to 2 s
    * before giving up with an actionable error; a lock older than 30 s is
    * treated as abandoned by a dead process and stolen.
+   *
+   * The lock file is created atomically WITH its content (write a private
+   * temp file, then link() it into place — link fails if the lock exists), so
+   * competitors never see a half-written lock. Empty/unparseable locks (older
+   * flakefinder versions, torn writes) are aged by mtime, and stale locks are
+   * broken by rename-then-verify (breakStaleLock), so two waiters can never
+   * delete each other's freshly acquired lock.
    */
   acquireLock() {
     const deadline = Date.now() + 2e3;
     for (; ; ) {
-      try {
-        writeFileSync2(this.lockPath, JSON.stringify({ pid: process.pid, epoch: Date.now() }), {
-          flag: "wx"
-        });
-        return;
-      } catch {
-        let ageMs = Infinity;
-        try {
-          const holder = JSON.parse(readFileSync3(this.lockPath, "utf8"));
-          if (typeof holder.epoch === "number") ageMs = Date.now() - holder.epoch;
-        } catch {
-        }
-        if (ageMs > 3e4) {
-          rmSync(this.lockPath, { force: true });
-          continue;
-        }
-        if (Date.now() >= deadline) {
-          throw new Error(
-            `history store is busy (held by another flakefinder process for >2s): ${this.lockPath}. Run ingest steps serially, or give each CI shard its own storeDir.`
-          );
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      if (this.tryCreateLock()) return;
+      if (Date.now() >= deadline) {
+        throw new StoreBusyError(
+          `history store is busy (held by another flakefinder process for >2s): ${this.lockPath}. Run ingest steps serially, or give each CI shard its own storeDir.`
+        );
       }
+      let content;
+      try {
+        content = readFileSync3(this.lockPath, "utf8");
+      } catch (err) {
+        const code = err.code;
+        if (code === "ENOENT") continue;
+        throw this.lockError(code, "exists but cannot be read as a lock file");
+      }
+      const ageMs = lockAgeMs(this.lockPath, content);
+      if (ageMs === null) continue;
+      if (ageMs > LOCK_STALE_MS2 && breakStaleLock(this.lockPath, content)) continue;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  lockError(code, what) {
+    return new Error(
+      `history store lock ${this.lockPath} ${what} (${code ?? "error"}) \u2014 check that the store directory is writable and that the lock path is not a directory`
+    );
+  }
+  /**
+   * One attempt to take the lock: true on success, false ONLY when another
+   * process holds it (EEXIST). Anything else — read-only directory (EACCES,
+   * EROFS), missing dir, … — throws: retrying cannot fix it, and treating it
+   * as "held" used to spin forever.
+   */
+  tryCreateLock() {
+    const token = JSON.stringify({
+      pid: process.pid,
+      epoch: Date.now(),
+      nonce: randomBytes(6).toString("hex")
+    });
+    const tmp = `${this.lockPath}.${uniqueSuffix()}.tmp`;
+    try {
+      writeFileSync2(tmp, token, "utf8");
+    } catch (err) {
+      throw this.lockError(err.code, "cannot be created");
+    }
+    try {
+      linkSync(tmp, this.lockPath);
+      this.lockToken = token;
+      return true;
+    } catch (err) {
+      const code = err.code;
+      if (code === "EEXIST") return false;
+      try {
+        writeFileSync2(this.lockPath, token, { flag: "wx" });
+        this.lockToken = token;
+        return true;
+      } catch (err2) {
+        const code2 = err2.code;
+        if (code2 === "EEXIST") return false;
+        throw this.lockError(code2, "cannot be created");
+      }
+    } finally {
+      rmSync2(tmp, { force: true });
     }
   }
   releaseLock() {
-    rmSync(this.lockPath, { force: true });
+    const token = this.lockToken;
+    this.lockToken = null;
+    try {
+      if (readFileSync3(this.lockPath, "utf8") === token) rmSync2(this.lockPath, { force: true });
+    } catch {
+    }
   }
   loadAll() {
     this.ensureLoaded();
@@ -478,14 +801,17 @@ var HistoryStore = class {
    * (a directory's stat size is non-zero) and crash in appendFileSync.
    */
   assertWritableFile() {
-    if (existsSync3(this.path) && !statSync2(this.path).isFile()) {
+    if (existsSync3(this.path) && !statSync3(this.path).isFile()) {
       throw new Error(
         `history store ${this.path} exists but is not a regular file \u2014 delete or rename it (flakefinder recreates it on the next write)`
       );
     }
   }
+  /**
+   * Appends without reading the store: when this instance has not loaded the
+   * file yet, the record simply becomes part of the next (lazy) read.
+   */
   append(run) {
-    this.ensureLoaded();
     this.ensureStoreDir();
     this.assertWritableFile();
     this.acquireLock();
@@ -500,7 +826,7 @@ var HistoryStore = class {
           `cannot write history store ${this.path} (${e.code ?? "error"}) \u2014 check it is a writable regular file`
         );
       }
-      this.records.push(run);
+      if (this.loaded) this.records.push(run);
     } finally {
       this.releaseLock();
     }
@@ -510,47 +836,63 @@ var HistoryStore = class {
    * Re-reads the file FRESH inside the lock: a stale in-memory snapshot
    * would silently delete records another process appended between our load
    * and this prune (verified 10/10 with two concurrent ingests before the
-   * fix). In-memory records are resynced to the fresh state.
+   * fix). In-memory records are resynced to the fresh state — including an
+   * empty one: the stale view is only kept when the fresh read FAILED, and
+   * then nothing is rewritten.
    */
   prune(maxRuns) {
-    this.ensureLoaded();
-    if (!existsSync3(this.path)) return;
     if (this.unreadable) return;
+    if (!existsSync3(this.path)) return;
     this.ensureStoreDir();
-    this.acquireLock();
     try {
-      const fresh = [];
-      try {
-        const lines = readFileSync3(this.path, "utf8").split(/\r?\n/);
-        for (const line of lines) {
-          const t = line.trim();
-          if (!t) continue;
-          try {
-            const parsed = JSON.parse(t);
-            if (typeof parsed.runId === "string" && Array.isArray(parsed.results)) {
-              fresh.push(parsed);
-            }
-          } catch {
-          }
+      this.acquireLock();
+    } catch (err) {
+      if (!(err instanceof StoreBusyError)) throw err;
+      this.warnings.push(`history store busy \u2014 prune skipped this time: ${this.path}`);
+      return;
+    }
+    try {
+      const fresh = new _HistoryStore(path3.dirname(this.path));
+      const source = fresh.runs();
+      if (fresh.unreadable !== null) {
+        if (this.loaded) {
+          this.warnings.push(`history store unreadable during prune \u2014 not pruned: ${this.path}`);
+        } else {
+          this.adopt(fresh);
         }
-      } catch {
+        return;
       }
-      const source = fresh.length > 0 ? fresh : this.records;
       if (source.length <= maxRuns) {
-        this.records = source;
+        this.adopt(fresh);
         return;
       }
       const keep = source.slice(-maxRuns);
+      const version = Math.max(fresh.formatVersion ?? STORE_FORMAT_VERSION, STORE_FORMAT_VERSION);
       const tmp = `${this.path}.tmp`;
-      const header = this.formatVersion === null ? `${JSON.stringify({ version: STORE_FORMAT_VERSION })}
-` : "";
-      writeFileSync2(tmp, `${header}${keep.map((r) => JSON.stringify(r)).join("\n")}
-`, "utf8");
-      renameSync(tmp, this.path);
+      const fd = openSync2(tmp, "w");
+      try {
+        writeSync2(fd, `${JSON.stringify({ version })}
+`, null, "utf8");
+        for (const r of keep) writeSync2(fd, `${JSON.stringify(r)}
+`, null, "utf8");
+      } finally {
+        closeSync2(fd);
+      }
+      renameSync2(tmp, this.path);
+      this.adopt(fresh);
       this.records = keep;
+      this.formatVersion = version;
     } finally {
       this.releaseLock();
     }
+  }
+  /** Resync this instance's view to a fresh read of the same store. */
+  adopt(fresh) {
+    if (!this.loaded) this.warnings.push(...fresh.warnings);
+    this.loaded = true;
+    this.records = fresh.runs();
+    this.formatVersion = fresh.formatVersion;
+    this.unreadable = fresh.unreadable;
   }
 };
 
@@ -662,7 +1004,7 @@ function runDoctor(cwd) {
           hint: `check that ${store.path} is a readable regular file (delete or rename it if it is a directory)`
         });
       } else {
-        const sizeKb = Math.round(statSync3(store.path).size / 1024);
+        const sizeKb = Math.round(statSync4(store.path).size / 1024);
         lines.push({
           status: "ok",
           message: `history: ${runs.length} run(s), ${sizeKb} KB${store.formatVersion ? `, format v${store.formatVersion}` : " (legacy, no header)"}`
@@ -926,7 +1268,9 @@ function confidenceFor(classification, observed, cfg) {
 function classifyAll(runs, cfg) {
   if (runs.length === 0) return [];
   const sorted = sortRuns(runs);
-  const recentRunIds = new Set(sorted.slice(-GONE_AFTER_RUNS).map((r) => r.runId));
+  const runOrder = [];
+  for (const r of sorted) if (runOrder[runOrder.length - 1] !== r.runId) runOrder.push(r.runId);
+  const recentRunIds = new Set(runOrder.slice(-GONE_AFTER_RUNS));
   const histories = buildHistories(sorted);
   const verdicts = histories.map((h) => {
     const nonSkip = h.observations.filter((o) => o.status !== "skip");
@@ -1014,6 +1358,13 @@ function makeTestId(suite, name) {
 }
 
 // src/parsers/internal.ts
+var XML_OPTIONS = {
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  parseTagValue: false,
+  parseAttributeValue: false,
+  htmlEntities: true
+};
 function isObj(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -1036,16 +1387,41 @@ function stripBom(content) {
 function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
 }
-function firstNonEmptyLine(content) {
-  for (const line of content.split(/\r?\n/)) {
-    if (line.trim() !== "") return line;
-  }
-  return null;
+var MAX_FLAKY_NAMES = 10;
+function flakyRetryMessage(failedAttempts, how, firstFailure, max) {
+  const header = `flaky: failed ${failedAttempts} of ${failedAttempts + 1} attempts before passing on ${how}`;
+  const first = trimTo(firstFailure, max);
+  return trimTo(first !== void 0 ? `${header} \u2014 first failure: ${first}` : header, max);
+}
+function flakyRetryWarning(format, sourcePath, how, names) {
+  const shown = names.slice(0, MAX_FLAKY_NAMES).join(", ");
+  const more = names.length > MAX_FLAKY_NAMES ? ` \u2026and ${names.length - MAX_FLAKY_NAMES} more` : "";
+  return `${format}: ${sourcePath}: ${names.length} test(s) FLAKY \u2014 failed, then passed on ${how} (recorded as pass with the failure in the message): ${shown}${more}`;
 }
 
 // src/parsers/gotest.ts
 var MAX_MALFORMED_DETAILS = 5;
+var SNIFF_MAX_LINES = 50;
+var WARNING_EXCERPT_LINES = 5;
 var MESSAGE_MAX_CHARS = 2e3;
+var MAX_FLAKY_NAMES2 = 10;
+function excerptOf(lines) {
+  const kept = lines.map((l) => stripAnsi(l).trim()).filter((l) => l !== "");
+  const head = kept.slice(0, WARNING_EXCERPT_LINES).join(" | ");
+  return kept.length > WARNING_EXCERPT_LINES ? `${head} | \u2026` : head;
+}
+function isBenchmark(test) {
+  return /^Benchmark/.test(test);
+}
+function hasBenchResult(outputs) {
+  return /^Benchmark\S*\s+\d+\s+[\d.]+ \S+\/op\b/m.test(outputs.join(""));
+}
+function isFailFamily(status) {
+  return status === "fail" || status === "error";
+}
+function newRun() {
+  return { durationMs: null, outputs: [] };
+}
 function elapsedToMs(ev) {
   const raw = ev.elapsed !== void 0 ? ev.elapsed : ev.Elapsed;
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return null;
@@ -1060,25 +1436,37 @@ function messageFromOutputs(outputs) {
 var goTestParser = {
   name: "go",
   sniff(content) {
-    const first = firstNonEmptyLine(stripBom(content));
-    if (first === null) return false;
-    try {
-      const ev = JSON.parse(first);
-      return isObj(ev) && "Action" in ev && "Package" in ev;
-    } catch {
-      return false;
+    let seen = 0;
+    for (const raw of stripBom(content).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (line === "") continue;
+      if (++seen > SNIFF_MAX_LINES) return false;
+      if (!line.startsWith("{")) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (isObj(ev) && "Action" in ev && ("Package" in ev || "ImportPath" in ev)) return true;
+      } catch {
+      }
     }
+    return false;
   },
   parse(content, sourcePath) {
     const results = [];
     const warnings = [];
     const tests = /* @__PURE__ */ new Map();
     const failedPackages = /* @__PURE__ */ new Map();
+    const builds = /* @__PURE__ */ new Map();
+    const strayText = [];
+    const passedPackages = /* @__PURE__ */ new Set();
     let malformed = 0;
     const lines = stripBom(content).split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (line === void 0 || line.trim() === "") continue;
+      if (!line.trimStart().startsWith("{")) {
+        strayText.push(line.trim());
+        continue;
+      }
       let ev;
       try {
         ev = JSON.parse(line);
@@ -1090,15 +1478,25 @@ var goTestParser = {
         continue;
       }
       if (!isObj(ev)) continue;
+      if (ev.Action === "build-output" || ev.Action === "build-fail") {
+        const importPath = typeof ev.ImportPath === "string" ? ev.ImportPath : "(unknown)";
+        const build = builds.get(importPath) ?? { failed: false, outputs: [] };
+        if (ev.Action === "build-fail") build.failed = true;
+        else if (typeof ev.Output === "string") build.outputs.push(ev.Output);
+        builds.set(importPath, build);
+        continue;
+      }
       const pkg = typeof ev.Package === "string" ? ev.Package : "";
       const test = typeof ev.Test === "string" && ev.Test.trim() !== "" ? ev.Test : null;
       if (pkg === "") continue;
       const action = ev.Action;
       const out = ev.Output !== void 0 ? ev.Output : ev.output;
       if (test === null) {
+        if (action === "pass") passedPackages.add(pkg);
         if (action === "fail") {
           const entry = failedPackages.get(pkg) ?? { failed: false, outputs: [] };
           entry.failed = true;
+          if (typeof ev.FailedBuild === "string") entry.failedBuild = ev.FailedBuild;
           failedPackages.set(pkg, entry);
         } else if (action === "output" && typeof out === "string") {
           const entry = failedPackages.get(pkg) ?? { failed: false, outputs: [] };
@@ -1113,23 +1511,33 @@ var goTestParser = {
         if (action !== "run" && action !== "pass" && action !== "fail" && action !== "skip") {
           continue;
         }
-        acc = { pkg, test, durationMs: null, outputs: [] };
+        acc = { pkg, test, runs: [newRun()] };
         tests.set(key, acc);
+      } else if ((action === "run" || action === "pass" || action === "fail" || action === "skip") && acc.runs[acc.runs.length - 1].status !== void 0) {
+        acc.runs.push(newRun());
       }
+      const run = acc.runs[acc.runs.length - 1];
       if (action === "pass" || action === "fail" || action === "skip") {
-        acc.status = action;
-        acc.durationMs = elapsedToMs(ev);
+        run.status = action;
+        run.durationMs = elapsedToMs(ev);
       } else if (action === "output") {
-        if (typeof out === "string") acc.outputs.push(out);
+        if (typeof out === "string") run.outputs.push(out);
       }
     }
     if (malformed > MAX_MALFORMED_DETAILS) {
       warnings.push(`\u2026and ${malformed - MAX_MALFORMED_DETAILS} more malformed lines`);
     }
-    let dangling = 0;
+    const rows = [];
     for (const acc of tests.values()) {
-      if (acc.status === void 0) {
-        dangling++;
+      const last = acc.runs[acc.runs.length - 1];
+      if (last.status === void 0 && isBenchmark(acc.test)) {
+        const prefix = `${acc.test}/`;
+        const ran = hasBenchResult(last.outputs) || passedPackages.has(acc.pkg) || [...tests.values()].some(
+          (o) => o.pkg === acc.pkg && o.test.startsWith(prefix) && hasBenchResult(o.runs[o.runs.length - 1].outputs)
+        );
+        if (ran) last.status = "pass";
+      }
+      if (last.status === void 0) {
         const result2 = {
           testId: makeTestId(acc.pkg, acc.test),
           suite: acc.pkg,
@@ -1138,43 +1546,95 @@ var goTestParser = {
           durationMs: null,
           message: "test started but never reported a result (test binary crashed mid-run?)"
         };
-        const output = messageFromOutputs(acc.outputs);
+        const output = messageFromOutputs(last.outputs);
         if (output !== void 0) result2.message = `${result2.message}
 ${output}`;
-        results.push(result2);
+        rows.push({ acc, result: result2, dangling: true, flaky: false });
         continue;
       }
+      const failed = acc.runs.filter((r) => r.status === "fail");
+      const reported = failed[0] ?? last;
       const result = {
         testId: makeTestId(acc.pkg, acc.test),
         suite: acc.pkg,
         name: acc.test,
-        status: acc.status,
-        durationMs: acc.durationMs
+        status: reported.status,
+        durationMs: reported.durationMs
       };
-      const message = messageFromOutputs(acc.outputs);
+      let message = messageFromOutputs(reported.outputs);
+      const isFlaky2 = failed.length > 0 && failed.length < acc.runs.length;
+      if (isFlaky2) {
+        const note = `flaky: failed ${failed.length} of ${acc.runs.length} runs in this report`;
+        message = message !== void 0 ? `${note}
+${message}` : note;
+      }
       if (message !== void 0) result.message = message;
-      results.push(result);
+      rows.push({ acc, result, dangling: false, flaky: isFlaky2 });
+    }
+    const hasChildren = /* @__PURE__ */ new Set();
+    const hasFailingChild = /* @__PURE__ */ new Set();
+    for (const { acc, result } of rows) {
+      const parts = acc.test.split("/");
+      for (let depth = 1; depth < parts.length; depth++) {
+        const ancestor = `${acc.pkg}\0${parts.slice(0, depth).join("/")}`;
+        hasChildren.add(ancestor);
+        if (isFailFamily(result.status)) hasFailingChild.add(ancestor);
+      }
+    }
+    let dangling = 0;
+    const flaky = [];
+    for (const row of rows) {
+      const key = `${row.acc.pkg}\0${row.acc.test}`;
+      if (hasChildren.has(key) && (hasFailingChild.has(key) || !isFailFamily(row.result.status))) {
+        continue;
+      }
+      if (row.dangling) dangling++;
+      if (row.flaky) flaky.push(`${row.acc.pkg} ${row.acc.test}`);
+      results.push(row.result);
+    }
+    if (flaky.length > 0) {
+      const shown = flaky.slice(0, MAX_FLAKY_NAMES2).join(", ");
+      const more = flaky.length > MAX_FLAKY_NAMES2 ? ` \u2026and ${flaky.length - MAX_FLAKY_NAMES2} more` : "";
+      warnings.push(
+        `go: ${sourcePath}: ${flaky.length} test(s) failed in some but not all repeated runs (-count) \u2014 reported as fail: ${shown}${more}`
+      );
     }
     if (dangling > 0) {
       warnings.push(
         `go: ${sourcePath}: ${dangling} test(s) started but never reported a result \u2014 synthesized as error (package crash?)`
       );
     }
+    for (const [importPath, build] of builds) {
+      if (!build.failed) continue;
+      const excerpt = excerptOf(build.outputs.join("").split(/\r?\n/));
+      warnings.push(
+        `go: ${sourcePath}: build failed for ${importPath}${excerpt ? `: ${excerpt}` : ""}`
+      );
+    }
     const pkgsWithTests = new Set([...tests.values()].map((a) => a.pkg));
     for (const [pkg, entry] of failedPackages) {
       if (!entry.failed || pkgsWithTests.has(pkg)) continue;
-      const output = messageFromOutputs(entry.outputs);
+      const build = entry.failedBuild !== void 0 ? builds.get(entry.failedBuild) : void 0;
+      const output = messageFromOutputs([...build?.outputs ?? [], ...entry.outputs]);
+      const reason = build !== void 0 ? "package failed to build" : "package failed before any test completed (build or init crash?)";
       results.push({
         testId: makeTestId(pkg, "(package)"),
         suite: pkg,
         name: "(package)",
         status: "error",
         durationMs: null,
-        message: `package failed before any test completed (build or init crash?)${output ? `
-${output}` : ""}`
+        message: output !== void 0 ? `${reason}
+${output}` : reason
       });
+      if (build === void 0 || !build.failed) {
+        warnings.push(
+          `go: ${sourcePath}: package ${pkg} failed with no test results \u2014 synthesized as error`
+        );
+      }
+    }
+    if (strayText.length > 0) {
       warnings.push(
-        `go: ${sourcePath}: package ${pkg} failed with no test results \u2014 synthesized as error`
+        `go: ${sourcePath}: ${strayText.length} non-JSON line(s) ignored (stderr merged into the stream? build errors?): ${excerptOf(strayText)}`
       );
     }
     return { results, warnings };
@@ -1183,16 +1643,21 @@ ${output}` : ""}`
 
 // src/parsers/jest.ts
 var SUITE_PLACEHOLDER = "(suite)";
-function statusOf(status) {
+function statusOf(status, failureMessages) {
   switch (status) {
     case "passed":
       return "pass";
     case "failed":
       return "fail";
+    case "error":
+      return "error";
+    case "focused":
+      return failureMessages.length > 0 ? "fail" : "pass";
     case "pending":
     case "skipped":
     // vitest's json reporter emits "skipped" (jest: "pending")
     case "todo":
+    case "disabled":
       return "skip";
     default:
       return null;
@@ -1212,6 +1677,7 @@ var jestParser = {
     if (!("doc" in parsed)) return false;
     const doc = parsed.doc;
     if (!isObj(doc) || !Array.isArray(doc.testResults)) return false;
+    if (doc.testResults.length === 0) return true;
     return doc.testResults.some((file) => isObj(file) && Array.isArray(file.assertionResults));
   },
   parse(content, sourcePath) {
@@ -1225,6 +1691,8 @@ var jestParser = {
     if (!isObj(doc) || !Array.isArray(doc.testResults)) {
       return { results, warnings: [`jest: ${sourcePath}: missing testResults[] array`] };
     }
+    const flaky = [];
+    const flakyHow = /* @__PURE__ */ new Set();
     for (const file of doc.testResults) {
       if (!isObj(file)) {
         warnings.push(`jest: ${sourcePath}: skipping non-object entry in testResults[]`);
@@ -1232,12 +1700,14 @@ var jestParser = {
       }
       const filePath = typeof file.name === "string" && file.name.trim() !== "" ? file.name.replace(/\\/g, "/") : "(unknown file)";
       const assertions = toArray(file.assertionResults);
+      let anyAssertionFailed = false;
       for (const assertion of assertions) {
         if (!isObj(assertion)) {
           warnings.push(`jest: ${sourcePath}: skipping non-object entry in assertionResults[]`);
           continue;
         }
-        const status = statusOf(assertion.status);
+        const failureMessages = toArray(assertion.failureMessages);
+        const status = statusOf(assertion.status, failureMessages);
         if (status === null) {
           warnings.push(
             `jest: ${sourcePath}: unknown assertion status ${JSON.stringify(assertion.status)}`
@@ -1248,9 +1718,31 @@ var jestParser = {
           (title) => typeof title === "string" && title.trim() !== ""
         ) : [];
         const suite = ancestors.length > 0 ? ancestors.join(" > ") : filePath;
-        const name = typeof assertion.title === "string" && assertion.title.trim() !== "" ? assertion.title : typeof assertion.fullName === "string" && assertion.fullName.trim() !== "" ? assertion.fullName : "(unnamed)";
+        const name = typeof assertion.title === "string" && assertion.title.trim() !== "" ? assertion.title : typeof assertion.fullName === "string" && assertion.fullName.trim() !== "" ? assertion.fullName : status === "error" ? SUITE_PLACEHOLDER : "(unnamed)";
         const durationMs2 = typeof assertion.duration === "number" && Number.isFinite(assertion.duration) ? assertion.duration : null;
-        const message = trimTo(toArray(assertion.failureMessages)[0], 2e3);
+        let message = trimTo(failureMessages[0], 2e3);
+        if (status === "fail" || status === "error") anyAssertionFailed = true;
+        const invocations = typeof assertion.invocations === "number" && assertion.invocations > 1 ? assertion.invocations : void 0;
+        if (status === "pass" && (invocations !== void 0 || failureMessages.length > 0)) {
+          const reasons = [
+            ...toArray(assertion.retryReasons),
+            ...toArray(assertion.retryMessages),
+            ...failureMessages
+          ];
+          const how = invocations !== void 0 ? "jest retry" : "vitest retry";
+          const failedAttempts = invocations !== void 0 ? invocations - 1 : failureMessages.length;
+          message = flakyRetryMessage(
+            failedAttempts,
+            how,
+            reasons.find((r) => typeof r === "string"),
+            2e3
+          );
+          flaky.push(`${suite} > ${name}`);
+          flakyHow.add(how);
+        } else if (status === "fail" && invocations !== void 0 && message !== void 0) {
+          message = trimTo(`${message}
+(failed all ${invocations} attempts)`, 2e3);
+        }
         const result = {
           testId: makeTestId(suite, name),
           suite,
@@ -1261,8 +1753,10 @@ var jestParser = {
         if (message !== void 0) result.message = message;
         results.push(result);
       }
-      if (assertions.length === 0 && file.status === "failed") {
-        const message = trimTo(file.message, 2e3);
+      const execError = isObj(file.testExecError) ? file.testExecError : void 0;
+      if ((file.status === "failed" || execError !== void 0) && !anyAssertionFailed) {
+        const message = trimTo(file.message, 2e3) ?? trimTo(file.failureMessage, 2e3) ?? trimTo(execError?.message, 2e3) ?? // vitest leaves the message empty when e.g. beforeAll threw
+        "test file failed outside any test (beforeAll/afterAll hook, import or collection error) \u2014 no test carried the failure";
         const result = {
           testId: makeTestId(filePath, SUITE_PLACEHOLDER),
           suite: filePath,
@@ -1270,9 +1764,12 @@ var jestParser = {
           status: "fail",
           durationMs: null
         };
-        if (message !== void 0) result.message = message;
+        result.message = message;
         results.push(result);
       }
+    }
+    if (flaky.length > 0) {
+      warnings.push(flakyRetryWarning("jest", sourcePath, [...flakyHow].join("/"), flaky));
     }
     return { results, warnings };
   }
@@ -1280,7 +1777,9 @@ var jestParser = {
 
 // src/parsers/junit.ts
 import { XMLParser } from "fast-xml-parser";
-var xml = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+var xml = new XMLParser(XML_OPTIONS);
+var MESSAGE_MAX_CHARS2 = 2e3;
+var STACK_MAX_CHARS = 1e3;
 function attr(node, name) {
   const v = node[name];
   return typeof v === "string" && v.trim() !== "" ? v : void 0;
@@ -1296,8 +1795,27 @@ function textOf(node) {
 }
 function durationOf(timeAttr) {
   if (timeAttr === void 0) return null;
-  const seconds = Number.parseFloat(timeAttr);
+  const raw = timeAttr.trim();
+  const normalized = raw.includes(".") ? raw.replace(/,/g, "") : raw.replace(/^(\d*),(\d+)$/, "$1.$2");
+  const seconds = Number.parseFloat(normalized);
   return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1e3) : null;
+}
+function detailMessage(detail) {
+  let fromAttr = isObj(detail) ? attr(detail, "@_message") : void 0;
+  if (fromAttr !== void 0 && /^\s*(?:failed|failure|error)\s*$/i.test(fromAttr)) {
+    fromAttr = void 0;
+  }
+  return trimTo(fromAttr, MESSAGE_MAX_CHARS2) ?? trimTo(detailStack(detail), MESSAGE_MAX_CHARS2) ?? // `<error type="java.lang.NPE"/>`: the type is all there is
+  (isObj(detail) ? trimTo(attr(detail, "@_type"), MESSAGE_MAX_CHARS2) : void 0);
+}
+function detailStack(detail) {
+  const text = textOf(detail);
+  if (text !== void 0 && text.trim() !== "") return text;
+  if (isObj(detail)) {
+    const nested = children(detail, "stackTrace")[0];
+    return textOf(nested);
+  }
+  return void 0;
 }
 function mapTestCase(tc, suiteName, ctx) {
   if (!isObj(tc)) return;
@@ -1307,17 +1825,23 @@ function mapTestCase(tc, suiteName, ctx) {
     return;
   }
   const suite = attr(tc, "@_classname") ?? suiteName;
+  const failures = children(tc, "failure");
+  const errors = children(tc, "error");
+  const skipped = children(tc, "skipped").length > 0;
   let status = "pass";
-  let detail;
-  if (tc.failure !== void 0) {
+  let details = [];
+  if (skipped && errors.length === 0) {
+    status = "skip";
+  } else if (failures.length > 0) {
     status = "fail";
-    detail = tc.failure;
-  } else if (tc.error !== void 0) {
+    details = failures;
+  } else if (errors.length > 0) {
     status = "error";
-    detail = tc.error;
-  } else if (tc.skipped !== void 0) {
+    details = errors;
+  } else if (skipped) {
     status = "skip";
   }
+  const detail = details[0];
   const result = {
     testId: makeTestId(suite, name),
     suite,
@@ -1326,13 +1850,71 @@ function mapTestCase(tc, suiteName, ctx) {
     durationMs: durationOf(attr(tc, "@_time"))
   };
   if (detail !== void 0) {
-    const detailMessage = isObj(detail) ? attr(detail, "@_message") : void 0;
-    const message = trimTo(detailMessage, 2e3) ?? trimTo(textOf(detail), 2e3);
-    const stack = trimTo(textOf(detail), 1e3);
+    let message = detailMessage(detail);
+    if (details.length > 1) {
+      const kind = status === "fail" ? "failure" : "error";
+      const more = `(+${details.length - 1} more ${kind}${details.length > 2 ? "s" : ""})`;
+      message = trimTo(message !== void 0 ? `${message}
+${more}` : more, MESSAGE_MAX_CHARS2);
+    }
+    const stack = trimTo(textOf(detail), STACK_MAX_CHARS);
     if (message !== void 0) result.message = message;
     if (stack !== void 0) result.stack = stack;
   }
+  const reruns = [...children(tc, "rerunFailure"), ...children(tc, "rerunError")];
+  const flakes = [...children(tc, "flakyFailure"), ...children(tc, "flakyError")];
+  if ((status === "fail" || status === "error") && reruns.length > 0) {
+    const note = `(Surefire: failed all ${reruns.length + 1} attempts)`;
+    result.message = trimTo(
+      result.message !== void 0 ? `${result.message}
+${note}` : note,
+      MESSAGE_MAX_CHARS2
+    );
+  } else if (status === "pass" && flakes.length > 0) {
+    const first = flakes[0];
+    result.message = flakyRetryMessage(
+      flakes.length,
+      "Surefire rerun",
+      detailMessage(first),
+      MESSAGE_MAX_CHARS2
+    );
+    const stack = trimTo(detailStack(first), STACK_MAX_CHARS);
+    if (stack !== void 0) result.stack = stack;
+    ctx.flaky.push(`${suite}.${name}`);
+  }
   ctx.results.push(result);
+}
+function collapsePytestReruns(ctx) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const r of ctx.results) {
+    const g = groups.get(r.testId);
+    if (g) g.push(r);
+    else groups.set(r.testId, [r]);
+  }
+  const out = [];
+  for (const group of groups.values()) {
+    const final = group[group.length - 1];
+    const earlier = group.slice(0, -1);
+    const reruns = earlier.length > 0 && earlier.every((r) => r.status === "pass" && r.message === void 0 && r.stack === void 0);
+    if (!reruns) {
+      out.push(...group);
+      continue;
+    }
+    const how = "pytest-rerunfailures rerun";
+    if (final.status === "pass") {
+      final.message = flakyRetryMessage(earlier.length, how, void 0, MESSAGE_MAX_CHARS2);
+      ctx.flaky.push(`${final.suite}.${final.name}`);
+    } else if (final.status === "fail" || final.status === "error") {
+      const note = `(failed all ${group.length} attempts)`;
+      final.message = trimTo(
+        final.message !== void 0 ? `${final.message}
+${note}` : note,
+        MESSAGE_MAX_CHARS2
+      );
+    }
+    out.push(final);
+  }
+  ctx.results = out;
 }
 function children(el, localName) {
   const out = [];
@@ -1347,6 +1929,7 @@ function children(el, localName) {
 function walk(el, inheritedSuite, ctx) {
   if (!isObj(el)) return;
   const ownSuite = attr(el, "@_name") ?? inheritedSuite;
+  if (ownSuite === "pytest") ctx.pytest = true;
   for (const tc of children(el, "testcase")) mapTestCase(tc, ownSuite, ctx);
   for (const ts of children(el, "testsuite")) walk(ts, ownSuite, ctx);
 }
@@ -1357,7 +1940,7 @@ var junitParser = {
     return trimmed.startsWith("<") && /<(?:[\w.-]+:)?testsuit/.test(trimmed);
   },
   parse(content, sourcePath) {
-    const ctx = { sourcePath, results: [], warnings: [] };
+    const ctx = { sourcePath, results: [], warnings: [], flaky: [], pytest: false };
     const body = stripBom(content);
     if (body.trim() === "") {
       ctx.warnings.push(`junit: ${sourcePath}: file is empty`);
@@ -1390,19 +1973,91 @@ var junitParser = {
       return { results: ctx.results, warnings: ctx.warnings };
     }
     walk(root, "unknown", ctx);
+    if (ctx.pytest) collapsePytestReruns(ctx);
+    if (ctx.flaky.length > 0) {
+      const how = ctx.pytest ? "pytest-rerunfailures rerun" : "Surefire rerun";
+      ctx.warnings.push(flakyRetryWarning("junit", sourcePath, how, ctx.flaky));
+    }
     return { results: ctx.results, warnings: ctx.warnings };
   }
 };
 
 // src/parsers/mocha.ts
-function fullTitleSet(arr) {
-  const set = /* @__PURE__ */ new Set();
+function keyOf(entry) {
+  const fullTitle = typeof entry.fullTitle === "string" ? entry.fullTitle.trim() : "";
+  if (fullTitle === "") return "";
+  const file = typeof entry.file === "string" ? entry.file.trim() : "";
+  return `${file}\0${fullTitle}`;
+}
+function bucket(arr) {
+  const map = /* @__PURE__ */ new Map();
   for (const entry of arr) {
-    if (isObj(entry) && typeof entry.fullTitle === "string" && entry.fullTitle !== "") {
-      set.add(entry.fullTitle);
-    }
+    if (!isObj(entry)) continue;
+    const key = keyOf(entry);
+    if (key === "") continue;
+    const queue = map.get(key);
+    if (queue) queue.push(entry);
+    else map.set(key, [entry]);
   }
-  return set;
+  return map;
+}
+function consume(b, key) {
+  if (key === "") return false;
+  const queue = b.get(key);
+  if (queue === void 0 || queue.length === 0) return false;
+  queue.shift();
+  return true;
+}
+function isMochawesome(doc) {
+  if (!Array.isArray(doc.results) || doc.results.length === 0) return false;
+  const first = doc.results[0];
+  return isObj(first) && Array.isArray(first.tests) && Array.isArray(first.suites);
+}
+var AWESOME_STATE = {
+  passed: "pass",
+  failed: "fail",
+  pending: "skip"
+};
+function mochawesomeEntries(roots) {
+  const files = /* @__PURE__ */ new Set();
+  const collectFiles = (suite) => {
+    if (!isObj(suite)) return;
+    if (typeof suite.fullFile === "string" && suite.fullFile !== "") files.add(suite.fullFile);
+    for (const child2 of Array.isArray(suite.suites) ? suite.suites : []) collectFiles(child2);
+  };
+  for (const root of roots) collectFiles(root);
+  const onlyFile = files.size === 1 ? [...files][0] : void 0;
+  const out = [];
+  const walk2 = (suite) => {
+    if (!isObj(suite)) return;
+    const file = typeof suite.fullFile === "string" && suite.fullFile !== "" ? suite.fullFile : onlyFile;
+    const toEntry = (t) => {
+      const err = isObj(t.err) ? { message: t.err.message, stack: t.err.estack } : t.err;
+      return { ...t, file, err };
+    };
+    const hooks = [
+      ...Array.isArray(suite.beforeHooks) ? suite.beforeHooks : [],
+      ...Array.isArray(suite.afterHooks) ? suite.afterHooks : []
+    ];
+    for (const t of Array.isArray(suite.tests) ? suite.tests : []) {
+      if (!isObj(t)) continue;
+      const state = typeof t.state === "string" ? AWESOME_STATE[t.state] : void 0;
+      out.push([toEntry(t), state ?? "skip"]);
+    }
+    for (const h of hooks) {
+      if (isObj(h) && h.state === "failed") out.push([toEntry(h), "fail"]);
+    }
+    for (const child2 of Array.isArray(suite.suites) ? suite.suites : []) walk2(child2);
+  };
+  for (const root of roots) walk2(root);
+  return out;
+}
+function hasErr(err) {
+  return typeof err === "string" && err !== "" || isObj(err) && Object.keys(err).length > 0;
+}
+var HOOK_TITLE = /^"(?:before|after) (?:all|each)" hook\b/;
+function hookName(title) {
+  return title.replace(/ (?:for|in) ".*"$/, "");
 }
 function deriveSuite(entry, title, fullTitle) {
   if (fullTitle !== "" && fullTitle !== title && fullTitle.endsWith(title)) {
@@ -1443,49 +2098,78 @@ var mochaParser = {
     if (!isObj(doc)) {
       return { results, warnings: [`mocha: ${sourcePath}: not a JSON object`] };
     }
-    const all = Array.isArray(doc.results) ? doc.results : Array.isArray(doc.tests) ? doc.tests : Array.isArray(doc.passes) || Array.isArray(doc.failures) ? (
-      // passes/failures-only shape (sniff accepts it): merge the buckets
-      [
-        ...Array.isArray(doc.passes) ? doc.passes : [],
-        ...Array.isArray(doc.failures) ? doc.failures : [],
-        ...Array.isArray(doc.pending) ? doc.pending : []
-      ]
-    ) : null;
-    if (all === null) {
-      return { results, warnings: [`mocha: ${sourcePath}: missing "tests"/"results" array`] };
-    }
     const passes = Array.isArray(doc.passes) ? doc.passes : [];
     const failures = Array.isArray(doc.failures) ? doc.failures : [];
     const pending = Array.isArray(doc.pending) ? doc.pending : [];
-    const passTitles = fullTitleSet(passes);
-    const failTitles = fullTitleSet(failures);
-    const pendingTitles = fullTitleSet(pending);
-    for (const entry of all) {
+    const testList = Array.isArray(doc.results) ? doc.results : Array.isArray(doc.tests) ? doc.tests : null;
+    if (testList === null && !Array.isArray(doc.passes) && !Array.isArray(doc.failures)) {
+      return { results, warnings: [`mocha: ${sourcePath}: missing "tests"/"results" array`] };
+    }
+    const entries = [];
+    const statuses = [];
+    const add = (entry, status) => {
       if (!isObj(entry)) {
         warnings.push(`mocha: ${sourcePath}: skipping non-object test entry`);
-        continue;
+        return;
       }
+      entries.push(entry);
+      statuses.push(status);
+    };
+    if (isMochawesome(doc)) {
+      for (const [entry, status] of mochawesomeEntries(doc.results))
+        add(entry, status);
+    } else if (testList === null) {
+      for (const entry of passes) add(entry, "pass");
+      for (const entry of failures) add(entry, "fail");
+      for (const entry of pending) add(entry, "skip");
+    } else {
+      const failBucket = bucket(failures);
+      const pendingBucket = bucket(pending);
+      const passBucket = bucket(passes);
+      const shared = /* @__PURE__ */ new Map();
+      for (const entry of testList) {
+        if (isObj(entry)) shared.set(keyOf(entry), (shared.get(keyOf(entry)) ?? 0) + 1);
+      }
+      for (const entry of testList) {
+        if (!isObj(entry)) {
+          add(entry, null);
+          continue;
+        }
+        const key = keyOf(entry);
+        const errLess = (shared.get(key) ?? 0) > 1 && !hasErr(entry.err);
+        const order = errLess ? [
+          [passBucket, "pass"],
+          [pendingBucket, "skip"],
+          [failBucket, "fail"]
+        ] : [
+          [failBucket, "fail"],
+          [pendingBucket, "skip"],
+          [passBucket, "pass"]
+        ];
+        const hit = order.find(([b]) => consume(b, key));
+        if (hit !== void 0) add(entry, hit[1]);
+        else if (entry.state === "failed") add(entry, "fail");
+        else if (entry.state === "pending") add(entry, "skip");
+        else add(entry, null);
+      }
+      for (const queue of failBucket.values()) for (const leftover of queue) add(leftover, "fail");
+    }
+    const hooks = [];
+    const flaky = [];
+    for (let n = 0; n < entries.length; n++) {
+      const entry = entries[n];
       const fullTitle = typeof entry.fullTitle === "string" ? entry.fullTitle.trim() : "";
       const title = typeof entry.title === "string" && entry.title.trim() !== "" ? entry.title.trim() : fullTitle !== "" ? fullTitle : "(unnamed)";
-      let status = null;
-      if (failures.includes(entry) || fullTitle !== "" && failTitles.has(fullTitle)) {
-        status = "fail";
-      } else if (pending.includes(entry) || fullTitle !== "" && pendingTitles.has(fullTitle)) {
-        status = "skip";
-      } else if (passes.includes(entry) || fullTitle !== "" && passTitles.has(fullTitle)) {
-        status = "pass";
-      } else if (entry.state === "failed") {
-        status = "fail";
-      } else if (entry.state === "pending") {
-        status = "skip";
-      }
-      const finalStatus = status ?? "pass";
+      const finalStatus = statuses[n] ?? "pass";
       const suite = deriveSuite(entry, title, fullTitle);
+      const isHook = HOOK_TITLE.test(title);
+      const name = isHook ? hookName(title) : title;
+      if (isHook && finalStatus === "fail") hooks.push(`${suite} ${name}`);
       const durationMs2 = typeof entry.duration === "number" && Number.isFinite(entry.duration) ? entry.duration : null;
       const result = {
-        testId: makeTestId(suite, title),
+        testId: makeTestId(suite, name),
         suite,
-        name: title,
+        name,
         status: finalStatus,
         durationMs: durationMs2
       };
@@ -1499,7 +2183,19 @@ var mochaParser = {
         if (message !== void 0) result.message = message;
         if (stack !== void 0) result.stack = stack;
       }
+      const retries = typeof entry.currentRetry === "number" && entry.currentRetry > 0 ? entry.currentRetry : 0;
+      if (retries > 0 && finalStatus === "pass") {
+        result.message = flakyRetryMessage(retries, "mocha retry", result.message, 2e3);
+        flaky.push(`${suite} ${name}`);
+      }
       results.push(result);
+    }
+    if (flaky.length > 0)
+      warnings.push(flakyRetryWarning("mocha", sourcePath, "mocha retry", flaky));
+    if (hooks.length > 0) {
+      warnings.push(
+        `mocha: ${sourcePath}: ${hooks.length} hook failure(s) \u2014 the tests they guard did not run; recorded as failures: ${hooks.join(", ")}`
+      );
     }
     return { results, warnings };
   }
@@ -1507,12 +2203,26 @@ var mochaParser = {
 
 // src/parsers/tap.ts
 var ROOT_SUITE = "node:test";
-var MESSAGE_MAX_CHARS2 = 2e3;
+var SNIFF_MAX_LINES2 = 50;
+var TAP_LINE = /^(?:(?:not )?ok(?:\s|$)|1\.\.\d+(?:\s+#.*)?\s*$|#|Bail out!|pragma [+-]|TAP version \d+|\s)/;
+var MESSAGE_MAX_CHARS3 = 2e3;
 var tapParser = {
   name: "tap",
   sniff(content) {
-    const first = stripBom(content).split(/\r?\n/).map((l) => l.trim()).find((l) => l !== "");
-    return first !== void 0 && /^TAP version \d+\s*$/i.test(first);
+    const lines = stripBom(content).split(/\r?\n/);
+    const first = lines.map((l) => l.trim()).find((l) => l !== "");
+    if (first === void 0) return false;
+    if (/^TAP version \d+\s*$/i.test(first)) return true;
+    if (!/^1\.\.\d+(?:\s+#.*)?$/.test(first) && !/^(?:not )?ok \d+(?:\s|$)/.test(first)) {
+      return false;
+    }
+    let seen = 0;
+    for (const line of lines) {
+      if (line.trim() === "") continue;
+      if (++seen > SNIFF_MAX_LINES2) break;
+      if (!TAP_LINE.test(line)) return false;
+    }
+    return true;
   },
   parse(content, sourcePath) {
     const results = [];
@@ -1523,97 +2233,132 @@ var tapParser = {
       return { results, warnings };
     }
     const lines = body.split(/\r?\n/);
-    const ancestors = [];
+    const pending = [];
+    const headers = [];
+    const counters = /* @__PURE__ */ new Map();
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
+      const indent = indentOf(line);
       const sub = line.match(/^\s*# Subtest: (.+?)\s*$/);
       if (sub) {
-        ancestors.push({ name: sub[1].replace(/\\#/g, "#"), children: 0 });
+        while (headers.length > 0 && headers[headers.length - 1].indent >= indent) headers.pop();
+        headers.push({ indent, name: unescapeName(sub[1]) });
         continue;
       }
       const assertion = line.match(
-        /^\s*(not ok|ok)\s+\d+\s+-\s+(.+?)(?:\s+#\s*([A-Za-z]+)\b(.*))?$/
+        /^\s*(not ok|ok)(?=\s|$)(?:\s+(\d+)(?=\s|$))?\s*(?:-(?=\s|$)\s*)?(.*)$/
       );
-      if (assertion) {
-        const [, verdict, rawName, directive, directiveText] = assertion;
-        const name = rawName.trim().replace(/\\#/g, "#");
-        let yaml = { isSuite: false };
-        if (lines[i + 1]?.trim() === "---") {
-          let j = i + 2;
-          const block = [];
-          while (j < lines.length && lines[j].trim() !== "...") {
-            block.push(lines[j]);
-            j++;
-          }
-          yaml = parseYamlBlock(block, sourcePath, warnings);
-        }
-        const ownDeclaration = ancestors.length > 0 && ancestors[ancestors.length - 1].name === name;
-        const isAggregate = ownDeclaration && (yaml.isSuite || ancestors[ancestors.length - 1].children > 0);
-        if (isAggregate) {
-          ancestors.pop();
-          if (ancestors.length > 0) ancestors[ancestors.length - 1].children++;
-          continue;
-        }
-        const chain = ownDeclaration ? ancestors.slice(0, -1) : ancestors;
-        const suite = chain.length > 0 ? chain.map((a) => a.name).join(" > ") : ROOT_SUITE;
-        let status = verdict === "not ok" ? "fail" : "pass";
-        let message = yaml.error;
-        const directiveKind = directive?.toUpperCase();
-        if (directiveKind === "SKIP" || directiveKind === "TODO") {
-          status = "skip";
-          const reason = directiveText?.replace(/^\s*-\s*/, "").trim();
-          if (reason) message = reason;
-        }
-        const result = {
-          testId: makeTestId(suite, name),
-          suite,
-          name,
-          status,
-          durationMs: null
-        };
-        if (message !== void 0 && message !== "")
-          result.message = trimTo(message, MESSAGE_MAX_CHARS2);
-        if (status === "fail" && yaml.stack !== void 0) {
-          result.stack = trimTo(yaml.stack, 1e3);
-        }
-        results.push(result);
-        if (ownDeclaration) {
-          ancestors.pop();
-          if (ancestors.length > 0) ancestors[ancestors.length - 1].children++;
-        }
+      if (!assertion) continue;
+      const [, verdict, numberText, rest] = assertion;
+      const [, rawName, directive, directiveText] = rest.match(
+        /^(.*?)(?:(?:^|\s+)#\s*([A-Za-z]+)\b(.*))?$/
+      );
+      let num = numberText !== void 0 ? Number.parseInt(numberText, 10) : void 0;
+      num ??= (counters.get(indent) ?? 0) + 1;
+      counters.set(indent, num);
+      for (const level of [...counters.keys()]) if (level > indent) counters.delete(level);
+      const name = unescapeName(rawName.trim()) || `(test ${num})`;
+      let yaml = { isSuite: false };
+      const opener = lines[i + 1];
+      if (opener !== void 0 && opener.trim() === "---") {
+        const yamlIndent = indentOf(opener);
+        let j = i + 2;
+        while (j < lines.length && !(lines[j].trim() === "..." && indentOf(lines[j]) <= yamlIndent))
+          j++;
+        yaml = parseYamlBlock(lines.slice(i + 2, j), sourcePath, warnings);
+        i = j;
+      }
+      while (headers.length > 0 && headers[headers.length - 1].indent >= indent) headers.pop();
+      let status = verdict === "not ok" ? "fail" : "pass";
+      let message = yaml.error;
+      const directiveKind = directive?.toUpperCase();
+      if (directiveKind === "SKIP" || directiveKind === "TODO") {
+        status = "skip";
+        const reason = directiveText?.replace(/^\s*-\s*/, "").trim();
+        if (reason) message = reason;
+      }
+      const own = {
+        chain: [],
+        name,
+        status,
+        durationMs: yaml.durationMs ?? null,
+        message: message !== void 0 && message !== "" ? trimTo(message, MESSAGE_MAX_CHARS3) : void 0,
+        stack: status === "fail" && yaml.stack !== void 0 ? trimTo(yaml.stack, 1e3) : void 0
+      };
+      const children2 = [];
+      while (pending.length > 0 && pending[pending.length - 1].indent > indent) {
+        children2.unshift(pending.pop());
+      }
+      if (children2.length === 0 && !yaml.isSuite) {
+        pending.push({ indent, entries: [own], failed: status === "fail" });
+        continue;
+      }
+      const entries = children2.flatMap((c) => c.entries);
+      for (const e of entries) e.chain.unshift(name);
+      const childFailed = children2.some((c) => c.failed);
+      const ownFailure = status === "fail" && !childFailed;
+      if (ownFailure) entries.push(own);
+      pending.push({ indent, entries, failed: childFailed || ownFailure });
+    }
+    for (let h = headers.length - 1; h >= 0; h--) {
+      const header = headers[h];
+      for (const subtree of pending) {
+        if (subtree.indent > header.indent)
+          for (const e of subtree.entries) e.chain.unshift(header.name);
       }
     }
-    if (ancestors.length > 0) {
+    if (headers.length > 0) {
       warnings.push(
-        `tap: ${sourcePath}: ${ancestors.length} subtest(s) never reported a result (truncated stream?)`
+        `tap: ${sourcePath}: ${headers.length} subtest(s) never reported a result (truncated stream?)`
       );
+    }
+    for (const e of pending.flatMap((p) => p.entries)) {
+      const suite = e.chain.length > 0 ? e.chain.join(" > ") : ROOT_SUITE;
+      const result = {
+        testId: makeTestId(suite, e.name),
+        suite,
+        name: e.name,
+        status: e.status,
+        durationMs: e.durationMs
+      };
+      if (e.message !== void 0) result.message = e.message;
+      if (e.stack !== void 0) result.stack = e.stack;
+      results.push(result);
     }
     return { results, warnings };
   }
 };
+function unescapeName(raw) {
+  return raw.replace(/\\([\\#])/g, "$1");
+}
 function parseYamlBlock(block, sourcePath, warnings) {
   const out = { isSuite: false };
   try {
+    const keyIndent = Math.min(
+      ...block.filter((l) => l.trim() !== "").map((l) => indentOf(l)),
+      Number.POSITIVE_INFINITY
+    );
     for (let k = 0; k < block.length; k++) {
       const line = block[k];
-      const errorMatch = line.match(/^\s*error:\s*(.+)$/);
-      if (errorMatch && out.error === void 0) {
-        out.error = unquote(errorMatch[1]);
-        continue;
-      }
-      const typeMatch = line.match(/^\s*type:\s*'suite'/);
-      if (typeMatch) out.isSuite = true;
-      const stackMatch = line.match(/^\s*stack:\s*\|[-+]?\s*$/);
-      if (stackMatch) {
-        const stackLines = [];
-        let m = k + 1;
-        const baseIndent = block[m]?.match(/^\s*/)?.[0].length ?? 0;
-        while (m < block.length && (block[m].trim() === "" || (block[m].match(/^\s*/)?.[0].length ?? 0) >= baseIndent)) {
-          stackLines.push(block[m].slice(baseIndent));
-          m++;
-        }
-        out.stack = stackLines.join("\n").trimEnd();
-        k = m - 1;
+      if (indentOf(line) !== keyIndent) continue;
+      const keyMatch = line.match(/^\s*([A-Za-z_][\w-]*):(?:\s+(.*?))?\s*$/);
+      if (!keyMatch) continue;
+      const [, key, rawValue = ""] = keyMatch;
+      let m = k + 1;
+      while (m < block.length && (block[m].trim() === "" || indentOf(block[m]) > keyIndent)) m++;
+      const continuation = block.slice(k + 1, m);
+      k = m - 1;
+      let value;
+      const scalar = rawValue.match(/^([|>])([-+]?)\d*$/);
+      if (scalar) value = readBlockScalar(continuation, scalar[1] === ">");
+      else if (rawValue !== "") value = unquote(rawValue);
+      if (value === void 0) continue;
+      if (key === "error" && out.error === void 0) out.error = value;
+      else if (key === "stack" && out.stack === void 0) out.stack = value;
+      else if (key === "type" && value === "suite") out.isSuite = true;
+      else if (key === "duration_ms") {
+        const ms = Number.parseFloat(value);
+        if (Number.isFinite(ms) && ms >= 0) out.durationMs = Math.round(ms);
       }
     }
   } catch (err) {
@@ -1621,14 +2366,35 @@ function parseYamlBlock(block, sourcePath, warnings) {
   }
   return out;
 }
+function indentOf(line) {
+  return line.length - line.trimStart().length;
+}
+function readBlockScalar(lines, folded) {
+  const firstContent = lines.find((l) => l.trim() !== "");
+  if (firstContent === void 0) return "";
+  const base = indentOf(firstContent);
+  const body = lines.map((l) => l.trim() === "" ? "" : l.slice(Math.min(base, indentOf(l))));
+  while (body.length > 0 && body[body.length - 1] === "") body.pop();
+  if (!folded) return body.join("\n");
+  let text = "";
+  for (let n = 0; n < body.length; n++) {
+    const cur = body[n];
+    if (n > 0) text += cur === "" || body[n - 1] === "" ? "\n" : " ";
+    text += cur;
+  }
+  return text.replace(/\n\n/g, "\n");
+}
 function unquote(s) {
-  const m = s.match(/^'(.*)'$/);
-  return m !== null ? m[1].replace(/\\'/g, "'") : s;
+  const m = s.match(/^(['"`])(.*)\1$/);
+  if (m === null) return s;
+  const [, quote, inner] = m;
+  const text = quote === "'" ? inner.replace(/''/g, "'") : inner;
+  return text.replace(/\\(['"`\\])/g, "$1");
 }
 
 // src/parsers/trx.ts
 import { XMLParser as XMLParser2 } from "fast-xml-parser";
-var xml2 = new XMLParser2({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+var xml2 = new XMLParser2(XML_OPTIONS);
 function attr2(node, name) {
   const v = node[name];
   return typeof v === "string" && v.trim() !== "" ? v : void 0;
@@ -1653,17 +2419,81 @@ function durationMs(raw) {
   if (!Number.isFinite(h) || !Number.isFinite(min) || !Number.isFinite(sec) || sec < 0) return null;
   return Math.round((((days * 24 + h) * 60 + min) * 60 + sec) * 1e3);
 }
-function outcomeStatus(outcome, hasErrorInfo) {
-  switch (outcome) {
-    case "Passed":
-      return "pass";
-    case "Failed":
-      return hasErrorInfo ? "error" : "fail";
-    case "NotExecuted":
-      return "skip";
-    default:
-      return null;
+var OUTCOMES = {
+  passed: "pass",
+  passedbutrunaborted: "pass",
+  completed: "pass",
+  warning: "pass",
+  failed: "fail",
+  timeout: "fail",
+  error: "error",
+  aborted: "error",
+  disconnected: "error",
+  notrunnable: "error",
+  inprogress: "error",
+  notexecuted: "skip",
+  inconclusive: "skip",
+  pending: "skip"
+};
+function outcomeStatus(outcome) {
+  return outcome !== void 0 ? OUTCOMES[outcome.trim().toLowerCase()] ?? null : null;
+}
+function childList(el, localName) {
+  const key = Object.keys(el).find((k) => k === localName || k.endsWith(`:${localName}`));
+  return key !== void 0 ? toArray(el[key]) : [];
+}
+function child(el, localName) {
+  const first = childList(el, localName)[0];
+  return isObj(first) ? first : void 0;
+}
+function mapResult(r, suites, ctx) {
+  if (!isObj(r)) return;
+  const testName = attr2(r, "@_testName");
+  if (testName === void 0) {
+    ctx.warnings.push(`trx: ${ctx.sourcePath}: skipping <UnitTestResult> without testName`);
+    return;
   }
+  const outcome = attr2(r, "@_outcome");
+  const status = outcomeStatus(outcome);
+  if (status === null) {
+    ctx.warnings.push(`trx: ${ctx.sourcePath}: unknown outcome "${outcome}" \u2014 skipped ${testName}`);
+    return;
+  }
+  const inner = child(r, "InnerResults");
+  const rows = inner !== void 0 ? childList(inner, "UnitTestResult") : [];
+  let rowFailed = false;
+  if (rows.length > 0) {
+    const before = ctx.results.length;
+    for (const row of rows) mapResult(row, suites, ctx);
+    rowFailed = ctx.results.slice(before).some((x) => x.status === "fail" || x.status === "error");
+    if (rowFailed || status !== "fail" && status !== "error") return;
+  }
+  const errorInfo = (() => {
+    const output = child(r, "Output");
+    return output !== void 0 ? child(output, "ErrorInfo") : void 0;
+  })();
+  let message;
+  let stack;
+  if (errorInfo !== void 0) {
+    message = textOf2(childList(errorInfo, "Message")[0]);
+    stack = textOf2(childList(errorInfo, "StackTrace")[0]);
+  }
+  const testId = attr2(r, "@_testId");
+  const known = (testId !== void 0 ? suites.byId.get(testId.toLowerCase()) : void 0) ?? suites.byName.get(testName);
+  if (known === void 0 && testId !== void 0) ctx.unresolvedIds++;
+  const suite = known ?? "unknown";
+  const result = {
+    testId: makeTestId(suite, testName),
+    suite,
+    name: testName,
+    status,
+    durationMs: durationMs(attr2(r, "@_duration"))
+  };
+  const trimmedMessage = trimTo(message, 2e3) ?? (status === "fail" || status === "error" ? `outcome: ${outcome}` : void 0);
+  if (trimmedMessage !== void 0) result.message = trimmedMessage;
+  const trimmedStack = trimTo(stack, 1e3);
+  if (trimmedStack !== void 0) result.stack = trimmedStack;
+  ctx.results.push(result);
 }
 var trxParser = {
   name: "trx",
@@ -1672,11 +2502,14 @@ var trxParser = {
     return trimmed.startsWith("<") && /<(?:[\w.-]+:)?TestRun[\s>]/.test(trimmed);
   },
   parse(content, sourcePath) {
-    const ctx = { sourcePath, results: [], warnings: [] };
+    const ctx = { sourcePath, results: [], warnings: [], unresolvedIds: 0 };
     const body = stripBom(content);
     if (body.trim() === "") {
       ctx.warnings.push(`trx: ${sourcePath}: file is empty`);
       return { results: ctx.results, warnings: ctx.warnings };
+    }
+    if (!/<\/(?:[\w.-]+:)?TestRun>\s*$/.test(body)) {
+      ctx.warnings.push(`trx: ${sourcePath}: content appears truncated (no closing </TestRun>)`);
     }
     let doc;
     try {
@@ -1700,64 +2533,32 @@ var trxParser = {
       root = root[0];
     }
     if (!isObj(root)) return { results: ctx.results, warnings: ctx.warnings };
-    const suiteByTestName = /* @__PURE__ */ new Map();
-    const defKey = Object.keys(root).find((k) => /(?:^|:)TestDefinitions$/.test(k));
-    if (defKey !== void 0) {
-      for (const unit of toArray(root[defKey]?.UnitTest)) {
-        if (!isObj(unit)) continue;
-        const unitName = attr2(unit, "@_name");
-        const methodKey = Object.keys(unit).find((k) => /(?:^|:)TestMethod$/.test(k));
-        const method = methodKey !== void 0 ? unit[methodKey] : void 0;
-        const className = method !== void 0 && isObj(method) ? attr2(method, "@_className") : void 0;
-        if (unitName !== void 0 && className !== void 0) {
-          suiteByTestName.set(unitName, className);
-        }
+    const suites = { byId: /* @__PURE__ */ new Map(), byName: /* @__PURE__ */ new Map() };
+    const definitions = child(root, "TestDefinitions");
+    for (const unit of definitions !== void 0 ? childList(definitions, "UnitTest") : []) {
+      if (!isObj(unit)) continue;
+      const method = child(unit, "TestMethod");
+      const className = method !== void 0 ? attr2(method, "@_className") : void 0;
+      if (className === void 0) continue;
+      const id = attr2(unit, "@_id");
+      if (id !== void 0) suites.byId.set(id.toLowerCase(), className);
+      const unitName = attr2(unit, "@_name");
+      if (unitName !== void 0 && !suites.byName.has(unitName)) {
+        suites.byName.set(unitName, className);
       }
     }
-    const resultsKey = Object.keys(root).find((k) => /(?:^|:)Results$/.test(k));
-    if (resultsKey === void 0) {
+    const resultsEl = child(root, "Results");
+    if (resultsEl === void 0 && !Object.keys(root).some((k) => /(?:^|:)Results$/.test(k))) {
       ctx.warnings.push(`trx: ${sourcePath}: no <Results> element found`);
       return { results: ctx.results, warnings: ctx.warnings };
     }
-    for (const r of toArray(root[resultsKey]?.UnitTestResult)) {
-      if (!isObj(r)) continue;
-      const testName = attr2(r, "@_testName");
-      if (testName === void 0) {
-        ctx.warnings.push(`trx: ${sourcePath}: skipping <UnitTestResult> without testName`);
-        continue;
-      }
-      const outputKey = Object.keys(r).find((k) => /(?:^|:)Output$/.test(k));
-      const output = outputKey !== void 0 && isObj(r[outputKey]) ? r[outputKey] : void 0;
-      const errorKey = output !== void 0 ? Object.keys(output).find((k) => /(?:^|:)ErrorInfo$/.test(k)) : void 0;
-      const errorInfo = errorKey !== void 0 && isObj(output[errorKey]) ? output[errorKey] : void 0;
-      let message;
-      let stack;
-      if (errorInfo !== void 0) {
-        const msgKey = Object.keys(errorInfo).find((k) => /(?:^|:)Message$/.test(k));
-        if (msgKey !== void 0) message = textOf2(errorInfo[msgKey]);
-        const stackKey = Object.keys(errorInfo).find((k) => /(?:^|:)StackTrace$/.test(k));
-        if (stackKey !== void 0) stack = textOf2(errorInfo[stackKey]);
-      }
-      const status = outcomeStatus(attr2(r, "@_outcome"), errorInfo !== void 0);
-      if (status === null) {
-        ctx.warnings.push(
-          `trx: ${sourcePath}: unknown outcome "${attr2(r, "@_outcome")}" \u2014 skipped ${testName}`
-        );
-        continue;
-      }
-      const suite = suiteByTestName.get(testName) ?? "unknown";
-      const result = {
-        testId: makeTestId(suite, testName),
-        suite,
-        name: testName,
-        status,
-        durationMs: durationMs(attr2(r, "@_duration"))
-      };
-      const trimmedMessage = trimTo(message, 2e3);
-      if (trimmedMessage !== void 0) result.message = trimmedMessage;
-      const trimmedStack = trimTo(stack, 1e3);
-      if (trimmedStack !== void 0) result.stack = trimmedStack;
-      ctx.results.push(result);
+    for (const r of resultsEl !== void 0 ? childList(resultsEl, "UnitTestResult") : []) {
+      mapResult(r, suites, ctx);
+    }
+    if (ctx.unresolvedIds > 0) {
+      ctx.warnings.push(
+        `trx: ${sourcePath}: ${ctx.unresolvedIds} result(s) have a testId with no matching <TestDefinitions> entry \u2014 recorded with suite 'unknown' (their ids differ from complete reports)`
+      );
     }
     return { results: ctx.results, warnings: ctx.warnings };
   }
@@ -1784,13 +2585,54 @@ function detectParser(content) {
 
 // src/util/redact.ts
 var PATTERNS = [
-  { name: "github-pat-classic", re: /ghp_[A-Za-z0-9]{30,}/g, replacement: "ghp_[REDACTED]" },
+  // PEM private keys (RSA/EC/OPENSSH/PKCS#8/encrypted…) — the whole block, or
+  // to the end of the text when a truncated message lost the END line.
+  // Certificates and public keys are not secrets and are left alone.
+  {
+    name: "pem-private-key",
+    re: /-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?(?:-----END \1-----|$)/g,
+    replacement: "[REDACTED-PRIVATE-KEY]"
+  },
+  // Credentials embedded in URLs: scheme://user:password@host — the password
+  // goes, the user and host stay for debugging.
+  {
+    name: "url-credentials",
+    re: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]+@/gi,
+    replacement: "$1[REDACTED]@"
+  },
+  // GitHub tokens: ghp_ (classic PAT), gho_ (OAuth), ghu_ (user-to-server),
+  // ghs_ (server-to-server / GITHUB_TOKEN), ghr_ (refresh)
+  { name: "github-token", re: /(gh[pousr])_[A-Za-z0-9]{30,}/g, replacement: "$1_[REDACTED]" },
   {
     name: "github-pat-fine",
     re: /github_pat_[A-Za-z0-9_]{20,}/g,
     replacement: "github_pat_[REDACTED]"
   },
-  { name: "aws-access-key", re: /AKIA[0-9A-Z]{16}/g, replacement: "AKIA[REDACTED]" },
+  // AKIA = long-lived access key id, ASIA = temporary (STS) key id. Exactly
+  // 16 trailing chars: a longer all-caps run is a word, not a key id.
+  {
+    name: "aws-access-key",
+    re: /(AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/g,
+    replacement: "$1[REDACTED]"
+  },
+  {
+    name: "google-api-key",
+    re: /AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g,
+    replacement: "AIza[REDACTED]"
+  },
+  {
+    name: "stripe-key",
+    // live keys only: sk_test_/rk_test_ are sandbox keys, and `…_test_…` is
+    // far too common in test names to match safely
+    re: /\b([sr]k)_live_[0-9A-Za-z]{10,}/g,
+    replacement: "$1_live_[REDACTED]"
+  },
+  // Azure storage / service bus connection strings
+  {
+    name: "azure-account-key",
+    re: /\b(AccountKey|SharedAccessKey)=[^;\s"']+/gi,
+    replacement: "$1=[REDACTED]"
+  },
   { name: "openai-key", re: /sk-[A-Za-z0-9_-]{20,}/g, replacement: "sk-[REDACTED]" },
   { name: "slack-token", re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox[REDACTED]" },
   { name: "gitlab-pat", re: /glpat-[A-Za-z0-9_-]{20,}/g, replacement: "glpat-[REDACTED]" },
@@ -1820,6 +2662,15 @@ var PATTERNS = [
     name: "secret-assignment",
     re: /((?:api[_-]?key|secret[_-]?key|access[_-]?key|auth[_-]?token|password|passwd|client[_-]?secret)["']?\s*[:=]\s*["']?)([^\s"']{12,})/gi,
     replacement: "$1[REDACTED]"
+  },
+  // Strict `=` assignments of token/secret/password (env dumps, query
+  // strings, CLI flags) are redacted at ANY length — `password=hunter2` is a
+  // real leak. Only the tight `key=value` form qualifies (no spaces, no
+  // `==`), so prose and code like `token === undefined` survive.
+  {
+    name: "short-assignment",
+    re: /((?:token|secret|password|passwd)["']?=["']?)(?!\[REDACTED\])[^\s"'=&;,()<>[\]][^\s"'&;,()<>]*/gi,
+    replacement: "$1[REDACTED]"
   }
 ];
 function redact(text) {
@@ -1830,17 +2681,38 @@ function redact(text) {
   return out;
 }
 
+// src/report/text.ts
+var CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+function escapeControlChars(s) {
+  return s.replace(CONTROL, (c) => {
+    const code = c.charCodeAt(0);
+    return code < 256 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
+}
+function truncateCodePoints(s, max) {
+  if (s.length <= max) return s;
+  const cps = Array.from(s);
+  return cps.length <= max ? s : `${cps.slice(0, max - 1).join("")}\u2026`;
+}
+
 // src/report/markdown.ts
 var PR_COMMENT_MARKER = "<!-- flakefinder:report -->";
 var FLAKY_CLASSES = ["flaky-confirmed", "flaky-retry", "flaky-suspected"];
 function isFlaky(v) {
   return FLAKY_CLASSES.includes(v.classification);
 }
+function escapeMarkdownInline(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/[[\]]/g, "\\$&").replace(/@(?=[A-Za-z0-9_-])/g, "@\u200D").replace(/\|/g, "\\|");
+}
 function cell(s, max = 80) {
   if (!s) return "";
-  const oneLine = redact(s).replace(/\r?\n/g, " ");
-  const out = oneLine.length > max ? `${oneLine.slice(0, max - 1)}\u2026` : oneLine;
-  return out.replace(/\|/g, "\\|");
+  const oneLine = escapeControlChars(redact(s).replace(/\r?\n/g, " "));
+  return escapeMarkdownInline(truncateCodePoints(oneLine, max));
+}
+function fenceFor(content) {
+  let longest = 0;
+  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  return "`".repeat(Math.max(3, longest + 1));
 }
 function classLabel(v) {
   switch (v.classification) {
@@ -1902,7 +2774,11 @@ function renderMarkdown(verdicts, opts) {
   }
   return sections.join("\n");
 }
-function buildPrComment(verdicts, previous) {
+var PR_COMMENT_MAX_ROWS = 50;
+var PR_COMMENT_MAX_CHARS = 6e4;
+function buildPrComment(verdicts, previous, opts = {}) {
+  const maxRows = opts.maxRows ?? PR_COMMENT_MAX_ROWS;
+  const maxChars = opts.maxChars ?? PR_COMMENT_MAX_CHARS;
   const prevFlaky = new Set((previous ?? []).filter(isFlaky).map((v) => v.testId));
   const prevScore = new Map((previous ?? []).map((v) => [v.testId, v.flakeScore]));
   const flaky = verdicts.filter(isFlaky).sort((a, b) => b.flakeScore - a.flakeScore);
@@ -1910,45 +2786,82 @@ function buildPrComment(verdicts, previous) {
   const failing = verdicts.filter(
     (v) => v.classification === "failing" || v.classification === "new-failure"
   );
-  const rows = flaky.map((v) => {
-    if (!previous) return { v, delta: "\u2014" };
-    if (!prevFlaky.has(v.testId)) return { v, delta: "**new**" };
+  const deltaOf = (v) => {
+    if (!previous) return "\u2014";
+    if (!prevFlaky.has(v.testId)) return "**new**";
     const d = v.flakeScore - (prevScore.get(v.testId) ?? 0);
-    return { v, delta: d === 0 ? "=" : d > 0 ? `\u2191${d}` : `\u2193${-d}` };
-  });
-  const out = [PR_COMMENT_MARKER, "## \u{1F40D} flakefinder", ""];
+    return d === 0 ? "=" : d > 0 ? `\u2191${d}` : `\u2193${-d}`;
+  };
+  const head = [PR_COMMENT_MARKER, "## \u{1F40D} flakefinder", ""];
   const summary = flaky.length === 0 ? `\u2705 no flakes detected among ${verdicts.length} tracked tests` : `**${flaky.length} flaky** (${newFlakes.length} new \xB7 ${flaky.length - newFlakes.length} known) \xB7 ${failing.length} failing \xB7 ${verdicts.length} tracked`;
-  out.push(summary);
-  if (previous === null && flaky.length > 0) out.push("_first run \u2014 building history_");
-  out.push("");
-  if (flaky.length > 0) out.push(table(rows), "");
-  const detailCount = Math.min(newFlakes.length, 5);
-  for (let i = 0; i < detailCount; i++) {
-    const v = newFlakes[i];
-    out.push(
-      `<details><summary><code>${cell(v.name, 60)}</code> \u2014 score ${v.flakeScore}</summary>`,
-      ""
+  head.push(summary);
+  if (previous === null && flaky.length > 0) head.push("_first run \u2014 building history_");
+  head.push("");
+  const dashboard = opts.dashboardArtifact;
+  const footer = [
+    "---",
+    dashboard ? `_\u{1F4CA} HTML dashboard uploaded as artifact \`${dashboard}\` \xB7 docs: \`docs/github-action.md\`_` : "_docs: `docs/github-action.md`_"
+  ];
+  const seeMore = dashboard ? " \u2014 see the dashboard artifact" : "";
+  const size = (lines) => lines.reduce((n, l) => n + l.length + 1, 0);
+  let budget = maxChars - size(head) - size(footer) - 400;
+  const body = [];
+  if (flaky.length > 0) {
+    const tableLines = table([]).split("\n");
+    budget -= size(tableLines);
+    let shown = 0;
+    for (const v of flaky) {
+      if (shown >= maxRows) break;
+      const row = table([{ v, delta: deltaOf(v) }]).split("\n")[2];
+      if (row.length + 1 > budget) break;
+      tableLines.push(row);
+      budget -= row.length + 1;
+      shown++;
+    }
+    body.push(...tableLines);
+    if (flaky.length > shown) {
+      body.push(
+        "",
+        `_\u2026and ${flaky.length - shown} more flaky test(s) not shown in this table${seeMore}._`
+      );
+    }
+    body.push("");
+  }
+  let detailCount = 0;
+  for (const v of newFlakes.slice(0, 5)) {
+    const message = truncateCodePoints(
+      redact(v.lastMessage ?? "(no failure message recorded)"),
+      400
     );
-    out.push("````text");
-    out.push(redact(v.lastMessage ?? "(no failure message recorded)").slice(0, 400));
-    out.push("````", "");
-    out.push("Quarantine it:", "");
-    out.push("```bash");
-    out.push(`flakefinder quarantine add ${v.testId}`);
-    out.push("```", "");
-    out.push("</details>", "");
+    const fence = fenceFor(message);
+    const block = [
+      `<details><summary><code>${cell(v.name, 60)}</code> \u2014 score ${v.flakeScore}</summary>`,
+      "",
+      `${fence}text`,
+      message,
+      fence,
+      "",
+      "Quarantine it:",
+      "",
+      "```bash",
+      `flakefinder quarantine add ${v.testId}`,
+      "```",
+      "",
+      "</details>",
+      ""
+    ];
+    if (size(block) > budget) break;
+    body.push(...block);
+    budget -= size(block);
+    detailCount++;
   }
   if (newFlakes.length > detailCount) {
-    out.push(
-      `_\u2026and ${newFlakes.length - detailCount} more new flake(s) \u2014 see the dashboard artifact._`,
+    body.push(
+      `_\u2026and ${newFlakes.length - detailCount} more new flake(s)${seeMore || " without details here"}._`,
       ""
     );
   }
-  out.push(
-    "---",
-    "_\u{1F4CA} HTML dashboard uploaded as artifact `flakefinder-dashboard` \xB7 docs: `docs/github-action.md`_"
-  );
-  return out.join("\n");
+  return [...head, ...body, ...footer].join("\n");
 }
 
 // src/report/gitlab.ts
@@ -1961,34 +2874,53 @@ function gitlabEnvFromProcess(env = process.env) {
   if (!apiV4 || !projectId || !mrIid || !token) return null;
   return { apiV4, projectId, mrIid, token };
 }
-async function upsertMrNote(gl, body, fetchImpl = fetch) {
+async function upsertMrNote(gl, body, fetchImpl = fetch, warn = (m) => console.warn(`flakefinder: ${m}`), timeoutMs = 15e3) {
+  const call = (url, init = {}) => fetchImpl(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
   const headers = {
     "PRIVATE-TOKEN": gl.token,
     "Content-Type": "application/json"
   };
-  const notesUrl = `${gl.apiV4}/projects/${encodeURIComponent(gl.projectId)}/merge_requests/${encodeURIComponent(gl.mrIid)}/notes?per_page=100`;
+  const mrUrl = `${gl.apiV4}/projects/${encodeURIComponent(gl.projectId)}/merge_requests/${encodeURIComponent(gl.mrIid)}`;
+  const notesUrl = `${mrUrl}/notes?per_page=100`;
   try {
-    const listRes = await fetchImpl(notesUrl, { headers });
+    const userRes = await call(`${gl.apiV4}/user`, { headers });
+    if (!userRes.ok) {
+      warn(`GitLab: resolving the token's user failed: HTTP ${userRes.status}`);
+      return "unavailable";
+    }
+    const me = await userRes.json();
+    if (typeof me.id !== "number") return "unavailable";
+    const listRes = await call(notesUrl, { headers });
     if (!listRes.ok) {
+      warn(`GitLab: listing MR notes failed: HTTP ${listRes.status}`);
       return "unavailable";
     }
     const notes = await listRes.json();
     if (!Array.isArray(notes)) return "unavailable";
-    const existing = notes.find((n) => (n.body ?? "").includes(PR_COMMENT_MARKER));
+    const existing = notes.find(
+      (n) => n.author?.id === me.id && (n.body ?? "").includes(PR_COMMENT_MARKER)
+    );
     if (existing) {
-      const res2 = await fetchImpl(
-        `${gl.apiV4}/projects/${encodeURIComponent(gl.projectId)}/merge_requests/${encodeURIComponent(gl.mrIid)}/notes/${existing.id}`,
-        { method: "PUT", headers, body: JSON.stringify({ body }) }
-      );
-      return res2.ok ? "updated" : "unavailable";
+      const res2 = await call(`${mrUrl}/notes/${existing.id}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ body })
+      });
+      if (res2.ok) return "updated";
+      warn(`GitLab: updating MR note ${existing.id} failed: HTTP ${res2.status}`);
+      return "unavailable";
     }
-    const res = await fetchImpl(notesUrl, {
+    const res = await call(notesUrl, {
       method: "POST",
       headers,
       body: JSON.stringify({ body })
     });
-    return res.ok ? "created" : "unavailable";
-  } catch {
+    if (res.ok) return "created";
+    warn(`GitLab: creating MR note failed: HTTP ${res.status}`);
+    return "unavailable";
+  } catch (err) {
+    const e = err;
+    warn(`GitLab: MR note request failed (${e.name}: ${e.message})`);
     return "unavailable";
   }
 }
@@ -2801,10 +3733,13 @@ function renderDashboard(data) {
   function midTrunc(s, max) {
     s = String(s);
     if (s.length <= max) return s;
+    // by code point: slicing UTF-16 units would split surrogate pairs (emoji)
+    var cps = Array.from(s);
+    if (cps.length <= max) return s;
     var keep = max - 1;
     var head = Math.ceil(keep / 2);
     var tail = keep - head;
-    return s.slice(0, head) + '\u2026' + s.slice(s.length - tail);
+    return cps.slice(0, head).join('') + '\u2026' + cps.slice(cps.length - tail).join('');
   }
   function shortSha(s) { return s ? String(s).slice(0, 7) : ''; }
 
@@ -3413,8 +4348,10 @@ function fmtMs(ms) {
 }
 function truncateMiddle(s, max) {
   if (s.length <= max) return s;
+  const cps = Array.from(s);
+  if (cps.length <= max) return s;
   const half = Math.floor((max - 1) / 2);
-  return `${s.slice(0, half)}\u2026${s.slice(s.length - half)}`;
+  return `${cps.slice(0, half).join("")}\u2026${cps.slice(cps.length - half).join("")}`;
 }
 function renderTerminal(allVerdicts, opts) {
   const color = makeColor(opts.color);
@@ -3432,6 +4369,7 @@ function renderTerminal(allVerdicts, opts) {
     list.push(v);
     byClass.set(v.classification, list);
   }
+  const safe = (s) => escapeControlChars(redact(s));
   for (const [, list] of byClass) {
     list.sort((a, b) => b.flakeScore - a.flakeScore || a.name.localeCompare(b.name));
   }
@@ -3469,9 +4407,9 @@ function renderTerminal(allVerdicts, opts) {
       const runs = String(v.runsObserved).padStart(3);
       const pass = `${Math.round(v.passRate * 100)}%`.padStart(4);
       const med = fmtMs(v.medianDurationMs).padStart(6);
-      const tags = v.tags.length > 0 ? dim2(` [${v.tags.join(", ")}]`) : "";
+      const tags = v.tags.length > 0 ? dim2(` [${safe(v.tags.join(", "))}]`) : "";
       lines.push(
-        `  ${color(meta.colorCode, score)}  conf ${conf}  runs ${runs}  pass ${pass}  med ${med}  ${v.suite} ${dim2("::")} ${bold(truncateMiddle(v.name, 48))}${tags}`
+        `  ${color(meta.colorCode, score)}  conf ${conf}  runs ${runs}  pass ${pass}  med ${med}  ${safe(v.suite)} ${dim2("::")} ${bold(truncateMiddle(safe(v.name), 48))}${tags}`
       );
     }
     lines.push("");
@@ -3485,9 +4423,9 @@ function renderTerminal(allVerdicts, opts) {
       const shown = cls === "passing" ? list.slice(0, 20) : list;
       for (const v of shown) {
         const med = fmtMs(v.medianDurationMs).padStart(6);
-        const tags = v.tags.length > 0 ? dim2(` [${v.tags.join(", ")}]`) : "";
+        const tags = v.tags.length > 0 ? dim2(` [${safe(v.tags.join(", "))}]`) : "";
         lines.push(
-          `  ${dim2(String(v.flakeScore).padStart(3))}  runs ${String(v.runsObserved).padStart(3)}  med ${med}  ${v.suite} ${dim2("::")} ${truncateMiddle(v.name, 48)}${tags}`
+          `  ${dim2(String(v.flakeScore).padStart(3))}  runs ${String(v.runsObserved).padStart(3)}  med ${med}  ${safe(v.suite)} ${dim2("::")} ${truncateMiddle(safe(v.name), 48)}${tags}`
         );
       }
       if (cls === "passing" && list.length > 20) lines.push(dim2(`  \u2026and ${list.length - 20} more`));
@@ -3509,7 +4447,7 @@ function renderTerminal(allVerdicts, opts) {
     lines.push("next steps:");
     if (worst) {
       lines.push(`  ${dim2("\u2022")} quarantine the worst offender:`);
-      lines.push(`      ${color("36", `flakefinder quarantine add ${worst.testId}`)}`);
+      lines.push(`      ${color("36", `flakefinder quarantine add ${safe(worst.testId)}`)}`);
     }
     lines.push(`  ${dim2("\u2022")} full interactive report: ${color("36", "flakefinder html")}`);
   }
@@ -3519,48 +4457,11 @@ function renderTerminal(allVerdicts, opts) {
 // src/runner/wrap.ts
 import { spawn, spawnSync as spawnSync2 } from "child_process";
 import { createHash as createHash2, randomUUID } from "crypto";
-import { readFileSync as readFileSync4, statSync as statSync4 } from "fs";
+import { existsSync as existsSync5, readFileSync as readFileSync4, statSync as statSync5 } from "fs";
 import path6 from "path";
-
-// src/runner/adapters.ts
-function escapeRegExp2(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function failedNamesOf(records) {
-  const names = /* @__PURE__ */ new Set();
-  for (const r of records) {
-    for (const t of r.results) {
-      if (t.status === "fail" || t.status === "error") names.add(t.name);
-    }
-  }
-  return [...names];
-}
-function failedOnlyArgs(runner, failedNames, quarantinedNames = []) {
-  if (failedNames.length === 0) return null;
-  switch (runner) {
-    case "jest":
-    case "mocha": {
-      const include = failedNames.map(escapeRegExp2).join("|");
-      const exclude = [...new Set(quarantinedNames.map(escapeRegExp2))];
-      const pattern = exclude.length > 0 ? `^(?=(?:.* )?(?:${include})$)(?!(?:.* )?(?:${exclude.join("|")})$)` : `^(?:.* )?(?:${include})$`;
-      return runner === "jest" ? ["-t", pattern] : ["--grep", pattern];
-    }
-    case "go": {
-      const parents = new Set(failedNames.map((n) => n.includes("/") ? n.split("/")[0] : n));
-      const pattern = `^(${[...parents].map(escapeRegExp2).join("|")})$`;
-      return ["-run", pattern];
-    }
-    case "pytest":
-      return ["--lf"];
-    default:
-      return null;
-  }
-}
-
-// src/runner/wrap.ts
 function statOf(file) {
   try {
-    const s = statSync4(file);
+    const s = statSync5(file);
     return { size: s.size, mtimeMs: s.mtimeMs };
   } catch {
     return null;
@@ -3588,32 +4489,73 @@ function snapshotReports(cwd, cfg, previous) {
   return snapshot;
 }
 function needsShell(command) {
-  return command.some((t) => /[<>|&]/.test(t));
+  return command.some((t) => /[<>|&]/.test(t) || isShellOperator(t));
 }
 function isShellOperator(token) {
-  return /^[<>|&\d]+$/.test(token);
+  return /^(?:\|\|?|\|&|&&?|;|&>>?|\d*(?:<<?|>>?|>\||<>)(?:&(?:\d+|-))?)$/.test(token);
+}
+var RUNNER_BINS = /^(?:jest|vitest|mocha|pytest|py\.test|go|npm|npx|yarn|pnpm|bun|bunx)$/;
+var RUNNER_WORDS = /^(?:jest|vitest|mocha|pytest|py\.test)$/;
+var SCRIPT_HOSTS = /^(?:node|python3?|deno)$/;
+function commandBase(token) {
+  return token.replace(/^.*[\\/]/, "").toLowerCase().replace(/\.(?:cmd|exe|bat)$/, "");
+}
+function runnerSegment(command) {
+  const segments = [];
+  let start = 0;
+  for (let i = 0; i <= command.length; i++) {
+    if (i < command.length && !isControlOperator(command[i])) continue;
+    let cmd = start;
+    while (cmd < i && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command[cmd])) cmd++;
+    let end = cmd;
+    while (end < i && !isShellOperator(command[end])) end++;
+    if (cmd < end) segments.push({ cmd, end });
+    start = i + 1;
+  }
+  const words = (seg) => command.slice(seg.cmd, seg.end).map(commandBase);
+  return segments.find((seg) => {
+    const w = words(seg);
+    return RUNNER_BINS.test(w[0]) || w.some((t) => RUNNER_WORDS.test(t));
+  }) ?? segments.find((seg) => SCRIPT_HOSTS.test(words(seg)[0])) ?? segments[0] ?? { cmd: 0, end: command.length };
 }
 function insertRunnerArgs(command, args) {
   if (args.length === 0) return [...command];
-  const separator = isPackageManagerWrapper(command) ? ["--"] : [];
-  const opIdx = command.findIndex((t) => isShellOperator(t));
-  const insertAt = opIdx === -1 ? command.length : opIdx;
-  return [...command.slice(0, insertAt), ...separator, ...args, ...command.slice(insertAt)];
+  const seg = runnerSegment(command);
+  const hasSeparator = command.slice(seg.cmd + 1, seg.end).includes("--");
+  const wrapper = isPackageManagerWrapper(command.slice(seg.cmd));
+  const separator = wrapper && !hasSeparator ? ["--"] : [];
+  return [...command.slice(0, seg.end), ...separator, ...args, ...command.slice(seg.end)];
 }
-function killTree(child) {
-  if (child.pid === void 0) return;
-  if (process.platform === "win32") {
-    spawnSync2("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-  } else {
-    child.kill("SIGTERM");
-    const escalated = setTimeout(() => child.kill("SIGKILL"), 3e3);
-    escalated.unref();
+var USE_PROCESS_GROUP = process.platform !== "win32";
+function signalTree(child2, signal) {
+  if (child2.pid === void 0) return;
+  if (USE_PROCESS_GROUP) {
+    try {
+      process.kill(-child2.pid, signal);
+      return;
+    } catch {
+    }
   }
+  try {
+    child2.kill(signal);
+  } catch {
+  }
+}
+function killTree(child2, signal = "SIGTERM") {
+  if (child2.pid === void 0) return;
+  if (process.platform === "win32") {
+    const r = spawnSync2("taskkill", ["/pid", String(child2.pid), "/T", "/F"], { stdio: "ignore" });
+    if (r.error || r.status !== 0) child2.kill();
+    return;
+  }
+  signalTree(child2, signal);
+  const escalated = setTimeout(() => signalTree(child2, "SIGKILL"), 3e3);
+  escalated.unref();
 }
 var SPAWN_FAILED = -2;
 var SHELL_NOT_FOUND = process.platform === "win32" ? 9009 : 127;
 function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
-  const shellArgv = command.map((t) => isShellOperator(t) ? t : shellQuote(t));
+  const shellArgv = shellArgvFor(command, cwd);
   return new Promise((resolve) => {
     const done = (code) => {
       if (currentChild.ref) currentChild.ref = null;
@@ -3623,9 +4565,20 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
     const start = (argv, useShell2) => {
       let abandoned = false;
       let timedOut = false;
-      let child;
+      let child2;
       try {
-        child = spawn(argv[0], argv.slice(1), { shell: useShell2, cwd, stdio: "inherit" });
+        child2 = spawn(argv[0], argv.slice(1), {
+          shell: useShell2,
+          cwd,
+          detached: USE_PROCESS_GROUP,
+          // a background process group that reads the terminal is stopped
+          // (SIGTTIN) — test runs get EOF on stdin instead of hanging
+          stdio: [
+            USE_PROCESS_GROUP && process.stdin.isTTY ? "ignore" : "inherit",
+            "inherit",
+            "inherit"
+          ]
+        });
       } catch (err) {
         if (!useShell2) {
           start(shellArgv, true);
@@ -3635,19 +4588,19 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
         done(SPAWN_FAILED);
         return;
       }
-      currentChild.ref = child;
+      currentChild.ref = child2;
       const timer = timeoutSeconds != null ? setTimeout(() => {
         timedOut = true;
         console.error(
           `flakefinder: attempt timed out after ${timeoutSeconds}s \u2014 killing the process tree`
         );
-        killTree(child);
+        killTree(child2);
       }, timeoutSeconds * 1e3) : null;
       const finish = (code) => {
         if (timer) clearTimeout(timer);
         done(timedOut ? 124 : code);
       };
-      child.on("error", (err) => {
+      child2.on("error", (err) => {
         if (!useShell2 && (err.code === "ENOENT" || err.code === "EINVAL")) {
           abandoned = true;
           if (err.code === "ENOENT") directNotFound = true;
@@ -3665,7 +4618,7 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
         if (timer) clearTimeout(timer);
         done(SPAWN_FAILED);
       });
-      child.on("close", (code) => {
+      child2.on("close", (code) => {
         if (abandoned) return;
         if (useShell2 && directNotFound && code === SHELL_NOT_FOUND && !timedOut) {
           if (timer) clearTimeout(timer);
@@ -3691,20 +4644,20 @@ async function runLive(command, cfg, opts) {
   const runner = cfg.runner === "auto" ? detectRunner(cwd) : cfg.runner;
   let quarantineFlags = [];
   let quarantinedNames = [];
+  let quarantinedIds = /* @__PURE__ */ new Set();
   if (opts.applyQuarantine) {
+    const entries = loadQuarantine(path6.resolve(cwd, cfg.quarantineFile));
+    quarantinedIds = new Set(entries.map((e) => e.testId));
     if (runner === "pytest" || runner === "jest" || runner === "mocha") {
-      const qm = new QuarantineManager(path6.resolve(cwd, cfg.quarantineFile));
-      const entries = qm.list();
       if (entries.length > 0) {
-        quarantineFlags = exclusionArgs(runner, entries);
+        quarantineFlags = exclusionArgs(runner, entries, cwd);
         quarantinedNames = entries.map((e) => e.name);
         console.log(
           `flakefinder: quarantine active \u2014 excluding ${entries.length} quarantined test(s) via runner flags`
         );
       }
     } else if (runner === "go" || runner === "generic") {
-      const qm = new QuarantineManager(path6.resolve(cwd, cfg.quarantineFile));
-      if (qm.list().length > 0) {
+      if (entries.length > 0) {
         console.log(
           `flakefinder: quarantine has entries but runner "${runner}" has no per-test exclusion \u2014 report only`
         );
@@ -3723,9 +4676,11 @@ async function runLive(command, cfg, opts) {
   const maxAttempts = Math.max(1, opts.retries + 1);
   const currentChild = { ref: null };
   let interrupted = false;
-  const onInterrupt = () => {
+  let warnedSelectorClash = false;
+  let notedSelectorMerge = false;
+  const onInterrupt = (signal) => {
     interrupted = true;
-    if (currentChild.ref) killTree(currentChild.ref);
+    if (currentChild.ref) killTree(currentChild.ref, signal);
   };
   process.on("SIGINT", onInterrupt);
   process.on("SIGTERM", onInterrupt);
@@ -3734,13 +4689,23 @@ async function runLive(command, cfg, opts) {
       let extraArgs = quarantineFlags;
       let note = "";
       if (attempt > 1 && cfg.retryMode !== "full") {
-        const failed = failedNamesOf(attempts).filter((n) => !quarantinedNames.includes(n));
-        const targeted = failedOnlyArgs(runner, failed, quarantinedNames);
-        if (targeted) {
+        const previous = attempts.filter((r) => r.attempt === attempt - 1);
+        const failed = failedNamesOf(previous).filter((n) => !quarantinedNames.includes(n));
+        let targeted = failedOnlyArgs(runner, failed, quarantinedNames);
+        if (runner === "pytest" && targeted) {
+          if (pytestCacheDisabled(command)) targeted = null;
+          else targeted = [...quarantineFlags, ...targeted];
+        }
+        const targetedChars = targeted ? targeted.reduce((n, a) => n + a.length + 1, 0) : 0;
+        if (targeted && targetedChars > SELECTOR_BUDGET_CHARS) {
+          note = `full re-run (${failed.length} failures: selector would be ${targetedChars} chars, over the ${SELECTOR_BUDGET_CHARS}-char budget)`;
+        } else if (targeted) {
           extraArgs = targeted;
           note = `targeted: re-running ${failed.length} failed test(s)`;
         } else if (failed.length === 0) {
           note = "full re-run (no failures recorded)";
+        } else if (runner === "pytest" && pytestCacheDisabled(command)) {
+          note = "full re-run (-p no:cacheprovider disables pytest --lf)";
         } else {
           if (cfg.retryMode === "failed") {
             console.warn(
@@ -3750,10 +4715,25 @@ async function runLive(command, cfg, opts) {
           note = "full re-run (no targeted adapter)";
         }
       }
-      const built = insertRunnerArgs(command, extraArgs);
+      const merged = mergeUserSelector(command, extraArgs);
+      if (merged.userPatterns.length > 0 && !notedSelectorMerge) {
+        notedSelectorMerge = true;
+        console.log(
+          `flakefinder: combined your own ${extraArgs[0]} filter with flakefinder's selector (both must match)`
+        );
+      }
+      const runCommand = merged.command;
+      extraArgs = merged.extraArgs;
+      if (!warnedSelectorClash && userSelectorClash(runCommand, extraArgs)) {
+        warnedSelectorClash = true;
+        console.warn(
+          `flakefinder: your command already passes a name selector; flakefinder's injected ${extraArgs[0]} (quarantine exclusion / targeted re-run) is appended after it and most runners keep only the LAST one \u2014 combine them yourself or use --no-quarantine / --retry-mode full`
+        );
+      }
+      const built = insertRunnerArgs(runCommand, extraArgs);
       console.log(
         dim(
-          `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ""} \u2192 ${built.join(" ")}`
+          `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ""} \u2192 ${truncateForLog(built.join(" "))}`
         )
       );
       let code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
@@ -3779,7 +4759,11 @@ async function runLive(command, cfg, opts) {
       exitCodes.push(code);
       const after = snapshotReports(cwd, cfg, snapshot);
       for (const [file, stamp] of after) {
-        if (attempt === 1 && snapshot.get(file)?.sha === stamp.sha) continue;
+        const prev = snapshot.get(file);
+        if (attempt === 1 && prev?.sha === stamp.sha) continue;
+        if (attempt > 1 && prev !== void 0 && prev.mtimeMs === stamp.mtimeMs && prev.size === stamp.size && prev.sha === stamp.sha) {
+          continue;
+        }
         let content;
         try {
           content = readFileSync4(file, "utf8");
@@ -3826,12 +4810,20 @@ async function runLive(command, cfg, opts) {
     );
   }
   const lastExit = exitCodes[exitCodes.length - 1] ?? 1;
-  const deterministicFail = verdicts.some(
-    (v) => (v.classification === "failing" || v.classification === "new-failure") && (v.lastStatus === "fail" || v.lastStatus === "error")
+  const lastRealStatus = /* @__PURE__ */ new Map();
+  for (const record of [...attempts].sort((a, b) => a.attempt - b.attempt)) {
+    for (const t of record.results) if (t.status !== "skip") lastRealStatus.set(t.testId, t.status);
+  }
+  const gated = verdicts.filter(
+    (v) => lastRealStatus.has(v.testId) && !quarantinedIds.has(v.testId)
   );
+  const deterministicFail = gated.some((v) => {
+    const last = lastRealStatus.get(v.testId);
+    return (v.classification === "failing" || v.classification === "new-failure") && (last === "fail" || last === "error");
+  });
   let finalExitCode = deterministicFail || lastExit !== 0 ? 1 : 0;
   if (interrupted) finalExitCode = 130;
-  if (cfg.failOnFlakes && (verdicts.some((v) => v.classification.startsWith("flaky-")) || suiteFlake)) {
+  if (cfg.failOnFlakes && (gated.some((v) => v.classification.startsWith("flaky-")) || suiteFlake)) {
     finalExitCode = 1;
   }
   return {
@@ -3842,6 +4834,82 @@ async function runLive(command, cfg, opts) {
     suiteFlake
   };
 }
+var SELECTOR_ALIASES = {
+  "-t": ["-t", "--testNamePattern"],
+  "--grep": ["--grep", "-g", "--fgrep", "-f"],
+  "-run": ["-run", "--run"]
+};
+var LITERAL_SELECTORS = /* @__PURE__ */ new Set(["--fgrep", "-f"]);
+function mergeUserSelector(command, extraArgs) {
+  const unchanged = { command, extraArgs, userPatterns: [] };
+  const flag = extraArgs[0];
+  const ours = extraArgs[1];
+  if (flag !== "-t" && flag !== "--grep" || ours === void 0 || !ours.startsWith("^")) {
+    return unchanged;
+  }
+  const aliases = SELECTOR_ALIASES[flag];
+  const { cmd, end } = runnerSegment(command);
+  if (flag === "--grep" && command.slice(cmd + 1, end).some((t) => t === "--invert" || t === "-i")) {
+    return unchanged;
+  }
+  const kept = command.slice(0, cmd + 1);
+  const userPatterns = [];
+  for (let i = cmd + 1; i < end; i++) {
+    const t = command[i];
+    const alias = aliases.find((a) => t === a || t.startsWith(`${a}=`));
+    if (!alias) {
+      kept.push(t);
+      continue;
+    }
+    let value;
+    if (t === alias) {
+      value = command[i + 1];
+      if (value === void 0 || i + 1 >= end) {
+        kept.push(t);
+        continue;
+      }
+      i++;
+    } else {
+      value = t.slice(alias.length + 1);
+    }
+    if (LITERAL_SELECTORS.has(alias)) value = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    else if (flag === "--grep") value = value.replace(/^\/(.*)\/[a-z]*$/s, "$1");
+    userPatterns.push(value);
+  }
+  if (userPatterns.length === 0) return unchanged;
+  const lookaheads = userPatterns.map((p) => `(?=[\\s\\S]*?(?:${p}))`).join("");
+  return {
+    command: [...kept, ...command.slice(end)],
+    extraArgs: [flag, `^${lookaheads}${ours.slice(1)}`, ...extraArgs.slice(2)],
+    userPatterns
+  };
+}
+function userSelectorClash(command, extraArgs) {
+  const aliases = SELECTOR_ALIASES[extraArgs[0] ?? ""];
+  if (!aliases) return false;
+  const { cmd, end } = runnerSegment(command);
+  const segment = command.slice(cmd + 1, end);
+  return segment.some((t) => aliases.some((a) => t === a || t.startsWith(`${a}=`)));
+}
+function loadQuarantine(file) {
+  try {
+    return new QuarantineManager(file).list();
+  } catch (err) {
+    console.warn(
+      `flakefinder: ${err.message} \u2014 running WITHOUT quarantine exclusions (see \`flakefinder doctor\`)`
+    );
+    return [];
+  }
+}
+function pytestCacheDisabled(command) {
+  return command.some(
+    (t, i) => t === "-pno:cacheprovider" || t === "-p=no:cacheprovider" || t === "no:cacheprovider" && command[i - 1] === "-p"
+  );
+}
+var SELECTOR_BUDGET_CHARS = process.platform === "win32" ? 6e3 : 32768;
+function truncateForLog(line, max = 400) {
+  return line.length <= max ? line : `${line.slice(0, max)}\u2026 (+${line.length - max} chars)`;
+}
 function dim(s) {
   return process.stdout.isTTY ? `\x1B[2m${s}\x1B[0m` : s;
 }
@@ -3849,12 +4917,68 @@ function isPackageManagerWrapper(command) {
   const first = command[0]?.toLowerCase().replace(/\.(cmd|exe)$/, "");
   return first === "npm" || first === "yarn" || first === "pnpm" || first === "bun";
 }
-function shellQuote(s) {
-  if (!/[\s"&|<>^()%!'"\\]/.test(s)) return s;
-  if (process.platform === "win32") {
-    return `"${s.replace(/"/g, '""')}"`;
+var POSIX_SAFE = /^[A-Za-z0-9_\-+=.,/:@%]+$/;
+var CMD_SAFE = /^[A-Za-z0-9_\-+./:@]+$/;
+var CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+function shellQuote(s, opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  if (platform === "win32") {
+    if (CMD_SAFE.test(s)) return s;
+    let a = s.replace(/(\\*)"/g, '$1$1\\"');
+    a = a.replace(/(\\*)$/, "$1$1");
+    a = `"${a}"`.replace(CMD_META, "^$1");
+    return opts.doubleEscape ? a.replace(CMD_META, "^$1") : a;
   }
+  if (POSIX_SAFE.test(s)) return s;
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+function isControlOperator(token) {
+  return /^(?:\|\|?|\|&|&&?|;)$/.test(token);
+}
+function takesRedirectTarget(token) {
+  return isShellOperator(token) && !isControlOperator(token) && !/&(?:\d+|-)$/.test(token);
+}
+function isBatchCommand(cmd, cwd, env = process.env) {
+  if (/\.(?:cmd|bat)$/i.test(cmd)) return true;
+  if (path6.extname(cmd) !== "") return false;
+  const exts = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  const hasDir = /[\\/]/.test(cmd);
+  const dirs = hasDir ? [""] : [cwd, ...(env.PATH ?? env.Path ?? "").split(";").filter(Boolean)];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = dir ? path6.join(dir, cmd + ext) : path6.resolve(cwd, cmd + ext);
+      if (existsSync5(candidate)) return /^\.(?:cmd|bat)$/i.test(ext);
+    }
+  }
+  return false;
+}
+function shellArgvFor(command, cwd, platform = process.platform) {
+  if (platform !== "win32") {
+    return command.map((t) => isShellOperator(t) ? t : shellQuote(t, { platform }));
+  }
+  const out = [];
+  let expectCommand = true;
+  let redirectTarget = false;
+  let batch = false;
+  for (const t of command) {
+    if (isShellOperator(t)) {
+      out.push(t);
+      if (isControlOperator(t)) expectCommand = true;
+      redirectTarget = takesRedirectTarget(t);
+      continue;
+    }
+    if (redirectTarget) {
+      out.push(shellQuote(t, { platform }));
+      redirectTarget = false;
+    } else if (expectCommand) {
+      batch = isBatchCommand(t, cwd);
+      out.push(t.replace(CMD_META, "^$1"));
+      expectCommand = false;
+    } else {
+      out.push(shellQuote(t, { platform, doubleEscape: batch }));
+    }
+  }
+  return out;
 }
 
 // src/util/strict-int.ts
@@ -3881,7 +5005,10 @@ function resolveCfg(g, overrides = {}) {
     } catch (err) {
       throw new Error(`invalid config ${g.config}: ${err.message}`);
     }
-    return resolveConfig(parsed, overrides);
+    return resolveConfig(
+      anchorConfigPaths(parsed, path7.dirname(path7.resolve(g.config))),
+      overrides
+    );
   }
   const { config } = loadConfig(g.cwd);
   return resolveConfig(config, overrides);
@@ -3892,6 +5019,9 @@ function gitSha(cwd) {
 }
 function storeFor(g, cfg) {
   return new HistoryStore(path7.resolve(g.cwd, cfg.storeDir));
+}
+function printStoreWarnings(store) {
+  for (const w of store.warnings) console.warn(`flakefinder: ${w}`);
 }
 function flagInt(flag, value, min, max, unit = "") {
   const n = parseStrictInt(value, min, max);
@@ -3987,7 +5117,7 @@ async function main(argv) {
       return;
     }
     const configPath = path7.join(g.cwd, CONFIG_FILE_NAME);
-    if (existsSync5(configPath) && !opts.force) {
+    if (existsSync6(configPath) && !opts.force) {
       console.error(`flakefinder: ${configPath} already exists (use --force to overwrite)`);
       exitCode = 2;
       return;
@@ -4133,6 +5263,7 @@ async function main(argv) {
       used++;
     }
     store.prune(cfg.maxRuns);
+    printStoreWarnings(store);
     console.log(
       `ingested ${total} test result(s) from ${used}/${targets.length} file(s) (${warnings} warning(s)) \u2192 ${store.path}`
     );
@@ -4149,7 +5280,9 @@ async function main(argv) {
       threshold = n;
     }
     const cfg = resolveCfg(g);
-    const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
+    const store = storeFor(g, cfg);
+    const verdicts = classifyAll(store.runs(), cfg);
+    printStoreWarnings(store);
     if (opts.format === "json") {
       console.log(renderJson(verdicts, cfg));
       return;
@@ -4182,6 +5315,7 @@ async function main(argv) {
     const cfg = resolveCfg(g);
     const store = storeFor(g, cfg);
     const verdicts = classifyAll(store.runs(), cfg);
+    printStoreWarnings(store);
     const runs = store.runs().slice(-50).map((r) => ({
       runId: r.runId,
       timestamp: r.timestamp,
@@ -4335,10 +5469,11 @@ async function main(argv) {
     }
     store.prune(cfg.maxRuns);
     const verdicts = classifyAll(store.runs(), cfg);
+    printStoreWarnings(store);
     console.log(renderTerminal(verdicts, { color: false, flakesOnly: false }));
     for (const v of verdicts.filter((x) => x.classification.startsWith("flaky-"))) {
       console.log(
-        `::warning title=flakefinder::${ghEscape(`${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`)}`
+        `::warning title=flakefinder::${ghEscape(escapeControlChars(`${redact(v.suite)} :: ${redact(v.name)} (${v.classification}, score ${v.flakeScore})`))}`
       );
     }
     const reportPath = path7.resolve(g.cwd, "flakefinder-report.json");
@@ -4346,7 +5481,7 @@ async function main(argv) {
     console.log(`json report \u2192 ${reportPath}`);
     const snap = snapshotPath(path7.resolve(g.cwd, cfg.storeDir));
     let previous = null;
-    if (existsSync5(snap)) {
+    if (existsSync6(snap)) {
       try {
         previous = JSON.parse(readFileSync5(snap, "utf8"));
       } catch {
@@ -4354,6 +5489,7 @@ async function main(argv) {
       }
     }
     const newFlakes = computeNewFlakes(verdicts, previous);
+    mkdirSync2(path7.dirname(snap), { recursive: true });
     writeFileSync3(snap, JSON.stringify(verdicts), "utf8");
     const gl = gitlabEnvFromProcess();
     if (gl) {
@@ -4373,7 +5509,9 @@ async function main(argv) {
     if (opts.failOnNewFlakes && newFlakes.length > 0) {
       console.error(`flakefinder ci: ${newFlakes.length} NEW flake(s):`);
       for (const v of newFlakes)
-        console.error(`  ${v.suite} :: ${v.name} (score ${v.flakeScore})`);
+        console.error(
+          `  ${escapeControlChars(redact(v.suite))} :: ${escapeControlChars(redact(v.name))} (score ${v.flakeScore})`
+        );
       exitCode = 1;
     }
   });

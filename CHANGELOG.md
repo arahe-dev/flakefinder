@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+QA round 5: about 80 fixes across the runner, quarantine, engine, store,
+config, parsers, reports, GitHub Action and release tooling. The per-fix
+detail is in the commit history (`fix(runner|quarantine|engine|store|config|parsers|report|action|gitlab|release)`).
+
+**Behavior changes to know about**
+
+- Retries re-run only the **previous** attempt's failures. Oversized name
+  selectors (more than 32 KiB) fall back to a full re-run.
+- The exit gates check each test's last *real* execution. Quarantined tests
+  and tests that were only skipped never trip `--fail-on-flake`.
+- Timeouts and Ctrl-C kill the whole process tree (POSIX process group).
+- pytest quarantine uses real node ids (`path/test_x.py::Class::test`).
+  jest/mocha exclusion matches whole titles, not substrings.
+- `storeDir` / `quarantineFile` in a config file resolve relative to that
+  file's directory.
+- History-store lock errors fail fast (exit 2). The store header survives
+  pruning, and a newer-format store is never downgraded.
+- The Action's cache key now includes a stream id (job + working-directory
+  + the new `history-key` input). Expect one warm-start restore after
+  upgrading.
+- PR/MR comments are capped at 50 table rows and 60k chars. Terminal output
+  escapes control characters and is redacted.
+- Parsers add Surefire reruns, go `-count`/benchmarks/build events,
+  mochawesome, TAP block scalars and headerless TAP12, TRX outcome/class
+  join/data rows, and jest/vitest/mocha retry-then-pass notes.
+  Retry-then-pass inside a single report is reported as a `pass` with a
+  `flaky: failed k of n attempts` message plus a warning. It is not yet
+  scored as flaky.
+
 ## 1.1.1
 
 Bug-fix release from QA round 4. No new features; one stricter-input change
