@@ -1550,7 +1550,7 @@ var tapParser = {
         const ownDeclaration = ancestors.length > 0 && ancestors[ancestors.length - 1].name === name;
         const isAggregate = ownDeclaration && (yaml.isSuite || ancestors[ancestors.length - 1].children > 0);
         if (isAggregate) {
-          const popped = ancestors.pop();
+          ancestors.pop();
           if (ancestors.length > 0) ancestors[ancestors.length - 1].children++;
           continue;
         }

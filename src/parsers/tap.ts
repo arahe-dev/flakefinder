@@ -91,7 +91,7 @@ export const tapParser: ReportParser = {
         const isAggregate =
           ownDeclaration && (yaml.isSuite || ancestors[ancestors.length - 1]!.children > 0);
         if (isAggregate) {
-          const popped = ancestors.pop()!;
+          ancestors.pop();
           // the popped suite is itself a child of the next level up
           if (ancestors.length > 0) ancestors[ancestors.length - 1]!.children++;
           continue;
