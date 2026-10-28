@@ -1098,3 +1098,71 @@ process.exit(n === 1 ? 1 : 0);
     expect(Math.max(...lines.map((l) => l.length))).toBeLessThan(1000);
   }, 60_000);
 });
+
+describe('pytest retries (QA RUN-7)', () => {
+  // fake pytest: test_flaky fails on the first call, passes after; records argv per call
+  const FAKE_PYTEST = `
+const fs = require('fs');
+let n = 0;
+try { n = parseInt(fs.readFileSync('c11.txt', 'utf8'), 10) || 0; } catch {}
+n++;
+fs.writeFileSync('c11.txt', String(n));
+fs.writeFileSync('argv' + n + '.json', JSON.stringify(process.argv.slice(2)));
+const fail = n === 1 ? '<failure message="boom"/>' : '';
+fs.writeFileSync('junit.xml', '<?xml version="1.0"?><testsuites><testsuite name="pytest">' +
+  '<testcase classname="tests.test_x" name="test_flaky">' + fail + '</testcase>' +
+  '<testcase classname="tests.test_x" name="test_ok"/></testsuite></testsuites>');
+process.exit(n === 1 ? 1 : 0);
+`;
+  const quarantine = (cwd: string) =>
+    writeFileSync(
+      path.join(cwd, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: 'q',
+            suite: 'tests.test_x',
+            name: 'test_quarantined',
+            reason: 'flaky',
+            quarantinedAt: new Date().toISOString(),
+            flakeScore: 90,
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+  it('targeted --lf retries keep the --deselect quarantine flags', async () => {
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'fake-pytest.js'), FAKE_PYTEST, 'utf8');
+    quarantine(cwd);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runLive(['node', 'fake-pytest.js'], cfg({ reports: ['junit.xml'], runner: 'pytest' }), {
+      retries: 1,
+      cwd,
+      applyQuarantine: true,
+    });
+    const argv2 = JSON.parse(readFileSync(path.join(cwd, 'argv2.json'), 'utf8')) as string[];
+    expect(argv2).toEqual(['--deselect', 'tests/test_x.py::test_quarantined', '--lf']);
+  }, 60_000);
+
+  it('-p no:cacheprovider → full re-run instead of an unusable --lf', async () => {
+    const { pytestCacheDisabled } = await import('./wrap.js');
+    expect(pytestCacheDisabled(['pytest', '-p', 'no:cacheprovider'])).toBe(true);
+    expect(pytestCacheDisabled(['pytest', '-pno:cacheprovider'])).toBe(true);
+    expect(pytestCacheDisabled(['pytest', '-p', 'xdist'])).toBe(false);
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'fake-pytest.js'), FAKE_PYTEST, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runLive(
+      ['node', 'fake-pytest.js', '-p', 'no:cacheprovider'],
+      cfg({ reports: ['junit.xml'], runner: 'pytest' }),
+      { retries: 1, cwd, applyQuarantine: false },
+    );
+    const argv2 = JSON.parse(readFileSync(path.join(cwd, 'argv2.json'), 'utf8')) as string[];
+    expect(argv2).toEqual(['-p', 'no:cacheprovider']);
+  }, 60_000);
+});

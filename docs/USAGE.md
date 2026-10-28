@@ -155,7 +155,9 @@ explicitly *passes* on a re-run, so an empty or partial re-run can never fake
 a rescue. Two implementation notes: targeted selectors match failed test
 names as space-delimited final segments of the full name (a failure named
 `update` does not drag in `math re-update`), and quarantined tests are
-excluded from re-runs even on name collisions. pytest's `--lf` trusts pytest's
+excluded from re-runs even on name collisions (pytest `--lf` retries keep the
+`--deselect` flags; with `-p no:cacheprovider` on the command line `--lf` is
+unavailable, so pytest retries are full re-runs). pytest's `--lf` trusts pytest's
 own last-failed cache — a stale cache from a *manual* pytest run outside
 flakefinder could re-run a quarantined test once; clear it with
 `pytest --cache-clear` if that ever bites. If your command already passes

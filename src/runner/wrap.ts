@@ -348,7 +348,15 @@ export async function runLive(
         // passed on 2 is already rescued — re-running it on 3 wastes time
         const previous = attempts.filter((r) => r.attempt === attempt - 1);
         const failed = failedNamesOf(previous).filter((n) => !quarantinedNames.includes(n));
-        const targeted = failedOnlyArgs(runner, failed, quarantinedNames);
+        let targeted = failedOnlyArgs(runner, failed, quarantinedNames);
+        if (runner === 'pytest' && targeted) {
+          // --lf needs pytest's cache plugin; without it pytest rejects the
+          // flag (usage error) on every retry
+          if (pytestCacheDisabled(command)) targeted = null;
+          // --lf alone would drop attempt 1's --deselect flags, and pytest's
+          // "no previously failed tests" fallback runs EVERYTHING
+          else targeted = [...quarantineFlags, ...targeted];
+        }
         const targetedChars = targeted ? targeted.reduce((n, a) => n + a.length + 1, 0) : 0;
         if (targeted && targetedChars > SELECTOR_BUDGET_CHARS) {
           // thousands of failures make a selector the OS refuses to exec
@@ -360,6 +368,8 @@ export async function runLive(
           note = `targeted: re-running ${failed.length} failed test(s)`;
         } else if (failed.length === 0) {
           note = 'full re-run (no failures recorded)';
+        } else if (runner === 'pytest' && pytestCacheDisabled(command)) {
+          note = 'full re-run (-p no:cacheprovider disables pytest --lf)';
         } else {
           if (cfg.retryMode === 'failed') {
             console.warn(
@@ -615,6 +625,16 @@ function loadQuarantine(file: string): QuarantineEntry[] {
     );
     return [];
   }
+}
+
+/** `-p no:cacheprovider` (any spelling) disables pytest's cache, and with it --lf. */
+export function pytestCacheDisabled(command: string[]): boolean {
+  return command.some(
+    (t, i) =>
+      t === '-pno:cacheprovider' ||
+      t === '-p=no:cacheprovider' ||
+      (t === 'no:cacheprovider' && command[i - 1] === '-p'),
+  );
 }
 
 /**
