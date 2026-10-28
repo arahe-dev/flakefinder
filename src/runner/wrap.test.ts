@@ -717,3 +717,41 @@ describe('package-manager separator (R5 bug 3)', () => {
     ]);
   });
 });
+
+describe('targeted re-runs use the previous attempt only (R5 bug 4)', () => {
+  it('attempt 3 does not re-run a test that already recovered on attempt 2', async () => {
+    const cwd = tmpCwd();
+    const script = `
+const fs = require('fs');
+let n = 0;
+try { n = parseInt(fs.readFileSync('c7.txt', 'utf8'), 10) || 0; } catch {}
+n++;
+fs.writeFileSync('c7.txt', String(n));
+fs.writeFileSync('argv' + n + '.json', JSON.stringify(process.argv.slice(2)));
+const mk = (title, status) => ({ title, fullName: title, status, ancestorTitles: [], duration: 3, failureMessages: [] });
+const results = n === 1
+  ? [mk('recovers', 'failed'), mk('stuck', 'failed')]
+  : n === 2
+    ? [mk('recovers', 'passed'), mk('stuck', 'failed')]
+    : [mk('stuck', 'failed')];
+fs.writeFileSync('out.json', JSON.stringify({ testResults: [{ name: 's.test.js', status: 'failed', assertionResults: results }] }));
+process.exit(1);
+`;
+    writeFileSync(path.join(cwd, 'script.js'), script, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runLive(['node', 'script.js'], cfg({ runner: 'jest' }), {
+      retries: 2,
+      cwd,
+      applyQuarantine: false,
+    });
+    const argv2 = JSON.parse(readFileSync(path.join(cwd, 'argv2.json'), 'utf8')) as string[];
+    const argv3 = JSON.parse(readFileSync(path.join(cwd, 'argv3.json'), 'utf8')) as string[];
+    expect(argv2[0]).toBe('-t');
+    expect(argv2[1]).toContain('recovers');
+    expect(argv2[1]).toContain('stuck');
+    expect(argv3[0]).toBe('-t');
+    expect(argv3[1]).toContain('stuck');
+    expect(argv3[1]).not.toContain('recovers');
+  }, 60_000);
+});

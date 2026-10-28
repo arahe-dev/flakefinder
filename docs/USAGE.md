@@ -132,8 +132,9 @@ observed in this invocation.
   unlimited. SIGINT/SIGTERM (Ctrl-C) kill the current tree, stop the loop,
   and exit 130 while keeping everything observed so far in history.
 - `--retry-mode auto|failed|full` — retry strategy (default: config `retryMode`,
-  itself default `auto`). `auto`: attempt 1 runs everything; re-runs execute
-  **only the failed tests** — jest/vitest via `-t`, mocha via `--grep`, go via
+  itself default `auto`). `auto`: attempt 1 runs everything; each re-run
+  executes **only the tests that failed on the previous attempt** (a test that
+  already recovered is not re-run again) — jest/vitest via `-t`, mocha via `--grep`, go via
   `-run`, pytest via `--lf` — falling back to a full re-run when the runner has
   no adapter or attempt 1 recorded no failures. `full` restores re-running the
   entire command every attempt.

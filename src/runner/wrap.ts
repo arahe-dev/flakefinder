@@ -291,7 +291,10 @@ export async function runLive(
       let extraArgs = quarantineFlags;
       let note = '';
       if (attempt > 1 && cfg.retryMode !== 'full') {
-        const failed = failedNamesOf(attempts).filter((n) => !quarantinedNames.includes(n));
+        // the PREVIOUS attempt's failures only: a test that failed on 1 and
+        // passed on 2 is already rescued — re-running it on 3 wastes time
+        const previous = attempts.filter((r) => r.attempt === attempt - 1);
+        const failed = failedNamesOf(previous).filter((n) => !quarantinedNames.includes(n));
         const targeted = failedOnlyArgs(runner, failed, quarantinedNames);
         if (targeted) {
           extraArgs = targeted;
