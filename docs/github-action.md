@@ -41,12 +41,36 @@ files your test runner writes, e.g.:
 The action stores history in `.flakefinder/` and persists it with
 `actions/cache`:
 
-- **Key**: `flakefinder-history-<commit sha>` (immutable per commit).
-- **Restore keys**: `flakefinder-history-` prefix-matching gives you the most
-  recent cache on your branch; on a new branch you inherit the default
-  branch's history (warm start).
-- No external service, no upload of your test data — everything stays inside
+- **Save key**: `flakefinder-history-<sha>-<run id>-<run attempt>-<job>`.
+  Cache entries are immutable, so every run *attempt* saves under its own
+  key. A re-run never collides with the first attempt's entry, so its
+  history is not silently dropped.
+- **Restore**: by the `flakefinder-history-` prefix. You get the most recent
+  cache on your branch, and on a new branch or PR you inherit the base or
+  default branch's history (warm start).
+- No external service, no upload of your test data. Everything stays inside
   GitHub's cache for your repository.
+
+### What "new flake" is compared against
+
+`new-flaky-count`, the PR comment's Δ column and `fail-on-new-flakes` diff
+this run's verdicts against a **baseline**: the verdict snapshot of the
+*previous workflow run* (the last run on this branch, or the base branch).
+
+Re-runs keep the same baseline. When you click "Re-run failed jobs", the
+newest cache was saved by this run's own first attempt. Its snapshot already
+lists the flakes that failed the job, so diffing against it would report
+"0 new" and let the re-run pass the gate. To prevent that, each run records
+the baseline it used, with its `GITHUB_RUN_ID`, in
+`.flakefinder/action-baseline.json`. Later attempts (and other jobs) of the
+same run reuse that recorded baseline. So a re-run fails the gate again until
+the flake is fixed or quarantined. Later runs (new pushes) compare against
+the latest snapshot as usual, so a flake that was reported once counts as
+*known* from then on.
+
+Matrix legs of the same job share a save key, so only the first leg's
+history is saved (the others log a warning). Give each leg its own
+`working-directory`/`storeDir` and job if you need separate histories.
 
 ## Inputs
 
@@ -72,6 +96,13 @@ The action stores history in `.flakefinder/` and persists it with
 ## PR comment behavior
 
 - One comment per PR, updated in place (marker `<!-- flakefinder:report -->`).
+  Only a comment authored by the token's identity (or by a bot account when
+  the default `GITHUB_TOKEN` is used) is ever updated. A marker pasted into
+  someone else's comment is ignored. Failed API writes are logged as
+  warnings.
+- Test names and suites are escaped before they are rendered: @mentions,
+  links/images and HTML can't be injected. Failure messages sit in a code
+  fence longer than any backtick run they contain.
 - Summary line: `N flaky (X new · Y known) · M failing · T tracked`.
 - Table with per-test score, confidence and Δ vs the previous run.
 - `<details>` blocks for up to 5 NEW flakes with the failure message and the
