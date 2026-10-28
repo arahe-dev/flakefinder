@@ -291,8 +291,10 @@ export async function runLive(
   const runner = cfg.runner === 'auto' ? detectRunner(cwd) : cfg.runner;
   let quarantineFlags: string[] = [];
   let quarantinedNames: string[] = [];
+  let quarantinedIds = new Set<string>();
   if (opts.applyQuarantine) {
     const entries = loadQuarantine(path.resolve(cwd, cfg.quarantineFile));
+    quarantinedIds = new Set(entries.map((e) => e.testId));
     if (runner === 'pytest' || runner === 'jest' || runner === 'mocha') {
       if (entries.length > 0) {
         quarantineFlags = exclusionArgs(runner, entries, cwd);
@@ -469,8 +471,15 @@ export async function runLive(
   // proved it flaky. The final attempt ingesting nothing (stale or deleted
   // report) or only skips must NOT erase the failure evidence: exit 0 is
   // reserved for "clean run or all failures were flakes".
-  const deterministicFail = verdicts.some((v) => {
-    const last = lastRealStatus.get(v.testId) ?? v.lastStatus;
+  // The exit gates only judge tests that actually EXECUTED in this invocation
+  // and are not quarantined: a quarantined test the runner reports as skipped
+  // (jest-junit lists excluded tests) must not fail --fail-on-flake on its
+  // historical flakiness — keeping it out of the gate is what quarantine is for.
+  const gated = verdicts.filter(
+    (v) => lastRealStatus.has(v.testId) && !quarantinedIds.has(v.testId),
+  );
+  const deterministicFail = gated.some((v) => {
+    const last = lastRealStatus.get(v.testId);
     return (
       (v.classification === 'failing' || v.classification === 'new-failure') &&
       (last === 'fail' || last === 'error')
@@ -480,7 +489,7 @@ export async function runLive(
   if (interrupted) finalExitCode = 130; // SIGINT/SIGTERM: convention for user interrupts
   if (
     cfg.failOnFlakes &&
-    (verdicts.some((v) => v.classification.startsWith('flaky-')) || suiteFlake)
+    (gated.some((v) => v.classification.startsWith('flaky-')) || suiteFlake)
   ) {
     finalExitCode = 1;
   }

@@ -124,7 +124,9 @@ observed in this invocation.
   (`run -R/--retries must be an integer 0–10 (got 50)`), not the config.
 - `--fail-on-flake` — exit non-zero when *flakes* (not just real failures) are
   detected. Default behavior: flakes alone exit 0, so known flakes don't fail
-  your CI gate.
+  your CI gate. Only tests that actually executed in this invocation count:
+  quarantined tests (even if the runner lists them as skipped) and tests
+  that only skipped never trip it.
 - `--no-quarantine` — run the full suite, ignoring the quarantine list.
 - `--timeout <seconds>` — kill the attempt (whole process tree) after N
   seconds (an integer 1–2147483); the attempt counts as failed (exit 124, GNU-timeout convention)

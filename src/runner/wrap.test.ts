@@ -923,3 +923,60 @@ process.exit(n === 1 ? 1 : 0);
     expect(result.finalExitCode).toBe(1);
   }, 60_000);
 });
+
+describe('quarantined / skip-only tests stay out of the exit gates (QA RUN-5)', () => {
+  it('a quarantined flake reported as skipped does not trip --fail-on-flake', async () => {
+    const cwd = tmpCwd();
+    const script = `
+const fs = require('fs');
+let n = 0;
+try { n = parseInt(fs.readFileSync('c9.txt', 'utf8'), 10) || 0; } catch {}
+n++;
+fs.writeFileSync('c9.txt', String(n));
+const mk = (title, status) => ({ title, fullName: title, status, ancestorTitles: [], duration: 3, failureMessages: [] });
+// run 1: alpha fails then passes (retry rescue). Later: alpha is excluded → skipped.
+const alpha = n === 1 ? 'failed' : n === 2 ? 'passed' : 'pending';
+const results = [mk('alpha', alpha), mk('gamma', 'passed')];
+const failed = alpha === 'failed';
+fs.writeFileSync('out.json', JSON.stringify({ testResults: [{ name: 's.test.js', status: failed ? 'failed' : 'passed', assertionResults: results }] }));
+process.exit(failed ? 1 : 0);
+`;
+    writeFileSync(path.join(cwd, 'script.js'), script, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const first = await runLive(['node', 'script.js'], cfg({ runner: 'jest' }), {
+      retries: 1,
+      cwd,
+      applyQuarantine: false,
+    });
+    const alpha = first.verdicts.find((v) => v.name === 'alpha')!;
+    expect(alpha.classification).toBe('flaky-retry');
+    writeFileSync(
+      path.join(cwd, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: alpha.testId,
+            suite: alpha.suite,
+            name: 'alpha',
+            reason: 'flaky',
+            quarantinedAt: new Date().toISOString(),
+            flakeScore: 40,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    const second = await runLive(
+      ['node', 'script.js'],
+      cfg({ runner: 'jest', failOnFlakes: true }),
+      {
+        retries: 1,
+        cwd,
+        applyQuarantine: true,
+      },
+    );
+    expect(second.finalExitCode).toBe(0);
+  }, 60_000);
+});
