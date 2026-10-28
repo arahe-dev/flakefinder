@@ -110,7 +110,8 @@ describe('goTestParser', () => {
     expect(results[0]?.message).toBe('something logged');
   });
 
-  it('lets the last terminal action win for a repeated test', () => {
+  it('a repeated test that failed once is NOT reported as a plain pass (r5 #2)', () => {
+    // previously "last terminal action wins" turned fail→pass into a clean pass
     const content = [
       '{"Action":"run","Package":"p","Test":"T"}',
       '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.01}',
@@ -118,7 +119,8 @@ describe('goTestParser', () => {
     ].join('\n');
     const { results } = goTestParser.parse(content, 'inline');
     expect(results).toHaveLength(1);
-    expect(results[0]).toMatchObject({ status: 'pass', durationMs: 20 });
+    expect(results[0]).toMatchObject({ status: 'fail', durationMs: 10 });
+    expect(results[0]!.message).toBe('flaky: failed 1 of 2 runs in this report');
   });
 
   it('reports at most 5 malformed lines then a summary', () => {
@@ -210,5 +212,44 @@ describe('go parser robustness (review round)', () => {
     const { results } = goTestParser.parse(content, 'mixed.jsonl');
     expect(results).toHaveLength(1); // dangling TestA only, no (package) row
     expect(results[0]!.name).toBe('TestA');
+  });
+});
+
+// go-count2.jsonl: REAL `go test -json -count=2 ./flaky` output (go 1.23.4).
+// TestFlaky fails on the first run and passes on the second; TestTable has a
+// failing subtest; TestParentOwnFailure fails itself after a passing child.
+describe('go test -count=N (r5 #2)', () => {
+  it('does not erase a failure that a later repeated run passed', () => {
+    const { results, warnings } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const flaky = results.find((r) => r.name === 'TestFlaky')!;
+    expect(flaky.status).toBe('fail');
+    expect(flaky.message).toMatch(/^flaky: failed 1 of 2 runs/);
+    expect(flaky.message).toContain('first attempt fails: got 1, want 2');
+    // the passing run's output is not glued onto the failing run's
+    expect(flaky.message).not.toContain('marker present');
+    expect(warnings.some((w) => w.includes('1 test(s)') && w.includes('TestFlaky'))).toBe(true);
+  });
+
+  it('keeps per-run output: a stable test reports one run, not both concatenated', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const stable = results.find((r) => r.name === 'TestStable')!;
+    expect(stable.status).toBe('pass');
+    expect(stable.message?.match(/=== RUN/g)).toHaveLength(1);
+    expect(stable.message?.match(/always fine/g)).toHaveLength(1);
+  });
+
+  it('failing on every repeated run is a plain failure (no flaky note, no warning)', () => {
+    const content = [
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"boom 1\\n"}',
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.01}',
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"boom 2\\n"}',
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.02}',
+    ].join('\n');
+    const { results, warnings } = goTestParser.parse(content, 'inline');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ status: 'fail', message: 'boom 1' });
+    expect(warnings).toEqual([]);
   });
 });

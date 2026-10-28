@@ -5,13 +5,20 @@
  * Test?, Elapsed?, Time, Output? }`. (Field casing varies across Go versions: `Elapsed`/
  * `elapsed` and `Output`/`output` are both accepted.)
  *
- * Per (Package, Test) the final terminal action (pass/fail/skip — last one wins) decides the
- * status. durationMs = round(elapsed * 1000) taken from that terminal event when present,
+ * Repeated runs (`-count=N`, or several streams concatenated): a 'run' event (or a second
+ * terminal action) for a test that already finished starts a new run, and each run keeps its
+ * own status, elapsed and output. One result per (Package, Test) is emitted, aggregated over
+ * its runs, because the engine collapses same-testId rows within a report (last one wins):
+ * - any run failed → 'fail', from the FIRST failing run (its output and duration). When other
+ *   runs passed, the message starts with "flaky: failed k of n runs in this report" and one
+ *   warning per file lists those tests. A failure is never erased by a later pass.
+ * - otherwise the LAST run decides ('pass', or 'skip').
+ * durationMs = round(elapsed * 1000) from the reported run's terminal event when present,
  * else null (older Go versions only put elapsed on package-level events).
  *
- * Messages are built from the test's 'output' events: ANSI SGR codes are stripped, blank
- * lines dropped, and the LAST 500 characters of the joined text are kept (failure details
- * come at the end, after t.Log noise).
+ * Messages are built from the reported run's 'output' events: ANSI SGR codes are stripped,
+ * blank lines dropped, and the LAST 2000 characters of the joined text are kept (failure
+ * details come at the end, after t.Log noise).
  *
  * Package-level events (no Test) are ignored. Lines that fail JSON.parse produce warnings —
  * at most 5 individually, then a single '…and N more' summary.
@@ -25,12 +32,25 @@ import { errorMessage, firstNonEmptyLine, isObj, stripAnsi, stripBom } from './i
 const MAX_MALFORMED_DETAILS = 5;
 const MESSAGE_MAX_CHARS = 2000;
 
-interface TestAccumulator {
-  pkg: string;
-  test: string;
+/** How many flaky test names one -count warning lists before summarising. */
+const MAX_FLAKY_NAMES = 10;
+
+/** One execution of a test (a `-count=N` stream holds N of these per test). */
+interface RunState {
   status?: TestStatus;
   durationMs: number | null;
   outputs: string[];
+}
+
+interface TestAccumulator {
+  pkg: string;
+  test: string;
+  /** Chronological runs; the last one is the run currently receiving events. */
+  runs: RunState[];
+}
+
+function newRun(): RunState {
+  return { durationMs: null, outputs: [] };
 }
 
 /** Elapsed seconds → ms; accepts both `Elapsed` and `elapsed` spellings. */
@@ -123,15 +143,22 @@ export const goTestParser: ReportParser = {
         if (action !== 'run' && action !== 'pass' && action !== 'fail' && action !== 'skip') {
           continue;
         }
-        acc = { pkg, test, durationMs: null, outputs: [] };
+        acc = { pkg, test, runs: [newRun()] };
         tests.set(key, acc);
+      } else if (
+        (action === 'run' || action === 'pass' || action === 'fail' || action === 'skip') &&
+        acc.runs[acc.runs.length - 1]!.status !== undefined
+      ) {
+        // the current run already finished: this is a repeated run (-count=N)
+        acc.runs.push(newRun());
       }
+      const run = acc.runs[acc.runs.length - 1]!;
 
       if (action === 'pass' || action === 'fail' || action === 'skip') {
-        acc.status = action;
-        acc.durationMs = elapsedToMs(ev);
+        run.status = action;
+        run.durationMs = elapsedToMs(ev);
       } else if (action === 'output') {
-        if (typeof out === 'string') acc.outputs.push(out);
+        if (typeof out === 'string') run.outputs.push(out);
       }
       // 'pause' | 'cont' | 'bench' | … — no state change.
     }
@@ -141,8 +168,10 @@ export const goTestParser: ReportParser = {
     }
 
     let dangling = 0;
+    const flaky: string[] = [];
     for (const acc of tests.values()) {
-      if (acc.status === undefined) {
+      const last = acc.runs[acc.runs.length - 1]!;
+      if (last.status === undefined) {
         // Test started (run event) but never reported pass/fail/skip — the test
         // binary crashed mid-run (panic, OOM, killed). Synthesize an error so
         // the crash is visible in verdicts instead of silently vanishing.
@@ -157,21 +186,36 @@ export const goTestParser: ReportParser = {
         };
         // Real crash output (panic trace etc.) is the evidence — keep it below
         // the synthetic explanation.
-        const output = messageFromOutputs(acc.outputs);
+        const output = messageFromOutputs(last.outputs);
         if (output !== undefined) result.message = `${result.message}\n${output}`;
         results.push(result);
         continue;
       }
+      const failed = acc.runs.filter((r) => r.status === 'fail');
+      const reported = failed[0] ?? last;
       const result: TestCaseResult = {
         testId: makeTestId(acc.pkg, acc.test),
         suite: acc.pkg,
         name: acc.test,
-        status: acc.status,
-        durationMs: acc.durationMs,
+        status: reported.status!,
+        durationMs: reported.durationMs,
       };
-      const message = messageFromOutputs(acc.outputs);
+      let message = messageFromOutputs(reported.outputs);
+      if (failed.length > 0 && failed.length < acc.runs.length) {
+        const note = `flaky: failed ${failed.length} of ${acc.runs.length} runs in this report`;
+        message = message !== undefined ? `${note}\n${message}` : note;
+        flaky.push(`${acc.pkg} ${acc.test}`);
+      }
       if (message !== undefined) result.message = message;
       results.push(result);
+    }
+    if (flaky.length > 0) {
+      const shown = flaky.slice(0, MAX_FLAKY_NAMES).join(', ');
+      const more =
+        flaky.length > MAX_FLAKY_NAMES ? ` …and ${flaky.length - MAX_FLAKY_NAMES} more` : '';
+      warnings.push(
+        `go: ${sourcePath}: ${flaky.length} test(s) failed in some but not all repeated runs (-count) — reported as fail: ${shown}${more}`,
+      );
     }
     if (dangling > 0) {
       warnings.push(
