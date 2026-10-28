@@ -11,7 +11,9 @@ describe('tapParser', () => {
   it('sniffs TAP version headers, rejects other formats', () => {
     expect(tapParser.sniff('TAP version 13\n')).toBe(true);
     expect(tapParser.sniff('TAP version 14\r\n')).toBe(true);
-    expect(tapParser.sniff('ok 1 - no header')).toBe(false);
+    // headerless TAP12 is accepted since QA PAR-12 (see 'headerless TAP' below)
+    expect(tapParser.sniff('ok 1 - no header')).toBe(true);
+    expect(tapParser.sniff('ok - no number, no header')).toBe(false);
     expect(tapParser.sniff('<xml/>')).toBe(false);
     expect(tapParser.sniff('')).toBe(false);
   });
@@ -304,5 +306,31 @@ describe('TAP robustness (r5 #6)', () => {
     ]);
     expect(results[0]!.message).toBe(`it's broken: "x"`);
     expect(results[2]!.message).toBe('parent own failure');
+  });
+});
+
+// tap-perl-no-header.tap: REAL Perl Test::More output (QA fixture) — TAP12
+// style, no `TAP version` line (prove/bats/Test::More default).
+describe('headerless TAP (QA PAR-12)', () => {
+  it('detects and parses TAP that starts with a plan or a numbered assertion', () => {
+    const content = load('tap-perl-no-header.tap');
+    expect(tapParser.sniff(content)).toBe(true);
+    const { results } = tapParser.parse(content, 'a.t');
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'first passes:pass',
+      'second fails:fail',
+      '(test 3):skip',
+    ]);
+    expect(tapParser.sniff('ok 1 - only\nok 2 - two\n')).toBe(true);
+  });
+
+  it('stays strict: anything not TAP-shaped is rejected', () => {
+    // plain `go test` output, a log that happens to start with "ok", prose
+    expect(tapParser.sniff('ok  \texample.com/pkg\t0.002s\n')).toBe(false);
+    expect(tapParser.sniff('=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\n')).toBe(false);
+    expect(tapParser.sniff('ok 1 - fine\nStarting server on :8080\n')).toBe(false);
+    expect(tapParser.sniff('1..2 apples\n')).toBe(false);
+    expect(tapParser.sniff('okay then\n')).toBe(false);
+    expect(tapParser.sniff('{"Action":"pass"}\n')).toBe(false);
   });
 });

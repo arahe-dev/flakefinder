@@ -3,7 +3,9 @@
  * node 20 and node 22 output) and plain TAP13/TAP14.
  *
  * Grammar notes from real output:
- * - `TAP version 13` header. Assertions are `ok`/`not ok`, optionally followed
+ * - `TAP version 13` header. Headerless TAP12 (Perl Test::More, prove, bats) is also
+ *   detected when it opens with a plan (`1..N`) or a numbered assertion and its first
+ *   50 lines are all TAP-shaped (assertion/plan/comment/Bail out!/indented). Assertions are `ok`/`not ok`, optionally followed
  *   by a number, optionally by ` - `, then the description (TAP13/14 make
  *   both optional): `ok 1 - name`, `ok 1 name`, `ok - name`, `ok`. A missing
  *   description becomes `(test N)` (N = the given or implied number).
@@ -34,6 +36,14 @@ import { makeTestId } from '../util/test-id.js';
 import { errorMessage, stripBom, trimTo } from './internal.js';
 
 const ROOT_SUITE = 'node:test';
+/** Lines a headerless-TAP sniff checks for TAP shape. */
+const SNIFF_MAX_LINES = 50;
+/**
+ * A TAP-shaped line: assertion, plan, comment/diagnostic, Bail out!, pragma,
+ * version, or anything indented (subtests, YAML blocks).
+ */
+const TAP_LINE =
+  /^(?:(?:not )?ok(?:\s|$)|1\.\.\d+(?:\s+#.*)?\s*$|#|Bail out!|pragma [+-]|TAP version \d+|\s)/;
 const MESSAGE_MAX_CHARS = 2000;
 
 interface YamlBlock {
@@ -68,11 +78,23 @@ export const tapParser: ReportParser = {
   name: 'tap',
 
   sniff(content: string): boolean {
-    const first = stripBom(content)
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .find((l) => l !== '');
-    return first !== undefined && /^TAP version \d+\s*$/i.test(first);
+    const lines = stripBom(content).split(/\r?\n/);
+    const first = lines.map((l) => l.trim()).find((l) => l !== '');
+    if (first === undefined) return false;
+    if (/^TAP version \d+\s*$/i.test(first)) return true;
+    // Headerless TAP12 (Perl Test::More, prove, bats): must OPEN with a plan or a
+    // NUMBERED assertion, and every line in the first SNIFF_MAX_LINES must be
+    // TAP-shaped — so plain logs that happen to start with "ok" are not TAP.
+    if (!/^1\.\.\d+(?:\s+#.*)?$/.test(first) && !/^(?:not )?ok \d+(?:\s|$)/.test(first)) {
+      return false;
+    }
+    let seen = 0;
+    for (const line of lines) {
+      if (line.trim() === '') continue;
+      if (++seen > SNIFF_MAX_LINES) break;
+      if (!TAP_LINE.test(line)) return false;
+    }
+    return true;
   },
 
   parse(content: string, sourcePath: string): { results: TestCaseResult[]; warnings: string[] } {

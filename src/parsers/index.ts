@@ -8,7 +8,8 @@
  * 3. mocha — whole document parses as JSON with (results/tests + stats) or (passes + failures)
  * 4. go    — one of the first 50 non-empty lines is a JSON event with Action plus Package or
  *            ImportPath (leading stderr text / go 1.24 build events are tolerated)
- * 5. tap   — first non-empty line is `TAP version N`
+ * 5. tap   — first non-empty line is `TAP version N`, or headerless TAP12 that opens with a
+ *            plan / numbered assertion and whose first 50 lines are all TAP-shaped
  * 6. trx   — trimmed content starts with '<' and contains a `<TestRun` element
  * 7. otherwise null. Never throws.
  */
