@@ -17,6 +17,10 @@
  * failure of its own, named after the hook without the variable ` for "<first test>"`
  * suffix (e.g. `"before all" hook`, suite = its describe chain), plus one warning.
  *
+ * mochawesome JSON (`results[]` = suite trees with `tests`/`suites`/`beforeHooks`/`afterHooks`)
+ * is recognised and flattened into the same entries — status from `state`, never-run tests
+ * (`skipped`) → skip, failed hooks → failures — so both reporters give the same identities.
+ *
  * suite = fullTitle with the title stripped (the describe chain), else `file`, else 'unknown'.
  * err.message trimmed to 2000 chars; err.stack trimmed to 1000 chars.
  *
@@ -55,6 +59,63 @@ function consume(b: Map<string, Record<string, unknown>[]>, key: string): boolea
   if (queue === undefined || queue.length === 0) return false;
   queue.shift();
   return true;
+}
+
+/** mochawesome wraps mocha's suite tree: `results: [{ uuid, tests: [], suites: [] … }]`. */
+function isMochawesome(doc: Record<string, unknown>): boolean {
+  if (!Array.isArray(doc.results) || doc.results.length === 0) return false;
+  const first = doc.results[0];
+  return isObj(first) && Array.isArray(first.tests) && Array.isArray(first.suites);
+}
+
+const AWESOME_STATE: Record<string, TestStatus> = {
+  passed: 'pass',
+  failed: 'fail',
+  pending: 'skip',
+};
+
+/**
+ * Flatten a mochawesome suite tree into mocha-JSON-like entries with their status.
+ * Tests carry no `file`: use the enclosing suite's `fullFile`, or — for root-level
+ * tests — the report's only spec file when there is exactly one. A test with no
+ * state (`skipped: true`) never ran because a hook failed → skip. Failed
+ * before/after hooks are emitted as failing entries.
+ */
+function mochawesomeEntries(roots: unknown[]): Array<[Record<string, unknown>, TestStatus]> {
+  const files = new Set<string>();
+  const collectFiles = (suite: unknown): void => {
+    if (!isObj(suite)) return;
+    if (typeof suite.fullFile === 'string' && suite.fullFile !== '') files.add(suite.fullFile);
+    for (const child of Array.isArray(suite.suites) ? suite.suites : []) collectFiles(child);
+  };
+  for (const root of roots) collectFiles(root);
+  const onlyFile = files.size === 1 ? [...files][0] : undefined;
+
+  const out: Array<[Record<string, unknown>, TestStatus]> = [];
+  const walk = (suite: unknown): void => {
+    if (!isObj(suite)) return;
+    const file =
+      typeof suite.fullFile === 'string' && suite.fullFile !== '' ? suite.fullFile : onlyFile;
+    const toEntry = (t: Record<string, unknown>): Record<string, unknown> => {
+      const err = isObj(t.err) ? { message: t.err.message, stack: t.err.estack } : t.err;
+      return { ...t, file, err };
+    };
+    const hooks = [
+      ...(Array.isArray(suite.beforeHooks) ? suite.beforeHooks : []),
+      ...(Array.isArray(suite.afterHooks) ? suite.afterHooks : []),
+    ];
+    for (const t of Array.isArray(suite.tests) ? suite.tests : []) {
+      if (!isObj(t)) continue;
+      const state = typeof t.state === 'string' ? AWESOME_STATE[t.state] : undefined;
+      out.push([toEntry(t), state ?? 'skip']);
+    }
+    for (const h of hooks) {
+      if (isObj(h) && h.state === 'failed') out.push([toEntry(h), 'fail']);
+    }
+    for (const child of Array.isArray(suite.suites) ? suite.suites : []) walk(child);
+  };
+  for (const root of roots) walk(root);
+  return out;
 }
 
 const HOOK_TITLE = /^"(?:before|after) (?:all|each)" hook\b/;
@@ -132,7 +193,11 @@ export const mochaParser: ReportParser = {
       entries.push(entry);
       statuses.push(status);
     };
-    if (testList === null) {
+    if (isMochawesome(doc)) {
+      // mochawesome: results[] are suite TREES, not tests (QA PAR-1)
+      for (const [entry, status] of mochawesomeEntries(doc.results as unknown[]))
+        add(entry, status);
+    } else if (testList === null) {
       // passes/failures-only shape (sniff accepts it): each bucket entry IS a
       // test, and its bucket is its status
       for (const entry of passes) add(entry, 'pass');

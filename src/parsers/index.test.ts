@@ -36,6 +36,7 @@ describe('detectParser', () => {
     ['trx-mstest2-datarows.trx', 'trx'],
     ['junit-surefire-reruns.xml', 'junit'],
     ['mocha-same-title-hook.json', 'mocha'],
+    ['mochawesome.json', 'mocha'],
   ];
 
   for (const [fixture, expected] of cases) {

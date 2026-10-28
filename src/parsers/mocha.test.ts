@@ -206,3 +206,34 @@ describe('mocha status matching + hook failures (r5 #9)', () => {
     expect(results.map((r) => r.status).sort()).toEqual(['fail', 'pass']);
   });
 });
+
+// mochawesome.json: REAL mochawesome output (QA fixture fx/mawe, paths → /repo)
+// for the same spec as the QA mocha.json: 6 failures (4 tests + 2 hooks).
+describe('mochawesome (QA PAR-1)', () => {
+  it('parses the nested suite tree instead of one phantom passing test', () => {
+    const { results, warnings } = mochaParser.parse(load('mochawesome.json'), 'mawe.json');
+    expect(results.some((r) => r.name === '(unnamed)')).toBe(false);
+    const fails = results.filter((r) => r.status === 'fail');
+    expect(fails.map((r) => `${r.suite} :: ${r.name}`)).toEqual([
+      'Outer :: slow',
+      'Outer Inner :: fails',
+      'Hooky :: "before all" hook',
+      'Each :: "after each" hook',
+      'Other :: same title',
+      'Outer :: same title', // the SECOND `describe('Outer')` — the first one's passed
+    ]);
+    expect(fails[1]!.message).toContain('strictly deep-equal');
+    expect(fails[1]!.stack).toContain('AssertionError');
+    // tests a failing hook prevented from running are skips, not passes
+    expect(results.find((r) => r.name === 'never runs')!.status).toBe('skip');
+    expect(results.find((r) => r.name === 'x2')!.status).toBe('skip');
+    expect(results.filter((r) => r.status === 'pass')).toHaveLength(5);
+    // root-level test: suite falls back to the spec file, like mocha's own JSON
+    expect(results.find((r) => r.name === 'root level')!.suite).toBe('/repo/js/mt/a.spec.js');
+    expect(warnings.some((w) => w.includes('hook failure'))).toBe(true);
+  });
+
+  it('still sniffs as mocha (same parser, same identities as mocha --reporter json)', () => {
+    expect(mochaParser.sniff(load('mochawesome.json'))).toBe(true);
+  });
+});
