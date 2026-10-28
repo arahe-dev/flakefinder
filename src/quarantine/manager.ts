@@ -24,7 +24,13 @@ type QuarantineOp = { kind: 'add'; entry: QuarantineEntry } | { kind: 'remove'; 
 
 function applyOp(entries: QuarantineEntry[], op: QuarantineOp): QuarantineEntry[] {
   if (op.kind === 'remove') return entries.filter((e) => e.testId !== op.testId);
-  return [...entries.filter((e) => e.testId !== op.entry.testId), op.entry];
+  // re-adding refreshes reason/score but keeps the ORIGINAL quarantine date:
+  // the 90-day age-out and "since quarantine" logic must not be reset
+  const prior = entries.find((e) => e.testId === op.entry.testId);
+  const entry = prior?.quarantinedAt
+    ? { ...op.entry, quarantinedAt: prior.quarantinedAt }
+    : op.entry;
+  return [...entries.filter((e) => e.testId !== op.entry.testId), entry];
 }
 
 /** How long save() waits for another process's lock before giving up. */
@@ -135,7 +141,7 @@ export class QuarantineManager {
     return [...this.file.entries];
   }
 
-  /** Add or replace an entry (same testId). */
+  /** Add or replace an entry (same testId); a re-add keeps the original quarantinedAt. */
   add(entry: QuarantineEntry): void {
     this.apply({ kind: 'add', entry });
   }

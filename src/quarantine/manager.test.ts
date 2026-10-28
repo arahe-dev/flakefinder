@@ -83,6 +83,19 @@ describe('QuarantineManager', () => {
     expect(qm.list()[0]!.name).toBe('new-name');
   });
 
+  it('re-adding keeps the original quarantinedAt (QA CLI-23)', () => {
+    const file = tmpFile();
+    const qm = new QuarantineManager(file);
+    qm.add(entry('a', 'n', { quarantinedAt: '2026-01-01T00:00:00.000Z', reason: 'old' }));
+    qm.save();
+    const again = new QuarantineManager(file);
+    again.add(entry('a', 'n', { quarantinedAt: '2026-10-28T00:00:00.000Z', reason: 'new' }));
+    again.save();
+    const [e] = new QuarantineManager(file).list();
+    expect(e!.quarantinedAt).toBe('2026-01-01T00:00:00.000Z');
+    expect(e!.reason).toBe('new');
+  });
+
   it('remove reports whether the id existed', () => {
     const qm = new QuarantineManager(tmpFile());
     qm.add(entry('t1'));
