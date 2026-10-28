@@ -47,7 +47,16 @@ export function ingestReports(
       warnings.push(`unrecognized report format — skipped ${file}`);
       continue;
     }
-    const parsed = parser.parse(content, file);
+    let parsed: ReturnType<typeof parser.parse>;
+    try {
+      parsed = parser.parse(content, file);
+    } catch (err) {
+      // one malformed report must not abort the whole action
+      warnings.push(
+        `${parser.name}: failed to parse ${file} — skipped (${(err as Error).message})`,
+      );
+      continue;
+    }
     warnings.push(...parsed.warnings);
     const record: RunRecord = {
       runId,
