@@ -895,3 +895,31 @@ describe('user-supplied name selector (R5 optional)', () => {
     expect(warn.mock.calls.filter((c) => String(c[0]).includes('name selector'))).toHaveLength(1);
   }, 60_000);
 });
+
+describe('exit gate uses the last REAL execution (QA RUN-2)', () => {
+  it('a failure followed by a retry that only reports it as skipped still exits 1', async () => {
+    const cwd = tmpCwd();
+    const script = `
+const fs = require('fs');
+let n = 0;
+try { n = parseInt(fs.readFileSync('c8.txt', 'utf8'), 10) || 0; } catch {}
+n++;
+fs.writeFileSync('c8.txt', String(n));
+const mk = (title, status) => ({ title, fullName: title, status, ancestorTitles: [], duration: 3, failureMessages: [] });
+// attempt 2: the selector missed, so the runner skipped everything and exited 0
+const results = n === 1 ? [mk('broken', 'failed'), mk('ok', 'passed')] : [mk('broken', 'pending'), mk('ok', 'pending')];
+fs.writeFileSync('out.json', JSON.stringify({ testResults: [{ name: 's.test.js', status: n === 1 ? 'failed' : 'passed', assertionResults: results }] }));
+process.exit(n === 1 ? 1 : 0);
+`;
+    writeFileSync(path.join(cwd, 'script.js'), script, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await runLive(['node', 'script.js'], cfg({ runner: 'jest' }), {
+      retries: 1,
+      cwd,
+      applyQuarantine: false,
+    });
+    expect(result.attempts.map((a) => a.attempt)).toEqual([1, 2]);
+    expect(result.finalExitCode).toBe(1);
+  }, 60_000);
+});

@@ -7,7 +7,13 @@ import { classifyAll } from '../engine/classify.js';
 import { detectParser } from '../parsers/index.js';
 import { exclusionArgs, QuarantineManager } from '../quarantine/manager.js';
 import { HistoryStore } from '../store/history-store.js';
-import type { QuarantineEntry, ResolvedConfig, RunRecord, TestVerdict } from '../types.js';
+import type {
+  QuarantineEntry,
+  ResolvedConfig,
+  RunRecord,
+  TestStatus,
+  TestVerdict,
+} from '../types.js';
 import { matchGlobs } from '../util/glob.js';
 import { failedNamesOf, failedOnlyArgs } from './adapters.js';
 
@@ -452,15 +458,24 @@ export async function runLive(
   }
 
   const lastExit = exitCodes[exitCodes.length - 1] ?? 1;
-  // Deterministic failure = the test's LAST observed state (this invocation or
-  // history) is fail-family and nothing proved it flaky. The final attempt
-  // ingesting nothing (stale or deleted report) must NOT erase the failure
-  // evidence: exit 0 is reserved for "clean run or all failures were flakes".
-  const deterministicFail = verdicts.some(
-    (v) =>
+  // The last REAL (non-skip) outcome of each test in this invocation. A retry
+  // that did not actually re-run a test (selector missed, runner reports the
+  // rest as skipped) is not evidence that its failure went away.
+  const lastRealStatus = new Map<string, TestStatus>();
+  for (const record of [...attempts].sort((a, b) => a.attempt - b.attempt)) {
+    for (const t of record.results) if (t.status !== 'skip') lastRealStatus.set(t.testId, t.status);
+  }
+  // Deterministic failure = the test's last real execution failed and nothing
+  // proved it flaky. The final attempt ingesting nothing (stale or deleted
+  // report) or only skips must NOT erase the failure evidence: exit 0 is
+  // reserved for "clean run or all failures were flakes".
+  const deterministicFail = verdicts.some((v) => {
+    const last = lastRealStatus.get(v.testId) ?? v.lastStatus;
+    return (
       (v.classification === 'failing' || v.classification === 'new-failure') &&
-      (v.lastStatus === 'fail' || v.lastStatus === 'error'),
-  );
+      (last === 'fail' || last === 'error')
+    );
+  });
   let finalExitCode = deterministicFail || lastExit !== 0 ? 1 : 0;
   if (interrupted) finalExitCode = 130; // SIGINT/SIGTERM: convention for user interrupts
   if (
