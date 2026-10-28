@@ -478,10 +478,23 @@ export async function runLive(
       for (const [file, stamp] of after) {
         // Attempt 1: skip files that already existed pre-run with identical
         // content (stale reports from a previous job). Attempts 2+: ingest
-        // EVERY matched file — the command ran again, so the report state is
-        // a new attempt observation even when byte-identical (a fail-fail-
-        // pass retry with a deterministic report must still be detected).
-        if (attempt === 1 && snapshot.get(file)?.sha === stamp.sha) continue;
+        // every file the attempt WROTE — new, or mtime/size/content changed
+        // since the previous attempt. A byte-identical rewrite still counts
+        // (its mtime moves: a fail-fail-pass retry with a deterministic report
+        // must be detected), but a file nobody touched — a stale report from
+        // another job, or attempt N-1's report when attempt N crashed before
+        // writing — is not a new observation.
+        const prev = snapshot.get(file);
+        if (attempt === 1 && prev?.sha === stamp.sha) continue;
+        if (
+          attempt > 1 &&
+          prev !== undefined &&
+          prev.mtimeMs === stamp.mtimeMs &&
+          prev.size === stamp.size &&
+          prev.sha === stamp.sha
+        ) {
+          continue;
+        }
         let content: string;
         try {
           content = readFileSync(file, 'utf8');

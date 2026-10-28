@@ -111,9 +111,12 @@ Commands containing shell operators (`>`, `|`, `&&`) automatically fall back
 to shell mode so redirects keep working. After each attempt it parses the
 report files that **changed** (attempt 1 ingests only files created/changed
 since the invocation started — stale reports from previous runs are ignored)
-and records them as attempts of one run. Retry attempts re-record **all**
-matched reports: identical content is still a new attempt observation, so a
-fail-fail-pass sequence with a deterministic report is detected as a rescue.
+and records them as attempts of one run. Retry attempts record every report
+the attempt **wrote** — a byte-identical rewrite still counts (its mtime
+moves), so a fail-fail-pass sequence with a deterministic report is detected
+as a rescue — while files nobody touched (stale reports from another job, or
+the previous attempt's report when a retry crashed before writing) are not
+recorded again.
 Then it classifies and prints a terminal report restricted to the tests
 observed in this invocation.
 

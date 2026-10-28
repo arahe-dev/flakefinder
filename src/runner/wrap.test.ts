@@ -1204,3 +1204,56 @@ describe('injection targets the runner segment (QA RUN-10)', () => {
     ]);
   });
 });
+
+describe('retries ingest only reports the attempt wrote (QA RUN-6)', () => {
+  it('an untouched stale report and a crashed attempt add no observations', async () => {
+    const cwd = tmpCwd();
+    // a stale report from another job, never rewritten during this run
+    writeFileSync(
+      path.join(cwd, 'old.json'),
+      JSON.stringify({
+        testResults: [
+          {
+            name: 'old.test.js',
+            status: 'failed',
+            assertionResults: [
+              {
+                title: 'legacy',
+                fullName: 'legacy',
+                status: 'failed',
+                ancestorTitles: [],
+                duration: 1,
+                failureMessages: ['x'],
+              },
+            ],
+          },
+        ],
+      }),
+      'utf8',
+    );
+    // attempt 1 writes out.json (alpha fails); attempts 2+ crash before writing
+    const script = `
+const fs = require('fs');
+let n = 0;
+try { n = parseInt(fs.readFileSync('c12.txt', 'utf8'), 10) || 0; } catch {}
+n++;
+fs.writeFileSync('c12.txt', String(n));
+if (n >= 2) process.exit(139);
+fs.writeFileSync('out.json', JSON.stringify({ testResults: [{ name: 's.test.js', status: 'failed', assertionResults: [
+  { title: 'alpha', fullName: 'alpha', status: 'failed', ancestorTitles: [], duration: 1, failureMessages: ['boom'] } ] }] }));
+process.exit(1);
+`;
+    writeFileSync(path.join(cwd, 'script.js'), script, 'utf8');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await runLive(
+      ['node', 'script.js'],
+      cfg({ reports: ['*.json'], runner: 'generic', minRuns: 3 }),
+      { retries: 2, cwd, applyQuarantine: false },
+    );
+    expect(result.attempts.map((a) => a.attempt)).toEqual([1]); // only attempt 1 wrote a report
+    expect(result.verdicts.map((v) => v.name)).toEqual(['alpha']); // stale `legacy` never ingested
+    expect(result.verdicts[0]!.runsObserved).toBe(1);
+    expect(result.finalExitCode).toBe(1);
+  }, 60_000);
+});
