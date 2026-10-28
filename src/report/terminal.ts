@@ -37,10 +37,13 @@ function fmtMs(ms: number | null): string {
   return `${Math.round(ms)}ms`;
 }
 
-function truncateMiddle(s: string, max: number): string {
-  if (s.length <= max) return s;
+/** Middle-truncate by code point, so a surrogate pair (emoji…) is never split. */
+export function truncateMiddle(s: string, max: number): string {
+  if (s.length <= max) return s; // UTF-16 length ≥ code points
+  const cps = Array.from(s);
+  if (cps.length <= max) return s;
   const half = Math.floor((max - 1) / 2);
-  return `${s.slice(0, half)}…${s.slice(s.length - half)}`;
+  return `${cps.slice(0, half).join('')}…${cps.slice(cps.length - half).join('')}`;
 }
 
 /**

@@ -371,3 +371,18 @@ describe('renderDashboard', () => {
     expect(html).toContain(`#0d1117`);
   });
 });
+
+describe('dashboard truncation keeps surrogate pairs whole (QA ACT-9)', () => {
+  it('midTrunc (the dashboard JS) cuts by code point', () => {
+    const html = renderDashboard(fixtureData());
+    const src = html.match(/function midTrunc\(s, max\) \{[\s\S]*?\n {2}\}/)?.[0];
+    expect(src).toBeDefined();
+    const midTrunc = new Function(`${src}; return midTrunc;`)() as (s: string, n: number) => string;
+    const out = midTrunc('😀'.repeat(100), 9);
+    expect(Array.from(out)).toHaveLength(9);
+    expect(out).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    expect(midTrunc('short', 9)).toBe('short');
+  });
+});

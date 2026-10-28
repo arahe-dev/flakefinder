@@ -209,3 +209,19 @@ describe('terminal output is redacted (QA ACT-3)', () => {
     expect(out).toContain('ghp_[REDACTED]');
   });
 });
+
+describe('terminal truncation keeps surrogate pairs whole (QA ACT-9)', () => {
+  it('truncateMiddle cuts by code point', async () => {
+    const { truncateMiddle } = await import('./terminal.js');
+    const out = truncateMiddle('😀'.repeat(60), 48);
+    expect(Array.from(out).length).toBeLessThanOrEqual(48);
+    expect(out).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    const v = verdict({ name: `${'😀'.repeat(30)}x${'😀'.repeat(30)}`, classification: 'failing' });
+    expect(renderTerminal([v], { color: false, flakesOnly: true })).not.toContain('�');
+    expect(renderTerminal([v], { color: false, flakesOnly: true })).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+  });
+});
