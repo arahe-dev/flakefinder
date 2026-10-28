@@ -216,3 +216,17 @@ describe('TRX XML text fidelity (r5 #8)', () => {
     expect(results[0]).toMatchObject({ name: 'CaféTest', message: '42', stack: '1' });
   });
 });
+
+// trx-truncated.trx: the QA's real MSTest TRX cut off mid-<Results> (paths → /repo)
+describe('truncated TRX (QA PAR-10)', () => {
+  it('warns that the file is truncated and that classes could not be resolved', () => {
+    const { results, warnings } = trxParser.parse(load('trx-truncated.trx'), 'cut.trx');
+    expect(results.length).toBeGreaterThan(0);
+    expect(warnings.some((w) => w.includes('truncated'))).toBe(true);
+    expect(warnings.some((w) => w.includes("suite 'unknown'"))).toBe(true);
+  });
+
+  it('a complete real TRX gets neither warning', () => {
+    expect(trxParser.parse(load('trx-mstest3.trx'), 'ok.trx').warnings).toEqual([]);
+  });
+});

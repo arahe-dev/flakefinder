@@ -34,6 +34,7 @@ describe('detectParser', () => {
     ['trx-dotnet.trx', 'trx'],
     ['trx-mstest3.trx', 'trx'],
     ['trx-mstest2-datarows.trx', 'trx'],
+    ['trx-truncated.trx', 'trx'],
     ['junit-surefire-reruns.xml', 'junit'],
     ['mocha-same-title-hook.json', 'mocha'],
     ['mochawesome.json', 'mocha'],

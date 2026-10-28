@@ -35,7 +35,9 @@
  * InnerResults are replaced by their rows (each row is its own result, same
  * identity as MSTest 3's flat rows); the parent is kept only when it failed
  * while none of its rows did. Message/stack are trimmed to 2000/1000 chars.
- * duration "[d.]HH:MM:SS.fraction" → ms. Never throws.
+ * duration "[d.]HH:MM:SS.fraction" → ms. A file without a closing </TestRun> gets a
+ * "truncated" warning; results whose testId has no <TestDefinitions> entry
+ * (it follows <Results>, so truncation loses it) get a second one. Never throws.
  */
 import { XMLParser } from 'fast-xml-parser';
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
@@ -48,6 +50,8 @@ interface Ctx {
   sourcePath: string;
   results: TestCaseResult[];
   warnings: string[];
+  /** Results whose testId matched no UnitTest definition (truncated file?). */
+  unresolvedIds: number;
 }
 
 function attr(node: Record<string, unknown>, name: string): string | undefined {
@@ -156,10 +160,11 @@ function mapResult(r: unknown, suites: Suites, ctx: Ctx): void {
   }
 
   const testId = attr(r, '@_testId');
-  const suite =
+  const known =
     (testId !== undefined ? suites.byId.get(testId.toLowerCase()) : undefined) ??
-    suites.byName.get(testName) ??
-    'unknown';
+    suites.byName.get(testName);
+  if (known === undefined && testId !== undefined) ctx.unresolvedIds++;
+  const suite = known ?? 'unknown';
   const result: TestCaseResult = {
     testId: makeTestId(suite, testName),
     suite,
@@ -185,11 +190,15 @@ export const trxParser: ReportParser = {
   },
 
   parse(content: string, sourcePath: string): { results: TestCaseResult[]; warnings: string[] } {
-    const ctx: Ctx = { sourcePath, results: [], warnings: [] };
+    const ctx: Ctx = { sourcePath, results: [], warnings: [], unresolvedIds: 0 };
     const body = stripBom(content);
     if (body.trim() === '') {
       ctx.warnings.push(`trx: ${sourcePath}: file is empty`);
       return { results: ctx.results, warnings: ctx.warnings };
+    }
+
+    if (!/<\/(?:[\w.-]+:)?TestRun>\s*$/.test(body)) {
+      ctx.warnings.push(`trx: ${sourcePath}: content appears truncated (no closing </TestRun>)`);
     }
 
     let doc: unknown;
@@ -241,6 +250,13 @@ export const trxParser: ReportParser = {
     }
     for (const r of resultsEl !== undefined ? childList(resultsEl, 'UnitTestResult') : []) {
       mapResult(r, suites, ctx);
+    }
+    // dotnet writes <Results> BEFORE <TestDefinitions>: a cut-off file loses
+    // every class name, and 'unknown' suites would fork the tests' history
+    if (ctx.unresolvedIds > 0) {
+      ctx.warnings.push(
+        `trx: ${sourcePath}: ${ctx.unresolvedIds} result(s) have a testId with no matching <TestDefinitions> entry — recorded with suite 'unknown' (their ids differ from complete reports)`,
+      );
     }
     return { results: ctx.results, warnings: ctx.warnings };
   },
