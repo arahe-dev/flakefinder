@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import * as artifact from '@actions/artifact';
 import * as cache from '@actions/cache';
@@ -83,6 +83,9 @@ async function actionMain(): Promise<void> {
 
   // 4. new-flake diff, fresh snapshot
   const newFlakes = computeNewFlakes(verdicts, previous);
+  // the store dir only exists once something was appended — a first run whose
+  // matched reports all failed to parse must not die with ENOENT here
+  mkdirSync(storeDir, { recursive: true });
   writeFileSync(snapshotPath(storeDir), JSON.stringify(verdicts), 'utf8');
   recordBaseline(storeDir, gh.runId, previous);
 

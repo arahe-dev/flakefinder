@@ -331,3 +331,15 @@ describe('ci annotations and table are redacted (QA ACT-3)', () => {
     expect(out).not.toContain(tok);
   });
 });
+
+describe('ci on a first run where nothing parses (QA ACT-5 / CLI-7)', () => {
+  it('does not crash with ENOENT writing the snapshot', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{"reports": ["r.xml"]}', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), 'this is not a test report', 'utf8');
+    const r = cli(['ci'], d);
+    expect(r.stderr).not.toContain('ENOENT');
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(d, '.flakefinder', 'verdicts-snapshot.json'))).toBe(true);
+  });
+});

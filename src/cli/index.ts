@@ -650,6 +650,8 @@ export async function main(argv: string[]): Promise<number> {
       }
       // same semantics as the GitHub Action — one implementation (src/action/diff.ts)
       const newFlakes = computeNewFlakes(verdicts, previous);
+      // nothing parsed on a first run → no store dir yet (QA ACT-5 / CLI-7)
+      mkdirSync(path.dirname(snap), { recursive: true });
       writeFileSync(snap, JSON.stringify(verdicts), 'utf8');
 
       // GitLab MR note (D4): activates only on GitLab CI with the user's vars set
