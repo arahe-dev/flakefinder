@@ -118,6 +118,11 @@ function mochawesomeEntries(roots: unknown[]): Array<[Record<string, unknown>, T
   return out;
 }
 
+/** mocha's `err` is `{}` for tests that did not fail. */
+function hasErr(err: unknown): boolean {
+  return (typeof err === 'string' && err !== '') || (isObj(err) && Object.keys(err).length > 0);
+}
+
 const HOOK_TITLE = /^"(?:before|after) (?:all|each)" hook\b/;
 
 /** `"before all" hook for "queries"` → `"before all" hook` (the suffix names whichever test ran first). */
@@ -207,15 +212,33 @@ export const mochaParser: ReportParser = {
       const failBucket = bucket(failures);
       const pendingBucket = bucket(pending);
       const passBucket = bucket(passes);
+      // how many tests share each key — duplicates need a tie-breaker
+      const shared = new Map<string, number>();
+      for (const entry of testList) {
+        if (isObj(entry)) shared.set(keyOf(entry), (shared.get(keyOf(entry)) ?? 0) + 1);
+      }
       for (const entry of testList) {
         if (!isObj(entry)) {
           add(entry, null);
           continue;
         }
         const key = keyOf(entry);
-        if (consume(failBucket, key)) add(entry, 'fail');
-        else if (consume(pendingBucket, key)) add(entry, 'skip');
-        else if (consume(passBucket, key)) add(entry, 'pass');
+        // Same-keyed duplicates: the one carrying an err takes the failure;
+        // an err-less one prefers pass/pending. Unique keys keep fail-first.
+        const errLess = (shared.get(key) ?? 0) > 1 && !hasErr(entry.err);
+        const order: Array<[Map<string, Record<string, unknown>[]>, TestStatus]> = errLess
+          ? [
+              [passBucket, 'pass'],
+              [pendingBucket, 'skip'],
+              [failBucket, 'fail'],
+            ]
+          : [
+              [failBucket, 'fail'],
+              [pendingBucket, 'skip'],
+              [passBucket, 'pass'],
+            ];
+        const hit = order.find(([b]) => consume(b, key));
+        if (hit !== undefined) add(entry, hit[1]);
         else if (entry.state === 'failed') add(entry, 'fail');
         else if (entry.state === 'pending') add(entry, 'skip');
         else add(entry, null);

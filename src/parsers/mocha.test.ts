@@ -237,3 +237,28 @@ describe('mochawesome (QA PAR-1)', () => {
     expect(mochaParser.sniff(load('mochawesome.json'))).toBe(true);
   });
 });
+
+// mocha-qa.json: REAL `mocha --reporter json` (mocha 12, QA fixture fx/mocha.json,
+// paths → /repo): a failing before() and afterEach(), --retries, and a duplicated
+// `describe('Outer') > it('same title')` where only the SECOND copy fails.
+describe('mocha QA fixture (QA PAR-3)', () => {
+  it('records before/after hook failures that appear only in failures[]', () => {
+    const { results, warnings } = mochaParser.parse(load('mocha-qa.json'), 'mocha.json');
+    const hooks = results.filter((r) => r.name.endsWith('hook'));
+    expect(hooks.map((r) => `${r.suite} :: ${r.name}:${r.status}`)).toEqual([
+      'Hooky :: "before all" hook:fail',
+      'Each :: "after each" hook:fail',
+    ]);
+    expect(hooks[0]!.message).toBe('before boom');
+    expect(warnings.some((w) => w.includes('2 hook failure(s)'))).toBe(true);
+    expect(results.filter((r) => r.status === 'fail')).toHaveLength(6);
+  });
+
+  it('gives a duplicated title its failure by err, not by position', () => {
+    const { results } = mochaParser.parse(load('mocha-qa.json'), 'mocha.json');
+    const dups = results.filter((r) => r.suite === 'Outer' && r.name === 'same title');
+    expect(dups.map((r) => r.status)).toEqual(['pass', 'fail']);
+    expect(dups[0]).not.toHaveProperty('message');
+    expect(dups[1]!.message).toBe('dup describe fails');
+  });
+});
