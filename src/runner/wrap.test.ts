@@ -1061,3 +1061,40 @@ describe("user's own name selector is merged, not overridden (QA RUN-3)", () => 
     expect(re.test('suite alpha')).toBe(false);
   }, 60_000);
 });
+
+describe('selector length budget (QA RUN-4)', () => {
+  it('thousands of failures fall back to a full re-run instead of E2BIG', async () => {
+    const cwd = tmpCwd();
+    const script = `
+const fs = require('fs');
+let n = 0;
+try { n = parseInt(fs.readFileSync('c10.txt', 'utf8'), 10) || 0; } catch {}
+n++;
+fs.writeFileSync('c10.txt', String(n));
+fs.writeFileSync('argv' + n + '.json', JSON.stringify(process.argv.slice(2)));
+const results = [];
+for (let i = 0; i < 2000; i++) {
+  const title = 'many failures case number ' + i + ' with a reasonably descriptive test title here';
+  results.push({ title, fullName: title, status: n === 1 ? 'failed' : 'passed', ancestorTitles: [], duration: 1, failureMessages: [] });
+}
+fs.writeFileSync('out.json', JSON.stringify({ testResults: [{ name: 's.test.js', status: n === 1 ? 'failed' : 'passed', assertionResults: results }] }));
+process.exit(n === 1 ? 1 : 0);
+`;
+    writeFileSync(path.join(cwd, 'script.js'), script, 'utf8');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await runLive(['node', 'script.js'], cfg({ runner: 'jest' }), {
+      retries: 2,
+      cwd,
+      applyQuarantine: false,
+    });
+    const argv2 = JSON.parse(readFileSync(path.join(cwd, 'argv2.json'), 'utf8')) as string[];
+    expect(argv2).toEqual([]); // full re-run: no giant -t
+    expect(result.attempts.map((a) => a.attempt)).toEqual([1, 2]);
+    expect(result.finalExitCode).toBe(0); // every failure was rescued
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes('over the') && l.includes('budget'))).toBe(true);
+    expect(Math.max(...lines.map((l) => l.length))).toBeLessThan(1000);
+  }, 60_000);
+});

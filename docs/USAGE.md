@@ -141,8 +141,10 @@ observed in this invocation.
   executes **only the tests that failed on the previous attempt** (a test that
   already recovered is not re-run again) — jest/vitest via `-t`, mocha via `--grep`, go via
   `-run`, pytest via `--lf` — falling back to a full re-run when the runner has
-  no adapter or attempt 1 recorded no failures. `full` restores re-running the
-  entire command every attempt.
+  no adapter, the previous attempt recorded no failures, or the selector would
+  be too long to pass to the OS (more than 32 KiB — thousands of failures;
+  6000 chars on Windows). `full` restores re-running the entire command every
+  attempt.
 
 **Targeted re-runs** cut retry cost from 3×(whole suite) to roughly
 suite + 2×(failed tests only). One honest caveat: order-dependent flakes may

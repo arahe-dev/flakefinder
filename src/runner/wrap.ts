@@ -349,7 +349,13 @@ export async function runLive(
         const previous = attempts.filter((r) => r.attempt === attempt - 1);
         const failed = failedNamesOf(previous).filter((n) => !quarantinedNames.includes(n));
         const targeted = failedOnlyArgs(runner, failed, quarantinedNames);
-        if (targeted) {
+        const targetedChars = targeted ? targeted.reduce((n, a) => n + a.length + 1, 0) : 0;
+        if (targeted && targetedChars > SELECTOR_BUDGET_CHARS) {
+          // thousands of failures make a selector the OS refuses to exec
+          // (E2BIG: Linux caps ONE argument at 128 KiB; cmd.exe a whole line
+          // at 8191 chars) — a full re-run is slower but always startable
+          note = `full re-run (${failed.length} failures: selector would be ${targetedChars} chars, over the ${SELECTOR_BUDGET_CHARS}-char budget)`;
+        } else if (targeted) {
           extraArgs = targeted;
           note = `targeted: re-running ${failed.length} failed test(s)`;
         } else if (failed.length === 0) {
@@ -383,7 +389,7 @@ export async function runLive(
       const built = insertRunnerArgs(runCommand, extraArgs);
       console.log(
         dim(
-          `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ''} → ${built.join(' ')}`,
+          `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ''} → ${truncateForLog(built.join(' '))}`,
         ),
       );
       let code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
@@ -609,6 +615,18 @@ function loadQuarantine(file: string): QuarantineEntry[] {
     );
     return [];
   }
+}
+
+/**
+ * Max total length of an injected targeted selector. Linux rejects any single
+ * argv string over 128 KiB (MAX_ARG_STRLEN) and Windows cmd.exe lines over
+ * 8191 chars; past this budget a full re-run is used instead.
+ */
+export const SELECTOR_BUDGET_CHARS = process.platform === 'win32' ? 6000 : 32_768;
+
+/** Keep the per-attempt command echo readable when selectors get long. */
+function truncateForLog(line: string, max = 400): string {
+  return line.length <= max ? line : `${line.slice(0, max)}… (+${line.length - max} chars)`;
 }
 
 function dim(s: string): string {
