@@ -326,6 +326,7 @@ export async function runLive(
   const currentChild: { ref: ReturnType<typeof spawn> | null } = { ref: null };
   let interrupted = false;
   let warnedSelectorClash = false;
+  let notedSelectorMerge = false;
   // the child runs in its own process group (POSIX), so the terminal's Ctrl-C
   // reaches only us: forward the signal to the whole tree ourselves
   const onInterrupt = (signal: NodeJS.Signals): void => {
@@ -362,13 +363,24 @@ export async function runLive(
           note = 'full re-run (no targeted adapter)';
         }
       }
-      if (!warnedSelectorClash && userSelectorClash(command, extraArgs)) {
+      // a user's own -t/--grep would be overridden (or, for jest, combined
+      // into a filter that matches nothing): fold it into ours instead
+      const merged = mergeUserSelector(command, extraArgs);
+      if (merged.userPatterns.length > 0 && !notedSelectorMerge) {
+        notedSelectorMerge = true;
+        console.log(
+          `flakefinder: combined your own ${extraArgs[0]!} filter with flakefinder's selector (both must match)`,
+        );
+      }
+      const runCommand = merged.command;
+      extraArgs = merged.extraArgs;
+      if (!warnedSelectorClash && userSelectorClash(runCommand, extraArgs)) {
         warnedSelectorClash = true;
         console.warn(
           `flakefinder: your command already passes a name selector; flakefinder's injected ${extraArgs[0]!} (quarantine exclusion / targeted re-run) is appended after it and most runners keep only the LAST one — combine them yourself or use --no-quarantine / --retry-mode full`,
         );
       }
-      const built = insertRunnerArgs(command, extraArgs);
+      const built = insertRunnerArgs(runCommand, extraArgs);
       console.log(
         dim(
           `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ''} → ${built.join(' ')}`,
@@ -509,6 +521,66 @@ const SELECTOR_ALIASES: Record<string, string[]> = {
   '--grep': ['--grep', '-g', '--fgrep', '-f'],
   '-run': ['-run', '--run'],
 };
+
+/** Literal-string selector flags (mocha --fgrep): their value is not a regex. */
+const LITERAL_SELECTORS = new Set(['--fgrep', '-f']);
+
+/**
+ * Fold a user-supplied jest `-t` / mocha `--grep` (in the runner's segment)
+ * into the selector flakefinder injects, so both apply: each user pattern
+ * becomes a lookahead in front of ours (`^(?=[\s\S]*?(?:user))…`), which
+ * keeps the runners' unanchored "search" semantics for the user's part.
+ * The user's flag tokens are removed from the command. Go `-run` (slash
+ * semantics) and mocha `--invert` are left alone — userSelectorClash warns.
+ */
+export function mergeUserSelector(
+  command: string[],
+  extraArgs: string[],
+): { command: string[]; extraArgs: string[]; userPatterns: string[] } {
+  const unchanged = { command, extraArgs, userPatterns: [] as string[] };
+  const flag = extraArgs[0];
+  const ours = extraArgs[1];
+  if ((flag !== '-t' && flag !== '--grep') || ours === undefined || !ours.startsWith('^')) {
+    return unchanged;
+  }
+  const aliases = SELECTOR_ALIASES[flag]!;
+  const opIdx = command.findIndex((t) => isShellOperator(t));
+  const end = opIdx === -1 ? command.length : opIdx;
+  if (flag === '--grep' && command.slice(1, end).some((t) => t === '--invert' || t === '-i')) {
+    return unchanged;
+  }
+  const kept: string[] = [command[0]!];
+  const userPatterns: string[] = [];
+  for (let i = 1; i < end; i++) {
+    const t = command[i]!;
+    const alias = aliases.find((a) => t === a || t.startsWith(`${a}=`));
+    if (!alias) {
+      kept.push(t);
+      continue;
+    }
+    let value: string | undefined;
+    if (t === alias) {
+      value = command[i + 1];
+      if (value === undefined || i + 1 >= end) {
+        kept.push(t); // dangling flag: leave it for the runner to complain about
+        continue;
+      }
+      i++;
+    } else {
+      value = t.slice(alias.length + 1);
+    }
+    if (LITERAL_SELECTORS.has(alias)) value = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    else if (flag === '--grep') value = value.replace(/^\/(.*)\/[a-z]*$/s, '$1'); // mocha "/re/flags"
+    userPatterns.push(value);
+  }
+  if (userPatterns.length === 0) return unchanged;
+  const lookaheads = userPatterns.map((p) => `(?=[\\s\\S]*?(?:${p}))`).join('');
+  return {
+    command: [...kept, ...command.slice(end)],
+    extraArgs: [flag, `^${lookaheads}${ours.slice(1)}`, ...extraArgs.slice(2)],
+    userPatterns,
+  };
+}
 
 /**
  * True when flakefinder is about to inject a name selector that the user's

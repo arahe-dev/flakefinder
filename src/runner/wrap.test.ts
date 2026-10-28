@@ -865,7 +865,7 @@ describe('user-supplied name selector (R5 optional)', () => {
     expect(userSelectorClash(['jest', '|', 'grep', '-t', 'x'], ['-t', 'x'])).toBe(false);
   });
 
-  it('runLive warns once when the user command already has -t', async () => {
+  it('runLive merges (not warns about) a user -t, and says so once', async () => {
     const cwd = tmpCwd();
     writeFileSync(path.join(cwd, 'script.js'), SCRIPT_ALL_PASS, 'utf8');
     writeFileSync(
@@ -885,14 +885,17 @@ describe('user-supplied name selector (R5 optional)', () => {
       }),
       'utf8',
     );
-    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await runLive(['node', 'script.js', '-t', 'mine'], cfg({ runner: 'jest' }), {
       retries: 0,
       cwd,
       applyQuarantine: true,
     });
-    expect(warn.mock.calls.filter((c) => String(c[0]).includes('name selector'))).toHaveLength(1);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('name selector'))).toHaveLength(0);
+    expect(
+      log.mock.calls.filter((c) => String(c[0]).includes('combined your own -t')),
+    ).toHaveLength(1);
   }, 60_000);
 });
 
@@ -978,5 +981,83 @@ process.exit(failed ? 1 : 0);
       },
     );
     expect(second.finalExitCode).toBe(0);
+  }, 60_000);
+});
+
+describe("user's own name selector is merged, not overridden (QA RUN-3)", () => {
+  it('folds jest -t / --testNamePattern= into the injected pattern as a lookahead', async () => {
+    const { mergeUserSelector } = await import('./wrap.js');
+    const q = '^(?!(?:.* )?(?:alpha)\\s*$)';
+    const m = mergeUserSelector(['npx', 'jest', '-t', 'gamma', '--ci'], ['-t', q]);
+    expect(m.command).toEqual(['npx', 'jest', '--ci']);
+    expect(m.userPatterns).toEqual(['gamma']);
+    const re = new RegExp(m.extraArgs[1]!, 'i'); // jest compiles -t case-insensitively
+    expect(re.test('suite A gamma')).toBe(true); // user filter AND not quarantined
+    expect(re.test('suite A alpha')).toBe(false); // quarantined
+    expect(re.test('suite A delta')).toBe(false); // outside the user's filter
+    const eq = mergeUserSelector(['jest', '--testNamePattern=gam'], ['-t', q]);
+    expect(eq.command).toEqual(['jest']);
+    expect(new RegExp(eq.extraArgs[1]!).test('x gamma')).toBe(true);
+  });
+
+  it('mocha: --grep "/re/" form and literal --fgrep; --invert is left alone', async () => {
+    const { mergeUserSelector } = await import('./wrap.js');
+    const ours = '^(?:.* )?(?:b)\\s*$';
+    const g = mergeUserSelector(['mocha', '--grep', '/api/'], ['--grep', ours]);
+    expect(g.command).toEqual(['mocha']);
+    expect(new RegExp(g.extraArgs[1]!).test('api b')).toBe(true);
+    expect(new RegExp(g.extraArgs[1]!).test('web b')).toBe(false);
+    const f = mergeUserSelector(['mocha', '--fgrep', 'a.b'], ['--grep', ours]);
+    expect(new RegExp(f.extraArgs[1]!).test('axb b')).toBe(false); // literal dot
+    expect(new RegExp(f.extraArgs[1]!).test('a.b b')).toBe(true);
+    const inv = mergeUserSelector(['mocha', '--grep', 'x', '--invert'], ['--grep', ours]);
+    expect(inv.userPatterns).toEqual([]);
+    expect(inv.command).toEqual(['mocha', '--grep', 'x', '--invert']);
+  });
+
+  it('go -run and later shell segments are not touched', async () => {
+    const { mergeUserSelector } = await import('./wrap.js');
+    const go = mergeUserSelector(['go', 'test', '-run', 'TestA'], ['-run', '^(TestB)$']);
+    expect(go.userPatterns).toEqual([]);
+    const seg = mergeUserSelector(['jest', '&&', 'other', '-t', 'x'], ['-t', '^a']);
+    expect(seg.command).toEqual(['jest', '&&', 'other', '-t', 'x']);
+  });
+
+  it('runLive: a user -t plus quarantine runs the user-selected tests', async () => {
+    const cwd = tmpCwd();
+    writeFileSync(
+      path.join(cwd, 'echo-args.js'),
+      "require('fs').writeFileSync('argv.json', JSON.stringify(process.argv.slice(2)));",
+      'utf8',
+    );
+    writeFileSync(
+      path.join(cwd, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: 'x',
+            suite: 's',
+            name: 'alpha',
+            reason: 'flaky',
+            quarantinedAt: new Date().toISOString(),
+            flakeScore: 90,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runLive(['node', 'echo-args.js', '-t', 'gamma'], cfg({ reports: [], runner: 'jest' }), {
+      retries: 0,
+      cwd,
+      applyQuarantine: true,
+    });
+    const argv = JSON.parse(readFileSync(path.join(cwd, 'argv.json'), 'utf8')) as string[];
+    expect(argv.filter((a) => a === '-t')).toHaveLength(1); // exactly one -t reaches jest
+    const re = new RegExp(argv[argv.indexOf('-t') + 1]!, 'i');
+    expect(re.test('suite gamma')).toBe(true);
+    expect(re.test('suite alpha')).toBe(false);
   }, 60_000);
 });
