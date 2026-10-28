@@ -25,6 +25,10 @@
  * unless the parent itself failed while none of its descendants did (t.Error after t.Run, a
  * panic in the parent body); that failure exists nowhere else, so the parent row is kept.
  *
+ * Benchmarks: test2json emits no terminal `pass` for a passing benchmark, only its result
+ * line. A Benchmark* test left without a terminal action is a pass when it printed a
+ * result line (`… ns/op`) or its package passed; otherwise it is a crash like any test.
+ *
  * Package-level events (no Test) produce no rows, except that a package which FAILED without
  * any test result (build error, init panic) becomes one synthetic `(package)` error.
  *
@@ -75,6 +79,16 @@ function excerptOf(lines: string[]): string {
   const kept = lines.map((l) => stripAnsi(l).trim()).filter((l) => l !== '');
   const head = kept.slice(0, WARNING_EXCERPT_LINES).join(' | ');
   return kept.length > WARNING_EXCERPT_LINES ? `${head} | …` : head;
+}
+
+function isBenchmark(test: string): boolean {
+  return /^Benchmark/.test(test);
+}
+
+/** A benchmark result line: `BenchmarkX-8   \t 1000\t  21.0 ns/op …`. */
+function hasBenchResult(outputs: string[]): boolean {
+  // the result line may be split across output events — test the joined text
+  return /^Benchmark\S*\s+\d+\s+[\d.]+ \S+\/op\b/m.test(outputs.join(''));
 }
 
 function isFailFamily(status: TestStatus): boolean {
@@ -136,6 +150,7 @@ export const goTestParser: ReportParser = {
     /** go 1.24+ build events, keyed by ImportPath. */
     const builds = new Map<string, { failed: boolean; outputs: string[] }>();
     const strayText: string[] = [];
+    const passedPackages = new Set<string>();
     let malformed = 0;
 
     const lines = stripBom(content).split(/\r?\n/);
@@ -180,6 +195,7 @@ export const goTestParser: ReportParser = {
       // that crashed before running any test still surfaces. Outputs are kept
       // for every package (they precede the fail event in real streams).
       if (test === null) {
+        if (action === 'pass') passedPackages.add(pkg);
         if (action === 'fail') {
           const entry = failedPackages.get(pkg) ?? { failed: false, outputs: [] };
           entry.failed = true;
@@ -235,6 +251,22 @@ export const goTestParser: ReportParser = {
     }> = [];
     for (const acc of tests.values()) {
       const last = acc.runs[acc.runs.length - 1]!;
+      if (last.status === undefined && isBenchmark(acc.test)) {
+        // test2json never emits a terminal `pass` for a benchmark — only its
+        // result line. A result line (or a package that passed) means it ran.
+        // A parent benchmark's result lines belong to its sub-benchmarks.
+        const prefix = `${acc.test}/`;
+        const ran =
+          hasBenchResult(last.outputs) ||
+          passedPackages.has(acc.pkg) ||
+          [...tests.values()].some(
+            (o) =>
+              o.pkg === acc.pkg &&
+              o.test.startsWith(prefix) &&
+              hasBenchResult(o.runs[o.runs.length - 1]!.outputs),
+          );
+        if (ran) last.status = 'pass';
+      }
       if (last.status === undefined) {
         // Test started (run event) but never reported pass/fail/skip — the test
         // binary crashed mid-run (panic, OOM, killed). Synthesize an error so

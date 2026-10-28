@@ -357,3 +357,43 @@ describe('go sniff + build failures (r5 #4)', () => {
     expect(text).toContain('undefined: undefinedThing');
   });
 });
+
+// go-bench-pass.jsonl / go-bench.jsonl: REAL `go test -json -bench=.` (QA
+// fixtures, go 1.23). test2json emits NO terminal `pass` for a benchmark —
+// only its result line (`BenchmarkX-4  10  21.00 ns/op`) — while a failing
+// benchmark does get `fail`.
+describe('go benchmarks (QA PAR-2)', () => {
+  it('passing benchmarks are passes, not "never reported a result" errors', () => {
+    const { results, warnings } = goTestParser.parse(load('go-bench-pass.jsonl'), 'bench.jsonl');
+    expect(warnings).toEqual([]);
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'TestA:pass',
+      'ExampleHello:pass',
+      'BenchmarkX:pass',
+      'BenchmarkSub/size=10:pass',
+    ]);
+    expect(results[2]!.message).toContain('ns/op');
+  });
+
+  it('a failing benchmark still fails; its passing siblings do not turn into errors', () => {
+    const { results, warnings } = goTestParser.parse(load('go-bench.jsonl'), 'bench.jsonl');
+    expect(warnings).toEqual([]);
+    expect(Object.fromEntries(results.map((r) => [r.name, r.status]))).toEqual({
+      TestA: 'pass',
+      ExampleHello: 'pass',
+      BenchmarkX: 'pass',
+      'BenchmarkSub/size=10': 'pass',
+      BenchmarkFails: 'fail',
+    });
+  });
+
+  it('a benchmark that crashed (no result line, package failed) is still an error', () => {
+    const content = [
+      '{"Action":"run","Package":"p","Test":"BenchmarkBoom"}',
+      '{"Action":"output","Package":"p","Test":"BenchmarkBoom","Output":"panic: boom\\n"}',
+      '{"Action":"fail","Package":"p","Elapsed":0.01}',
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    expect(results[0]).toMatchObject({ name: 'BenchmarkBoom', status: 'error' });
+  });
+});
