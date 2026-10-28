@@ -4,7 +4,7 @@
  * so these never depend on a stale committed dist/.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,5 +82,74 @@ describe('ingest dedupes explicitly-passed files (QA A6)', () => {
     const records = historyRecords(d);
     expect(records).toHaveLength(1);
     expect(records[0]!.results).toHaveLength(2);
+  });
+});
+
+describe('strict integer flags (QA A7/A8)', () => {
+  it.each([
+    [
+      ['run', '-R', '2.5', '--', 'node', '-e', '0'],
+      'run -R/--retries must be an integer 0–10 (got 2.5)',
+    ],
+    [
+      ['run', '-R', '2x', '--', 'node', '-e', '0'],
+      'run -R/--retries must be an integer 0–10 (got 2x)',
+    ],
+    [
+      ['run', '-R', '50', '--', 'node', '-e', '0'],
+      'run -R/--retries must be an integer 0–10 (got 50)',
+    ],
+    [
+      ['run', '--retries=-1', '--', 'node', '-e', '0'],
+      'run -R/--retries must be an integer 0–10 (got -1)',
+    ],
+    [
+      ['run', '--timeout', '1.5', '--', 'node', '-e', '0'],
+      'run --timeout must be an integer 1–2147483 (seconds) (got 1.5)',
+    ],
+    [
+      ['run', '--timeout', '0', '--', 'node', '-e', '0'],
+      'run --timeout must be an integer 1–2147483 (seconds) (got 0)',
+    ],
+    [['ingest', 'r.xml', '--attempt=-5'], 'ingest --attempt must be an integer 1–1000000 (got -5)'],
+    [
+      ['ingest', 'r.xml', '--attempt', '2.7'],
+      'ingest --attempt must be an integer 1–1000000 (got 2.7)',
+    ],
+    [
+      ['ingest', 'r.xml', '--attempt', 'abc'],
+      'ingest --attempt must be an integer 1–1000000 (got abc)',
+    ],
+    [
+      ['ingest', 'r.xml', '--attempt', '0'],
+      'ingest --attempt must be an integer 1–1000000 (got 0)',
+    ],
+    [['report', '--threshold', '50abc'], 'report --threshold must be an integer 0–100 (got 50abc)'],
+    [['report', '--threshold', '101'], 'report --threshold must be an integer 0–100 (got 101)'],
+  ])('%j exits 2 naming the flag and range', (args, message) => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(args, d);
+    expect(r.status).toBe(2);
+    expect(r.stderr.trim()).toBe(`flakefinder: ${message}`);
+    // nothing ran, nothing was recorded
+    expect(existsSync(path.join(d, '.flakefinder'))).toBe(false);
+  });
+
+  it('-R 50 is blamed on the flag even when a valid config exists (QA A8)', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "liveRetries": 1 }', 'utf8');
+    const r = cli(['run', '-R', '50', '--', 'node', '-e', '0'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('run -R/--retries must be an integer 0–10 (got 50)');
+    expect(r.stderr).not.toContain('config');
+  });
+
+  it('valid values still work: --attempt 2, --threshold 0', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml', '--attempt', '2'], d).status).toBe(0);
+    expect(historyRecords(d)[0]).toMatchObject({ attempt: 2 });
+    expect(cli(['report', '--threshold', '0'], d).status).toBe(0);
   });
 });

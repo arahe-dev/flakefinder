@@ -124,7 +124,7 @@ observed in this invocation.
   your CI gate.
 - `--no-quarantine` — run the full suite, ignoring the quarantine list.
 - `--timeout <seconds>` — kill the attempt (whole process tree) after N
-  seconds; the attempt counts as failed (exit 124, GNU-timeout convention)
+  seconds (an integer 1–2147483); the attempt counts as failed (exit 124, GNU-timeout convention)
   and the retry loop proceeds. Default: config `timeoutSeconds`, itself
   unlimited. SIGINT/SIGTERM (Ctrl-C) kill the current tree, stop the loop,
   and exit 130 while keeping everything observed so far in history.
@@ -167,8 +167,8 @@ Parses report files into the history store without running anything. With no
 file arguments it uses the configured `reports` globs. The parser is detected
 per file from content.
 
-- `--attempt <n>` — attempt number to record (default 1). Useful for
-  reconstructing a retry sequence from CI artifacts.
+- `--attempt <n>` — attempt number to record (default 1; an integer
+  1–1000000). Useful for reconstructing a retry sequence from CI artifacts.
 - `--source <source>` — provenance tag stored on the run (default `report`).
 
 **Same-runId note:** each `ingest` invocation creates its **own** `runId`.
@@ -192,7 +192,7 @@ Classifies everything in the history store and prints it.
 - `--format md` — markdown (same shape as PR comments).
 - `--flakes-only` — drop the `ok:` summary line (table).
 - `--all` — include passing/skipped/gone rows (table), all tests (md).
-- `--threshold <n>` — minimum score for `flaky-suspected` inclusion; applied
+- `--threshold <n>` — minimum score (an integer 0–100) for `flaky-suspected` inclusion; applied
   identically to the table and md formats. Confirmed/retry flakes and
   failures are always included. Default: config `flakeScoreThreshold`. The
   `json` format is always complete, and the `ci` command / GitHub Action
@@ -549,7 +549,10 @@ manually (e.g. `-run` in your own scripts) until Go grows a selector.
 
 **Exit code 2** — a flag/config problem, not a test result: check the error
 message above the exit (unreadable config, invalid `--retries`, empty
-quarantine action, no matching reports for `ingest`/`ci`).
+quarantine action, no matching reports for `ingest`/`ci`). Numeric flags
+(`-R`, `--timeout`, `--attempt`, `--threshold`) accept plain integers only —
+`2.5`, `2x` or `50abc` are rejected with the flag's accepted range rather than
+silently truncated.
 
 ## Privacy
 

@@ -31,6 +31,7 @@ import type {
 } from '../types.js';
 import { FLAKEFINDER_VERSION } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
+import { parseStrictInt } from '../util/strict-int.js';
 
 interface Globals {
   config?: string;
@@ -68,6 +69,24 @@ function gitSha(cwd: string): string | undefined {
 function storeFor(g: Globals, cfg: ResolvedConfig): HistoryStore {
   return new HistoryStore(path.resolve(g.cwd, cfg.storeDir));
 }
+
+/**
+ * Validates an integer flag (QA A7/A8). On failure prints an error naming the
+ * flag and the accepted range and returns null — the caller sets exit 2. Runs
+ * BEFORE resolveConfig so a bad override is blamed on the flag, not the config.
+ */
+function flagInt(flag: string, value: string, min: number, max: number, unit = ''): number | null {
+  const n = parseStrictInt(value, min, max);
+  if (n === null) {
+    console.error(`flakefinder: ${flag} must be an integer ${min}–${max}${unit} (got ${value})`);
+  }
+  return n;
+}
+
+/** Engine/config bounds the flags share (config.ts validates the same ranges). */
+const RETRIES_MAX = 10;
+/** setTimeout's ceiling (2^31-1 ms) in whole seconds — larger values would fire at once. */
+const TIMEOUT_MAX_SECONDS = 2_147_483;
 
 function filterVerdicts(
   verdicts: TestVerdict[],
@@ -211,11 +230,14 @@ export async function main(argv: string[]): Promise<number> {
         },
       ) => {
         const g = globals();
-        const retries = opts.retries != null ? Number.parseInt(opts.retries, 10) : undefined;
-        if (opts.retries != null && (Number.isNaN(retries) || retries! < 0)) {
-          console.error('flakefinder: --retries must be a non-negative integer');
-          exitCode = 2;
-          return;
+        let retries: number | undefined;
+        if (opts.retries != null) {
+          const n = flagInt('run -R/--retries', opts.retries, 0, RETRIES_MAX);
+          if (n === null) {
+            exitCode = 2;
+            return;
+          }
+          retries = n;
         }
         if (opts.retryMode != null && !['auto', 'failed', 'full'].includes(opts.retryMode)) {
           console.error(
@@ -231,11 +253,14 @@ export async function main(argv: string[]): Promise<number> {
           overrides.retryMode = opts.retryMode as FlakefinderConfig['retryMode'];
         }
         if (opts.timeout != null) {
-          const seconds = Number.parseInt(opts.timeout, 10);
-          if (Number.isNaN(seconds) || seconds <= 0) {
-            console.error(
-              `flakefinder: --timeout must be a positive number of seconds (got "${opts.timeout}")`,
-            );
+          const seconds = flagInt(
+            'run --timeout',
+            opts.timeout,
+            1,
+            TIMEOUT_MAX_SECONDS,
+            ' (seconds)',
+          );
+          if (seconds === null) {
             exitCode = 2;
             return;
           }
@@ -269,8 +294,12 @@ export async function main(argv: string[]): Promise<number> {
     )
     .action((files: string[], opts: { attempt: string; source: string; runId?: string }) => {
       const g = globals();
+      const attempt = flagInt('ingest --attempt', opts.attempt, 1, 1_000_000);
+      if (attempt === null) {
+        exitCode = 2;
+        return;
+      }
       const cfg = resolveCfg(g);
-      const attempt = Number.parseInt(opts.attempt, 10) || 1;
       if (!['live', 'report', 'action'].includes(opts.source)) {
         console.error(`flakefinder: --source must be live|report|action (got ${opts.source})`);
         exitCode = 2;
@@ -350,19 +379,17 @@ export async function main(argv: string[]): Promise<number> {
     .option('--threshold <n>', 'minimum score for suspected flakes', undefined)
     .action((opts: { format: string; flakesOnly?: boolean; all?: boolean; threshold?: string }) => {
       const g = globals();
-      const cfg = resolveCfg(g);
-      const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
       let threshold: number | undefined;
       if (opts.threshold != null) {
-        threshold = Number.parseInt(opts.threshold, 10);
-        if (Number.isNaN(threshold) || threshold < 0 || threshold > 100) {
-          console.error(
-            `flakefinder: --threshold must be an integer 0-100 (got "${opts.threshold}")`,
-          );
+        const n = flagInt('report --threshold', opts.threshold, 0, 100);
+        if (n === null) {
           exitCode = 2;
           return;
         }
+        threshold = n;
       }
+      const cfg = resolveCfg(g);
+      const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
       if (opts.format === 'json') {
         console.log(renderJson(verdicts, cfg));
         return;
