@@ -195,11 +195,11 @@ describe('exclusionArgs', () => {
       entry('c', 'plain'),
     ]);
     expect(args[0]).toBe('-t');
-    expect(args[1]).toBe('^(?!(?:.* )?(?:does \\(x\\)|plain)$)');
+    expect(args[1]).toBe('^(?!(?:.* )?(?:does \\(x\\)|plain)\\s*$)');
   });
   it('mocha: --grep with the same construction', () => {
     const args = exclusionArgs('mocha', [entry('a', 'one')]);
-    expect(args).toEqual(['--grep', '^(?!(?:.* )?(?:one)$)']);
+    expect(args).toEqual(['--grep', '^(?!(?:.* )?(?:one)\\s*$)']);
   });
   it('jest/mocha: excludes the quarantined title only, not names that merely contain it (R5 bug 7)', () => {
     const re = new RegExp(exclusionArgs('jest', [entry('a', 'login')])[1]!);
@@ -209,6 +209,12 @@ describe('exclusionArgs', () => {
     expect(re.test('login ok works')).toBe(true); // kept
     expect(re.test('relogin')).toBe(true); // kept
     expect(re.test('ui relogin')).toBe(true); // kept
+  });
+  it('jest/mocha exclusion: vitest " > " names and trailing spaces (QA RUN-1)', () => {
+    const re = new RegExp(exclusionArgs('jest', [entry('a', 'suite V > flaky')])[1]!);
+    expect(re.test('suite V flaky')).toBe(false); // excluded
+    expect(re.test('suite V flaky ')).toBe(false); // excluded despite trailing space
+    expect(re.test('suite V other')).toBe(true);
   });
   it('go and generic: no exclusion support', () => {
     expect(exclusionArgs('go', [entry('a')])).toEqual([]);

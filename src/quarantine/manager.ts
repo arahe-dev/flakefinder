@@ -10,6 +10,7 @@ import {
   writeSync,
 } from 'node:fs';
 import path from 'node:path';
+import { titleAlternation } from '../runner/adapters.js';
 import type { QuarantineEntry, RunnerKind, TestVerdict } from '../types.js';
 
 interface QuarantineFile {
@@ -204,10 +205,6 @@ export class QuarantineManager {
   }
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /** Files that mark a pytest rootdir candidate / project root: stop looking upward there. */
 const ROOT_MARKERS = ['pytest.ini', 'pyproject.toml', 'tox.ini', 'setup.cfg', 'setup.py', '.git'];
 
@@ -287,9 +284,8 @@ export function exclusionArgs(
       // space-delimited FINAL segment — the same anchoring adapters.ts uses
       // for targeted re-runs — so quarantining "login" excludes "login" and
       // "ui login", but not "login ok works" or "relogin".
-      const names = [...new Set(entries.map((e) => escapeRegExp(e.name)))];
       const flag = runner === 'jest' ? '-t' : '--grep';
-      return [flag, `^(?!(?:.* )?(?:${names.join('|')})$)`];
+      return [flag, `^(?!(?:.* )?(?:${titleAlternation(entries.map((e) => e.name))})\\s*$)`];
     }
     // go / generic: no per-test exclusion — callers must warn
     default:
