@@ -113,4 +113,17 @@ describe('QA probes: engine edge cases', () => {
     expect(mk(29).classification).not.toBe('gone'); // first run is the 30th-most-recent → inside window
     expect(mk(30).classification).toBe('gone'); // pushed out (absent from the last 30 runs)
   });
+
+  it('gone counts RUNS, not records: one run with many report files/attempts is one run (R5 bug 8)', () => {
+    const target = makeTestId('s.ts', 't');
+    const runs: RunRecord[] = [run('pass', { runId: 'first' })];
+    // a single later run that ingested 40 report files and retried twice
+    for (let i = 0; i < 40; i++) {
+      const rec = run('pass', { name: `filler${i}`, suite: 'f.ts', runId: 'big' });
+      runs.push(rec, { ...rec, attempt: 2 }, { ...rec, attempt: 3 });
+    }
+    const t = classifyAll(runs, cfg).find((x) => x.testId === target)!;
+    expect(t.classification).not.toBe('gone'); // only ONE run has happened since
+    expect(t.tags).not.toContain('long-unseen');
+  });
 });

@@ -234,7 +234,12 @@ export function classifyAll(runs: RunRecord[], cfg: ResolvedConfig): TestVerdict
   if (runs.length === 0) return [];
 
   const sorted = sortRuns(runs);
-  const recentRunIds = new Set(sorted.slice(-GONE_AFTER_RUNS).map((r) => r.runId));
+  // "last 30 RUNS", not records: one run can carry many records (one per
+  // report file, one per retry attempt). sortRuns keeps each runId's records
+  // contiguous, so collapsing adjacent duplicates yields runs in order.
+  const runOrder: string[] = [];
+  for (const r of sorted) if (runOrder[runOrder.length - 1] !== r.runId) runOrder.push(r.runId);
+  const recentRunIds = new Set(runOrder.slice(-GONE_AFTER_RUNS));
   const histories = buildHistories(sorted);
 
   const verdicts: TestVerdict[] = histories.map((h) => {
