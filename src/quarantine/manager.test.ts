@@ -182,6 +182,25 @@ describe('QuarantineManager', () => {
     expect(readdirSync(path.dirname(file))).toEqual(['flakefinder.quarantine.json']);
   });
 
+  it('invalid entries are rejected with a precise message (QA CLI-21)', () => {
+    const file = tmpFile();
+    writeFileSync(file, JSON.stringify({ version: 1, entries: [null] }), 'utf8');
+    expect(() => new QuarantineManager(file)).toThrow('entry #1 is not an object');
+    writeFileSync(file, JSON.stringify({ version: 1, entries: [{ testId: 'a' }] }), 'utf8');
+    expect(() => new QuarantineManager(file)).toThrow('entry #1 has no string "suite"');
+    writeFileSync(file, '[]', 'utf8');
+    expect(() => new QuarantineManager(file)).toThrow('expected a JSON object');
+  });
+
+  it('unknown top-level fields survive a save (QA CLI-21)', () => {
+    const file = tmpFile();
+    writeFileSync(file, JSON.stringify({ version: 1, owner: 'team-x', entries: [] }), 'utf8');
+    const qm = new QuarantineManager(file);
+    qm.add(entry('a'));
+    qm.save();
+    expect(JSON.parse(readFileSync(file, 'utf8')).owner).toBe('team-x');
+  });
+
   it('corrupt file throws with the path', () => {
     const file = tmpFile();
     writeFileSync(file, '{ nope', 'utf8');

@@ -16,6 +16,8 @@ import type { QuarantineEntry, RunnerKind, TestVerdict } from '../types.js';
 interface QuarantineFile {
   version: 1;
   entries: QuarantineEntry[];
+  /** Unknown top-level fields are preserved on save. */
+  [key: string]: unknown;
 }
 
 const EMPTY: QuarantineFile = { version: 1, entries: [] };
@@ -125,9 +127,24 @@ export class QuarantineManager {
   private load(): QuarantineFile {
     if (!existsSync(this.filePath)) return { ...EMPTY, entries: [] };
     try {
-      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as QuarantineFile;
-      if (!Array.isArray(parsed.entries)) throw new Error('missing "entries" array');
-      return { version: 1, entries: parsed.entries };
+      const parsed: unknown = JSON.parse(readFileSync(this.filePath, 'utf8'));
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('expected a JSON object');
+      }
+      const obj = parsed as Record<string, unknown>;
+      if (!Array.isArray(obj.entries)) throw new Error('missing "entries" array');
+      obj.entries.forEach((e, i) => {
+        if (typeof e !== 'object' || e === null || Array.isArray(e)) {
+          throw new Error(`entry #${i + 1} is not an object`);
+        }
+        for (const field of ['testId', 'suite', 'name'] as const) {
+          const value = (e as Record<string, unknown>)[field];
+          if (typeof value !== 'string' || value === '') {
+            throw new Error(`entry #${i + 1} has no string "${field}"`);
+          }
+        }
+      });
+      return { ...obj, version: 1, entries: obj.entries as QuarantineEntry[] };
     } catch (err) {
       throw new Error(`invalid quarantine file ${this.filePath}: ${(err as Error).message}`);
     }
