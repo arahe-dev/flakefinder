@@ -127,3 +127,63 @@ describe('QA probes: engine edge cases', () => {
     expect(t.tags).not.toContain('long-unseen');
   });
 });
+
+// Merged from the former scratch-repro.test.ts (QA round 4 regression probes).
+function attemptRecord(
+  runId: string,
+  attempt: number,
+  sha: string,
+  status: 'pass' | 'fail',
+  timestamp: string,
+  name: string,
+): RunRecord {
+  return {
+    runId,
+    timestamp,
+    source: 'report',
+    parsedFrom: 'jest',
+    attempt,
+    commitSha: sha,
+    results: [{ testId: makeTestId('s.js', name), suite: 's.js', name, status, durationMs: 10 }],
+  };
+}
+
+describe('retry rescue with identical timestamps', () => {
+  it('distinct timestamps → rescue detected (control)', () => {
+    const runs = [
+      attemptRecord('R', 1, 'shaA', 'fail', '2026-10-26T10:00:00.000Z', 't'),
+      attemptRecord('R', 2, 'shaA', 'pass', '2026-10-26T10:00:01.000Z', 't'),
+    ];
+    const v = classifyAll(runs, cfg).find((x) => x.name === 't')!;
+    expect(v.retryRescues).toBe(1);
+  });
+
+  it('IDENTICAL timestamps → rescue still detected', () => {
+    const runs = [
+      attemptRecord('R', 1, 'shaA', 'fail', '2026-10-26T10:00:00.000Z', 't'),
+      attemptRecord('R', 2, 'shaA', 'pass', '2026-10-26T10:00:00.000Z', 't'),
+    ];
+    const v = classifyAll(runs, cfg).find((x) => x.name === 't')!;
+    expect(v.retryRescues).toBe(1);
+  });
+});
+
+describe('runId-grouped ordering (QA round 4 regression)', () => {
+  it('retry pairs survive identical timestamps interleaved with other runIds', () => {
+    const T = '2026-10-26T10:00:00.000Z';
+    const runs = [
+      attemptRecord('R', 1, 'shaA', 'fail', T, 't'),
+      attemptRecord('R2', 1, 'shaB', 'fail', T, 't'),
+      attemptRecord('R3', 1, 'shaC', 'pass', T, 't'),
+      attemptRecord('R4', 1, 'shaD', 'pass', T, 't'),
+      attemptRecord('R', 2, 'shaA', 'pass', T, 't'),
+    ];
+    const v = classifyAll(runs, cfg).find((x) => x.name === 't')!;
+    expect(v.retryRescues).toBe(1);
+    expect(v.sameShaFlips).toBe(1);
+    expect(v.classification).toBe('flaky-confirmed');
+    // 50 (flip) + 40 (rescue) + 16 (2 direction changes × 8, fresh) → capped 100
+    expect(v.directionChanges).toBe(2);
+    expect(v.flakeScore).toBe(100);
+  });
+});
