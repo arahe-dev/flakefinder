@@ -25,16 +25,32 @@
  * unless the parent itself failed while none of its descendants did (t.Error after t.Run, a
  * panic in the parent body); that failure exists nowhere else, so the parent row is kept.
  *
- * Package-level events (no Test) are ignored. Lines that fail JSON.parse produce warnings —
- * at most 5 individually, then a single '…and N more' summary.
+ * Package-level events (no Test) produce no rows, except that a package which FAILED without
+ * any test result (build error, init panic) becomes one synthetic `(package)` error.
+ *
+ * Build failures: go 1.24+ emits `build-output`/`build-fail` events keyed by `ImportPath`
+ * (no `Package`); each build-fail becomes one warning with the compiler output, and that
+ * output is folded into the `(package)` error of the package whose `fail` event names it in
+ * `FailedBuild`. Older Go prints build errors as plain text on stderr; when stderr is merged
+ * into the file those non-JSON lines become one summary warning (with an excerpt).
+ *
+ * Lines that look like JSON (`{…`) but fail JSON.parse produce warnings — at most 5
+ * individually, then a single '…and N more' summary.
+ *
+ * Sniff: the first 50 non-empty lines are scanned for an event object carrying `Action` plus
+ * `Package` or `ImportPath`, so leading stderr text or build events do not hide the format.
  *
  * Never throws.
  */
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
-import { errorMessage, firstNonEmptyLine, isObj, stripAnsi, stripBom } from './internal.js';
+import { errorMessage, isObj, stripAnsi, stripBom } from './internal.js';
 
 const MAX_MALFORMED_DETAILS = 5;
+/** Non-empty lines sniff inspects before giving up. */
+const SNIFF_MAX_LINES = 50;
+/** Lines of compiler/stderr output quoted in a warning. */
+const WARNING_EXCERPT_LINES = 5;
 const MESSAGE_MAX_CHARS = 2000;
 
 /** How many flaky test names one -count warning lists before summarising. */
@@ -52,6 +68,13 @@ interface TestAccumulator {
   test: string;
   /** Chronological runs; the last one is the run currently receiving events. */
   runs: RunState[];
+}
+
+/** First few non-blank lines joined with ' | ' — compact enough for a one-line warning. */
+function excerptOf(lines: string[]): string {
+  const kept = lines.map((l) => stripAnsi(l).trim()).filter((l) => l !== '');
+  const head = kept.slice(0, WARNING_EXCERPT_LINES).join(' | ');
+  return kept.length > WARNING_EXCERPT_LINES ? `${head} | …` : head;
 }
 
 function isFailFamily(status: TestStatus): boolean {
@@ -86,21 +109,33 @@ export const goTestParser: ReportParser = {
   name: 'go',
 
   sniff(content: string): boolean {
-    const first = firstNonEmptyLine(stripBom(content));
-    if (first === null) return false;
-    try {
-      const ev: unknown = JSON.parse(first);
-      return isObj(ev) && 'Action' in ev && 'Package' in ev;
-    } catch {
-      return false;
+    let seen = 0;
+    for (const raw of stripBom(content).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (line === '') continue;
+      if (++seen > SNIFF_MAX_LINES) return false;
+      if (!line.startsWith('{')) continue; // stderr text merged ahead of the stream
+      try {
+        const ev: unknown = JSON.parse(line);
+        if (isObj(ev) && 'Action' in ev && ('Package' in ev || 'ImportPath' in ev)) return true;
+      } catch {
+        // keep scanning
+      }
     }
+    return false;
   },
 
   parse(content: string, sourcePath: string): { results: TestCaseResult[]; warnings: string[] } {
     const results: TestCaseResult[] = [];
     const warnings: string[] = [];
     const tests = new Map<string, TestAccumulator>();
-    const failedPackages = new Map<string, { failed: boolean; outputs: string[] }>();
+    const failedPackages = new Map<
+      string,
+      { failed: boolean; outputs: string[]; failedBuild?: string }
+    >();
+    /** go 1.24+ build events, keyed by ImportPath. */
+    const builds = new Map<string, { failed: boolean; outputs: string[] }>();
+    const strayText: string[] = [];
     let malformed = 0;
 
     const lines = stripBom(content).split(/\r?\n/);
@@ -108,6 +143,11 @@ export const goTestParser: ReportParser = {
       const line = lines[i];
       if (line === undefined || line.trim() === '') continue;
 
+      if (!line.trimStart().startsWith('{')) {
+        // plain text (compiler errors, `# pkg` headers, panics) — stderr merged into the file
+        strayText.push(line.trim());
+        continue;
+      }
       let ev: unknown;
       try {
         ev = JSON.parse(line);
@@ -119,6 +159,15 @@ export const goTestParser: ReportParser = {
         continue;
       }
       if (!isObj(ev)) continue;
+
+      if (ev.Action === 'build-output' || ev.Action === 'build-fail') {
+        const importPath = typeof ev.ImportPath === 'string' ? ev.ImportPath : '(unknown)';
+        const build = builds.get(importPath) ?? { failed: false, outputs: [] };
+        if (ev.Action === 'build-fail') build.failed = true;
+        else if (typeof ev.Output === 'string') build.outputs.push(ev.Output);
+        builds.set(importPath, build);
+        continue;
+      }
 
       const pkg = typeof ev.Package === 'string' ? ev.Package : '';
       const test = typeof ev.Test === 'string' && ev.Test.trim() !== '' ? ev.Test : null;
@@ -134,6 +183,7 @@ export const goTestParser: ReportParser = {
         if (action === 'fail') {
           const entry = failedPackages.get(pkg) ?? { failed: false, outputs: [] };
           entry.failed = true;
+          if (typeof ev.FailedBuild === 'string') entry.failedBuild = ev.FailedBuild;
           failedPackages.set(pkg, entry);
         } else if (action === 'output' && typeof out === 'string') {
           const entry = failedPackages.get(pkg) ?? { failed: false, outputs: [] };
@@ -262,25 +312,43 @@ export const goTestParser: ReportParser = {
       );
     }
 
+    // go 1.24+ build failures: one warning each, quoting the compiler output.
+    for (const [importPath, build] of builds) {
+      if (!build.failed) continue;
+      const excerpt = excerptOf(build.outputs.join('').split(/\r?\n/));
+      warnings.push(
+        `go: ${sourcePath}: build failed for ${importPath}${excerpt ? `: ${excerpt}` : ''}`,
+      );
+    }
+
     const pkgsWithTests = new Set([...tests.values()].map((a) => a.pkg));
     for (const [pkg, entry] of failedPackages) {
       if (!entry.failed || pkgsWithTests.has(pkg)) continue; // per-test results already reflect it
-      const output = messageFromOutputs(entry.outputs);
+      const build = entry.failedBuild !== undefined ? builds.get(entry.failedBuild) : undefined;
+      const output = messageFromOutputs([...(build?.outputs ?? []), ...entry.outputs]);
+      const reason =
+        build !== undefined
+          ? 'package failed to build'
+          : 'package failed before any test completed (build or init crash?)';
       results.push({
         testId: makeTestId(pkg, '(package)'),
         suite: pkg,
         name: '(package)',
         status: 'error',
         durationMs: null,
-        message: `package failed before any test completed (build or init crash?)${
-          output
-            ? `
-${output}`
-            : ''
-        }`,
+        message: output !== undefined ? `${reason}\n${output}` : reason,
       });
+      // a build-fail warning above already reported this package
+      if (build === undefined || !build.failed) {
+        warnings.push(
+          `go: ${sourcePath}: package ${pkg} failed with no test results — synthesized as error`,
+        );
+      }
+    }
+
+    if (strayText.length > 0) {
       warnings.push(
-        `go: ${sourcePath}: package ${pkg} failed with no test results — synthesized as error`,
+        `go: ${sourcePath}: ${strayText.length} non-JSON line(s) ignored (stderr merged into the stream? build errors?): ${excerptOf(strayText)}`,
       );
     }
     return { results, warnings };

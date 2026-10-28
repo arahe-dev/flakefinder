@@ -22,6 +22,9 @@ describe('detectParser', () => {
     ['mocha.json', 'mocha'],
     ['go-test.jsonl', 'go'],
     ['go-test-old.jsonl', 'go'],
+    ['go-count2.jsonl', 'go'],
+    ['go124-build-fail.jsonl', 'go'],
+    ['go-stderr-merged.jsonl', 'go'],
   ];
 
   for (const [fixture, expected] of cases) {

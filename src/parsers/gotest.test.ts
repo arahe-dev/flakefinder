@@ -124,7 +124,8 @@ describe('goTestParser', () => {
   });
 
   it('reports at most 5 malformed lines then a summary', () => {
-    const lines = Array.from({ length: 7 }, (_, i) => `garbage line ${i} {{`);
+    // JSON-looking lines that fail to parse (plain-text lines are summarised separately, r5 #4)
+    const lines = Array.from({ length: 7 }, (_, i) => `{garbage line ${i} {{`);
     lines.push('{"Action":"pass","Package":"p","Test":"Ok","Elapsed":0.001}');
     const { results, warnings } = goTestParser.parse(lines.join('\n'), 'inline');
     expect(results).toHaveLength(1);
@@ -304,5 +305,55 @@ describe('go subtest parents (r5 #3)', () => {
       'TestB/x:pass',
       'TestBravo:pass',
     ]);
+  });
+});
+
+// go124-build-fail.jsonl: REAL `go test -json -count=2 ./...` from go 1.24.4 —
+// the stream OPENS with build-output/build-fail events (ImportPath, no Package)
+// for a package that does not compile.
+// go-stderr-merged.jsonl: REAL go 1.23.4 `go test -json ./broken 2>&1` — the
+// compiler's stderr lands BEFORE the first JSON event.
+describe('go sniff + build failures (r5 #4)', () => {
+  it('sniffs streams that open with build events or stray stderr lines', () => {
+    expect(goTestParser.sniff(load('go124-build-fail.jsonl'))).toBe(true);
+    expect(goTestParser.sniff(load('go-stderr-merged.jsonl'))).toBe(true);
+    expect(
+      goTestParser.sniff('{"ImportPath":"p [p.test]","Action":"build-output","Output":"# p\\n"}'),
+    ).toBe(true);
+    // still rejects non-go content and JSON without the event keys
+    expect(goTestParser.sniff('# just a comment\nnot json\n')).toBe(false);
+    expect(goTestParser.sniff('{"Output":"x"}\n{"Action":"pass"}')).toBe(false);
+  });
+
+  it('surfaces go 1.24 build-fail events as a warning and in the (package) error', () => {
+    const { results, warnings } = goTestParser.parse(
+      load('go124-build-fail.jsonl'),
+      'go124-build-fail.jsonl',
+    );
+    const pkg = results.find((r) => r.suite === 'example.com/ffdemo/broken')!;
+    expect(pkg).toMatchObject({ name: '(package)', status: 'error' });
+    expect(pkg.message).toContain('undefined: undefinedThing');
+    const build = warnings.filter((w) => w.includes('build failed'));
+    expect(build).toHaveLength(1);
+    expect(build[0]).toContain('example.com/ffdemo/broken');
+    expect(build[0]).toContain('undefined: undefinedThing');
+    // the build failure is reported once, not again as a generic "(package)" warning
+    expect(warnings.some((w) => w.includes('failed with no test results'))).toBe(false);
+    expect(warnings.some((w) => w.includes('invalid JSON'))).toBe(false);
+    // the compiling package's tests still parse
+    expect(results.find((r) => r.name === 'TestStable')).toMatchObject({ status: 'pass' });
+  });
+
+  it('turns leading stderr text into one warning instead of invalid-JSON noise', () => {
+    const { results, warnings } = goTestParser.parse(
+      load('go-stderr-merged.jsonl'),
+      'go-stderr-merged.jsonl',
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ name: '(package)', status: 'error' });
+    expect(warnings.some((w) => w.includes('invalid JSON'))).toBe(false);
+    const text = warnings.find((w) => w.includes('non-JSON'));
+    expect(text).toContain('2 non-JSON line(s)');
+    expect(text).toContain('undefined: undefinedThing');
   });
 });

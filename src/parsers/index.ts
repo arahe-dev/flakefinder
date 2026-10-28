@@ -5,7 +5,8 @@
  * 1. junit — trimmed content starts with '<' and contains '<testsuit'
  * 2. jest  — whole document parses as a JSON object with testResults[].assertionResults
  * 3. mocha — whole document parses as JSON with (results/tests + stats) or (passes + failures)
- * 4. go    — first non-empty line parses as JSON carrying both Action and Package keys
+ * 4. go    — one of the first 50 non-empty lines is a JSON event with Action plus Package or
+ *            ImportPath (leading stderr text / go 1.24 build events are tolerated)
  * 5. otherwise null. Never throws.
  */
 import type { ReportParser } from '../types.js';
