@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  anchorConfigPaths,
   CONFIG_FILE_NAME,
   defaultConfig,
   detectRunner,
@@ -70,6 +71,17 @@ describe('stripJsonComments', () => {
   it('drops trailing commas', () => {
     expect(JSON.parse(stripJsonComments('{"a": [1, 2,],}'))).toEqual({ a: [1, 2] });
   });
+  it('drops trailing commas separated by whitespace and comments', () => {
+    expect(JSON.parse(stripJsonComments('{"a": [1, 2, // last\n ], /* end */\n}'))).toEqual({
+      a: [1, 2],
+    });
+  });
+  it('does not rewrite ",}" / ",]" inside string literals (R5 #5)', () => {
+    const src = '{"reports": ["r-{a,}.xml", "x[1,]", "esc\\",}"],}';
+    expect(JSON.parse(stripJsonComments(src))).toEqual({
+      reports: ['r-{a,}.xml', 'x[1,]', 'esc",}'],
+    });
+  });
 });
 
 describe('loadConfig discovery', () => {
@@ -101,6 +113,39 @@ describe('loadConfig discovery', () => {
     expect(loadConfig(dir).config.liveRetries).toBe(4);
     writeFileSync(file, '{ broken', 'utf8');
     expect(() => loadConfig(dir)).toThrow(dir);
+  });
+});
+
+describe('config-relative paths (R5 #6)', () => {
+  it('storeDir/quarantineFile from a parent-dir config resolve against the CONFIG dir', () => {
+    const root = tmpDir();
+    writeFileSync(
+      path.join(root, CONFIG_FILE_NAME),
+      '{"storeDir": ".ff", "quarantineFile": "q/quarantine.json", "reports": ["junit.xml"]}',
+      'utf8',
+    );
+    const deep = path.join(root, 'packages', 'a');
+    mkdirSync(deep, { recursive: true });
+    const cfg = resolveConfig(loadConfig(deep).config);
+    expect(cfg.storeDir).toBe(path.join(root, '.ff'));
+    expect(cfg.quarantineFile).toBe(path.join(root, 'q', 'quarantine.json'));
+    // reports globs stay relative to the working directory
+    expect(cfg.reports).toEqual(['junit.xml']);
+    // callers' path.resolve(cwd, …) is a no-op on the anchored values
+    expect(path.resolve(deep, cfg.storeDir)).toBe(path.join(root, '.ff'));
+  });
+  it('a config in cwd resolves exactly as before; defaults stay cwd-relative', () => {
+    const dir = tmpDir();
+    writeFileSync(path.join(dir, CONFIG_FILE_NAME), '{"storeDir": "hist"}', 'utf8');
+    const cfg = resolveConfig(loadConfig(dir).config);
+    expect(path.resolve(dir, cfg.storeDir)).toBe(path.join(dir, 'hist'));
+    expect(cfg.quarantineFile).toBe('flakefinder.quarantine.json');
+  });
+  it('absolute and invalid values are left for validation', () => {
+    const abs = path.resolve('/abs/store');
+    expect(anchorConfigPaths({ storeDir: abs }, '/x').storeDir).toBe(abs);
+    const bad = anchorConfigPaths({ storeDir: 5 as unknown as string }, '/x');
+    expect(() => resolveConfig(bad)).toThrow('storeDir');
   });
 });
 

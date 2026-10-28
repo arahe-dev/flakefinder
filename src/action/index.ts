@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import * as artifact from '@actions/artifact';
 import * as cache from '@actions/cache';
@@ -6,126 +6,16 @@ import * as core from '@actions/core';
 import { loadConfig, resolveConfig } from '../config.js';
 import { renderDashboard } from '../report/html.js';
 import { renderJson } from '../report/json.js';
-import { buildPrComment, PR_COMMENT_MARKER } from '../report/markdown.js';
+import { buildPrComment } from '../report/markdown.js';
 import { snapshotPath } from '../store/history-store.js';
-import type { TestVerdict } from '../types.js';
 import { FLAKEFINDER_VERSION } from '../types.js';
-import { redact } from '../util/redact.js';
+import { cacheKeys, recordBaseline, resolveBaseline } from './baseline.js';
 import { computeNewFlakes } from './diff.js';
+import { githubEnv, upsertPrComment } from './github.js';
+import { cacheUsable, restoreHistory, saveHistory } from './history-cache.js';
 import { ingestReports } from './ingest.js';
-
-/**
- * GitHub context from the standard environment (no @actions/github — pulling
- * octokit into the bundle costs megabytes for three REST calls we make with
- * plain fetch). Env docs: https://docs.github.com/actions/learn-github-actions/variables
- */
-export function githubEnv(): {
-  owner: string;
-  repo: string;
-  sha: string;
-  ref: string;
-  runId: string;
-  isPr: boolean;
-  prNumber: number | null;
-  apiUrl: string;
-} {
-  const [owner = '', repo = ''] = (process.env.GITHUB_REPOSITORY ?? '/').split('/');
-  const sha = process.env.GITHUB_SHA ?? '';
-  const ref = process.env.GITHUB_REF ?? '';
-  const runId = process.env.GITHUB_RUN_ID ?? '';
-  const apiUrl = process.env.GITHUB_API_URL ?? 'https://api.github.com';
-  let isPr = false;
-  let prNumber: number | null = null;
-  const eventPath = process.env.GITHUB_EVENT_PATH;
-  if (eventPath && existsSync(eventPath)) {
-    try {
-      const payload = JSON.parse(readFileSync(eventPath, 'utf8')) as {
-        pull_request?: { number?: number };
-      };
-      if (payload.pull_request?.number != null) {
-        isPr = true;
-        prNumber = payload.pull_request.number;
-      }
-    } catch {
-      // malformed event payload → treat as non-PR
-    }
-  }
-  return { owner, repo, sha, ref, runId, isPr, prNumber, apiUrl };
-}
-
-interface GhComment {
-  id: number;
-  body?: string | null;
-}
-
-async function ghRest(
-  apiUrl: string,
-  token: string,
-  method: 'GET' | 'POST' | 'PATCH',
-  pathName: string,
-  body?: unknown,
-): Promise<{ ok: boolean; status: number; json: unknown; nextUrl: string | null }> {
-  const res = await fetch(`${apiUrl}${pathName}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Content-Type': 'application/json',
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  let json: unknown = null;
-  try {
-    json = await res.json();
-  } catch {
-    // 204s and empty bodies
-  }
-  const nextUrl = res.headers.get('link')?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
-  return { ok: res.ok, status: res.status, json, nextUrl };
-}
-
-/** Upsert the flakefinder PR comment (plain REST — marker-scoped, single comment). */
-export async function upsertPrComment(
-  token: string,
-  body: string,
-  ctx: ReturnType<typeof githubEnv>,
-): Promise<void> {
-  if (!ctx.isPr || ctx.prNumber === null) return;
-  // collect all comment pages
-  const comments: GhComment[] = [];
-  let url: string | null =
-    `${ctx.apiUrl}/repos/${ctx.owner}/${ctx.repo}/issues/${ctx.prNumber}/comments?per_page=100`;
-  while (url) {
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
-    });
-    if (!res.ok) {
-      core.warning(`listing PR comments failed: HTTP ${res.status}`);
-      return;
-    }
-    comments.push(...((await res.json()) as GhComment[]));
-    url = res.headers.get('link')?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
-  }
-  const existing = comments.find((c) => (c.body ?? '').includes(PR_COMMENT_MARKER));
-  if (existing) {
-    await ghRest(
-      ctx.apiUrl,
-      token,
-      'PATCH',
-      `/repos/${ctx.owner}/${ctx.repo}/issues/comments/${existing.id}`,
-      { body },
-    );
-  } else {
-    await ghRest(
-      ctx.apiUrl,
-      token,
-      'POST',
-      `/repos/${ctx.owner}/${ctx.repo}/issues/${ctx.prNumber}/comments`,
-      { body },
-    );
-  }
-}
+import { type ActionInputs, readInputs } from './inputs.js';
+import { jobSummaryHtml, newFlakesFailure } from './output.js';
 
 async function expandGlobs(patterns: string[], cwd: string): Promise<string[]> {
   const globModule = await import('@actions/glob');
@@ -135,41 +25,44 @@ async function expandGlobs(patterns: string[], cwd: string): Promise<string[]> {
 }
 
 async function actionMain(): Promise<void> {
-  const workingDirectory = core.getInput('working-directory') || '.';
-  const cwd = path.resolve(process.cwd(), workingDirectory);
+  // validate every input before doing anything (no half-done runs)
+  let inputs: ActionInputs;
+  try {
+    inputs = readInputs((name) => core.getInput(name), process.cwd());
+  } catch (err) {
+    core.setFailed(`flakefinder: ${(err as Error).message}`);
+    return;
+  }
+  const cwd = inputs.cwd;
   process.chdir(cwd);
   const gh = githubEnv();
 
   const { config } = loadConfig(cwd);
-  const reportsInput = core.getInput('reports');
-  const historyMaxRuns = Number.parseInt(core.getInput('history-max-runs') || '300', 10);
   const cfg = resolveConfig(
     config,
-    reportsInput
-      ? { reports: reportsInput.split(',').map((s) => s.trim()), maxRuns: historyMaxRuns }
-      : { maxRuns: historyMaxRuns },
+    inputs.reports
+      ? { reports: inputs.reports, maxRuns: inputs.historyMaxRuns }
+      : { maxRuns: inputs.historyMaxRuns },
   );
   const storeDir = path.resolve(cwd, cfg.storeDir);
 
-  // 1. restore history cache (best-effort — miss on first run is normal)
-  const primaryKey = `flakefinder-history-${gh.sha}`;
-  const restoreKeys = ['flakefinder-history-'];
-  try {
-    await cache.restoreCache([storeDir], primaryKey, restoreKeys);
-  } catch (err) {
-    core.warning(`history cache restore failed (continuing): ${(err as Error).message}`);
-  }
+  // 1. restore history cache (best-effort — miss on first run is normal).
+  // Saved per run attempt + job, restored by prefix: see baseline.ts.
+  const { saveKey, restoreKeys } = cacheKeys(gh, {
+    workingDirectory: inputs.workingDirectoryRel,
+    historyKey: inputs.historyKey,
+  });
+  const useCache = cacheUsable(cache, core);
+  if (useCache) await restoreHistory(cache, core, storeDir, saveKey, restoreKeys);
 
-  // 2. read the previous verdict snapshot BEFORE ingesting today's runs
-  const snap = snapshotPath(storeDir);
-  let previous: TestVerdict[] | null = null;
-  if (existsSync(snap)) {
-    try {
-      previous = JSON.parse(readFileSync(snap, 'utf8')) as TestVerdict[];
-    } catch {
-      core.warning('previous verdict snapshot unreadable — treating this as a first run');
-    }
+  // 2. pick the "previous verdicts" baseline BEFORE ingesting today's runs —
+  // never this run's own earlier attempt (re-runs must not bypass the gate)
+  const baseline = resolveBaseline(storeDir, gh.runId);
+  for (const w of baseline.warnings) core.warning(w);
+  if (baseline.source === 'earlier-attempt') {
+    core.info('re-run detected: comparing against the baseline of this run’s first attempt');
   }
+  const previous = baseline.previous;
 
   // 3. ingest report files
   const patterns = cfg.reports;
@@ -196,14 +89,14 @@ async function actionMain(): Promise<void> {
 
   // 4. new-flake diff, fresh snapshot
   const newFlakes = computeNewFlakes(verdicts, previous);
-  writeFileSync(snap, JSON.stringify(verdicts), 'utf8');
+  // the store dir only exists once something was appended — a first run whose
+  // matched reports all failed to parse must not die with ENOENT here
+  mkdirSync(storeDir, { recursive: true });
+  writeFileSync(snapshotPath(storeDir), JSON.stringify(verdicts), 'utf8');
+  recordBaseline(storeDir, gh.runId, previous);
 
-  // 5. save history cache (immutable keys: only the first save on a sha sticks)
-  try {
-    await cache.saveCache([storeDir], primaryKey);
-  } catch {
-    // races on the same sha or cache-not-available are expected; history is restored via restore-keys
-  }
+  // 5. save history cache under this attempt's own key
+  if (useCache) await saveHistory(cache, core, storeDir, saveKey);
 
   // 6. outputs + summary
   const flakyCount = verdicts.filter((v) => v.classification.startsWith('flaky-')).length;
@@ -217,41 +110,12 @@ async function actionMain(): Promise<void> {
   writeFileSync(reportJsonPath, renderJson(verdicts, cfg), 'utf8');
   core.setOutput('report-json', reportJsonPath);
 
-  await core.summary
-    .addHeading('flakefinder')
-    .addRaw(
-      `**${flakyCount} flaky** (${newFlakes.length} new) · ${failingCount} failing · ${verdicts.length} tracked\n`,
-    )
-    .addTable([
-      [
-        { data: 'Test', header: true },
-        { data: 'Class', header: true },
-        { data: 'Score', header: true },
-      ],
-      ...verdicts
-        .filter((v) => v.classification.startsWith('flaky-'))
-        .sort((a, b) => b.flakeScore - a.flakeScore)
-        .slice(0, 20)
-        .map((v) => [
-          `${redact(v.suite)} :: ${redact(v.name)}`,
-          v.classification,
-          String(v.flakeScore),
-        ]),
-    ])
-    .write();
+  await core.summary.addRaw(jobSummaryHtml(verdicts, newFlakes.length, failingCount)).write();
 
-  // 7. PR comment
-  if (core.getBooleanInput('comment') && gh.isPr) {
-    const token = core.getInput('github-token');
-    try {
-      await upsertPrComment(token, buildPrComment(verdicts, previous), gh);
-    } catch (err) {
-      core.warning(`PR comment failed (check token permissions): ${(err as Error).message}`);
-    }
-  }
-
-  // 8. dashboard artifact
-  if (core.getBooleanInput('upload-dashboard')) {
+  // 7. dashboard artifact — BEFORE the comment, which only mentions it if
+  // the upload actually happened
+  let dashboardArtifact: string | undefined;
+  if (inputs.uploadDashboard) {
     try {
       const runs = outcome.store
         .runs()
@@ -275,17 +139,30 @@ async function actionMain(): Promise<void> {
       await client.uploadArtifact('flakefinder-dashboard', [htmlPath], cwd, {
         retentionDays: 30,
       });
+      dashboardArtifact = 'flakefinder-dashboard';
     } catch (err) {
       core.warning(`dashboard upload failed: ${(err as Error).message}`);
     }
   }
 
+  // 8. PR comment
+  if (inputs.comment && gh.isPr) {
+    const token = inputs.githubToken;
+    try {
+      const result = await upsertPrComment(
+        token,
+        buildPrComment(verdicts, previous, { dashboardArtifact }),
+        gh,
+      );
+      core.info(`PR comment: ${result}`);
+    } catch (err) {
+      core.warning(`PR comment failed (check token permissions): ${(err as Error).message}`);
+    }
+  }
+
   // 9. fail gate
-  if (core.getBooleanInput('fail-on-new-flakes') && newFlakes.length > 0) {
-    const names = newFlakes
-      .map((v) => `  • ${v.suite} :: ${v.name} (score ${v.flakeScore})`)
-      .join('\n');
-    core.setFailed(`flakefinder: ${newFlakes.length} NEW flaky test(s):\n${names}`);
+  if (inputs.failOnNewFlakes && newFlakes.length > 0) {
+    core.setFailed(newFlakesFailure(newFlakes));
   }
 }
 

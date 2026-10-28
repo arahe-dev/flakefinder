@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Command } from 'commander';
 import { computeNewFlakes } from '../action/diff.js';
 import {
+  anchorConfigPaths,
   CONFIG_FILE_NAME,
   detectRunner,
   loadConfig,
@@ -20,6 +21,7 @@ import { renderDashboard } from '../report/html.js';
 import { renderJson } from '../report/json.js';
 import { buildPrComment, renderMarkdown } from '../report/markdown.js';
 import { renderTerminal } from '../report/terminal.js';
+import { escapeControlChars } from '../report/text.js';
 import { runLive } from '../runner/wrap.js';
 import { HistoryStore, snapshotPath } from '../store/history-store.js';
 import type {
@@ -31,6 +33,7 @@ import type {
 } from '../types.js';
 import { FLAKEFINDER_VERSION } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
+import { redact } from '../util/redact.js';
 import { parseStrictInt } from '../util/strict-int.js';
 
 interface Globals {
@@ -55,7 +58,10 @@ function resolveCfg(g: Globals, overrides: Partial<FlakefinderConfig> = {}): Res
     } catch (err) {
       throw new Error(`invalid config ${g.config}: ${(err as Error).message}`);
     }
-    return resolveConfig(parsed, overrides);
+    return resolveConfig(
+      anchorConfigPaths(parsed, path.dirname(path.resolve(g.config))),
+      overrides,
+    );
   }
   const { config } = loadConfig(g.cwd);
   return resolveConfig(config, overrides);
@@ -68,6 +74,14 @@ function gitSha(cwd: string): string | undefined {
 
 function storeFor(g: Globals, cfg: ResolvedConfig): HistoryStore {
   return new HistoryStore(path.resolve(g.cwd, cfg.storeDir));
+}
+
+/**
+ * Store problems (unreadable file, corrupt lines, newer format) go to stderr:
+ * otherwise a broken store reads as "no history yet". Call after a read.
+ */
+function printStoreWarnings(store: HistoryStore): void {
+  for (const w of store.warnings) console.warn(`flakefinder: ${w}`);
 }
 
 /**
@@ -371,6 +385,7 @@ export async function main(argv: string[]): Promise<number> {
         used++;
       }
       store.prune(cfg.maxRuns);
+      printStoreWarnings(store);
       console.log(
         `ingested ${total} test result(s) from ${used}/${targets.length} file(s) (${warnings} warning(s)) → ${store.path}`,
       );
@@ -395,7 +410,9 @@ export async function main(argv: string[]): Promise<number> {
         threshold = n;
       }
       const cfg = resolveCfg(g);
-      const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
+      const store = storeFor(g, cfg);
+      const verdicts = classifyAll(store.runs(), cfg);
+      printStoreWarnings(store);
       if (opts.format === 'json') {
         console.log(renderJson(verdicts, cfg));
         return;
@@ -434,6 +451,7 @@ export async function main(argv: string[]): Promise<number> {
       const cfg = resolveCfg(g);
       const store = storeFor(g, cfg);
       const verdicts = classifyAll(store.runs(), cfg);
+      printStoreWarnings(store);
       const runs = store
         .runs()
         .slice(-50)
@@ -607,12 +625,13 @@ export async function main(argv: string[]): Promise<number> {
       }
       store.prune(cfg.maxRuns);
       const verdicts = classifyAll(store.runs(), cfg);
+      printStoreWarnings(store);
 
       console.log(renderTerminal(verdicts, { color: false, flakesOnly: false }));
 
       for (const v of verdicts.filter((x) => x.classification.startsWith('flaky-'))) {
         console.log(
-          `::warning title=flakefinder::${ghEscape(`${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`)}`,
+          `::warning title=flakefinder::${ghEscape(escapeControlChars(`${redact(v.suite)} :: ${redact(v.name)} (${v.classification}, score ${v.flakeScore})`))}`,
         );
       }
 
@@ -631,6 +650,8 @@ export async function main(argv: string[]): Promise<number> {
       }
       // same semantics as the GitHub Action — one implementation (src/action/diff.ts)
       const newFlakes = computeNewFlakes(verdicts, previous);
+      // nothing parsed on a first run → no store dir yet (QA ACT-5 / CLI-7)
+      mkdirSync(path.dirname(snap), { recursive: true });
       writeFileSync(snap, JSON.stringify(verdicts), 'utf8');
 
       // GitLab MR note (D4): activates only on GitLab CI with the user's vars set
@@ -653,7 +674,9 @@ export async function main(argv: string[]): Promise<number> {
       if (opts.failOnNewFlakes && newFlakes.length > 0) {
         console.error(`flakefinder ci: ${newFlakes.length} NEW flake(s):`);
         for (const v of newFlakes)
-          console.error(`  ${v.suite} :: ${v.name} (score ${v.flakeScore})`);
+          console.error(
+            `  ${escapeControlChars(redact(v.suite))} :: ${escapeControlChars(redact(v.name))} (score ${v.flakeScore})`,
+          );
         exitCode = 1;
       }
     });

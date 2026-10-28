@@ -175,3 +175,53 @@ describe('threshold honesty (review round)', () => {
     expect(out).toContain('hidden below score 40');
   });
 });
+
+describe('terminal output escapes control characters (QA ACT-2)', () => {
+  it('names, suites and tags cannot emit raw ESC/CR/LF/C1/bidi characters', () => {
+    const v = verdict({
+      suite: 'S\x1b[2J',
+      name: 'n\n::error::boom\x9b31m\u202Eabc',
+      classification: 'flaky-confirmed',
+      tags: ['slow\x1b]8;;http://evil\x07' as TestVerdict['tags'][number]],
+    });
+    const out = renderTerminal([v], { color: true, flakesOnly: false });
+    // our own colour codes are the only escape sequences left: SGR `ESC[<n>m`
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: asserting on control characters
+    const stripped = out.replace(/\x1b\[[0-9;]*m/g, '');
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: asserting on control characters
+    expect(stripped).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202e]/);
+    expect(out.split('\n').some((l) => l.startsWith('::'))).toBe(false);
+    expect(stripped).toContain('S\\x1b[2J');
+    expect(stripped).toContain('\\x0a::error::boom\\x9b31m\\u202eabc');
+    expect(stripped).toContain('slow\\x1b]8;;http://evil\\x07');
+  });
+});
+
+describe('terminal output is redacted (QA ACT-3)', () => {
+  it('a token in a test name or suite is not printed verbatim', () => {
+    const tok = 'ghp_0123456789abcdefABCDEF0123456789abcd';
+    const out = renderTerminal(
+      [verdict({ name: `uses ${tok}`, suite: 'password=hunter2', classification: 'failing' })],
+      { color: false, flakesOnly: false },
+    );
+    expect(out).not.toContain(tok);
+    expect(out).not.toContain('hunter2');
+    expect(out).toContain('ghp_[REDACTED]');
+  });
+});
+
+describe('terminal truncation keeps surrogate pairs whole (QA ACT-9)', () => {
+  it('truncateMiddle cuts by code point', async () => {
+    const { truncateMiddle } = await import('./terminal.js');
+    const out = truncateMiddle('😀'.repeat(60), 48);
+    expect(Array.from(out).length).toBeLessThanOrEqual(48);
+    expect(out).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    const v = verdict({ name: `${'😀'.repeat(30)}x${'😀'.repeat(30)}`, classification: 'failing' });
+    expect(renderTerminal([v], { color: false, flakesOnly: true })).not.toContain('�');
+    expect(renderTerminal([v], { color: false, flakesOnly: true })).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+  });
+});

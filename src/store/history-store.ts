@@ -1,12 +1,17 @@
+import { randomBytes } from 'node:crypto';
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import path from 'node:path';
 import type { RunRecord } from '../types.js';
@@ -18,6 +23,76 @@ export function snapshotPath(storeDir: string): string {
 
 /** Current on-disk schema version, stamped as a {"version":N} header line. */
 export const STORE_FORMAT_VERSION = 1;
+
+/** Thrown when the store lock stays held by another process past the wait deadline. */
+export class StoreBusyError extends Error {}
+
+/** A lock older than this is treated as abandoned by a dead process. */
+const LOCK_STALE_MS = 30_000;
+
+function uniqueSuffix(): string {
+  return `${process.pid}-${randomBytes(6).toString('hex')}`;
+}
+
+/**
+ * Age of a lock file. Uses the `epoch` recorded inside it; when the content
+ * is empty or unparseable (a legacy writer caught between create and write,
+ * or a torn write) the file's mtime is used instead — so a lock that was
+ * JUST created always reads as fresh, never as "infinitely old".
+ * Returns null when the lock cannot be stat'ed (it vanished).
+ */
+function lockAgeMs(lockPath: string, content: string | null): number | null {
+  if (content) {
+    try {
+      const holder = JSON.parse(content) as { epoch?: unknown };
+      if (typeof holder.epoch === 'number' && Number.isFinite(holder.epoch)) {
+        return Date.now() - holder.epoch;
+      }
+    } catch {
+      // fall through to mtime
+    }
+  }
+  try {
+    return Date.now() - statSync(lockPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Break a stale lock without ever removing a live one. The lock is moved
+ * aside with an atomic rename; only if the moved file is still the stale one
+ * we observed (same content AND still older than the stale threshold) is it
+ * deleted. Otherwise another waiter already broke it and someone re-acquired
+ * it in between: the live lock is put back with link() (which never
+ * clobbers an existing file) and false is returned.
+ */
+export function breakStaleLock(lockPath: string, observed: string): boolean {
+  const aside = `${lockPath}.stale-${uniqueSuffix()}`;
+  try {
+    renameSync(lockPath, aside);
+  } catch {
+    return false; // already broken or released by someone else
+  }
+  let moved: string | null = null;
+  try {
+    moved = readFileSync(aside, 'utf8');
+  } catch {
+    // unreadable — age falls back to mtime
+  }
+  const age = lockAgeMs(aside, moved);
+  if (moved === observed && age !== null && age > LOCK_STALE_MS) {
+    rmSync(aside, { force: true });
+    return true;
+  }
+  try {
+    linkSync(aside, lockPath);
+  } catch {
+    // the lock was re-taken meanwhile; nothing safe left to restore
+  }
+  rmSync(aside, { force: true });
+  return false;
+}
 
 /**
  * Append-only JSONL history store. One RunRecord per line, prefixed by a
@@ -41,6 +116,8 @@ export class HistoryStore {
 
   private loaded = false;
   private records: RunRecord[] = [];
+  /** Content of the lock file this instance wrote; release only removes a lock that still matches. */
+  private lockToken: string | null = null;
 
   constructor(storeDir: string) {
     // deliberately does NOT create the directory: read-only commands (report,
@@ -144,40 +221,98 @@ export class HistoryStore {
    * lock serializes them. Busy-waits in ≤50 ms slices (Atomics.wait) up to 2 s
    * before giving up with an actionable error; a lock older than 30 s is
    * treated as abandoned by a dead process and stolen.
+   *
+   * The lock file is created atomically WITH its content (write a private
+   * temp file, then link() it into place — link fails if the lock exists), so
+   * competitors never see a half-written lock. Empty/unparseable locks (older
+   * flakefinder versions, torn writes) are aged by mtime, and stale locks are
+   * broken by rename-then-verify (breakStaleLock), so two waiters can never
+   * delete each other's freshly acquired lock.
    */
   private acquireLock(): void {
     const deadline = Date.now() + 2000;
     for (;;) {
-      try {
-        writeFileSync(this.lockPath, JSON.stringify({ pid: process.pid, epoch: Date.now() }), {
-          flag: 'wx',
-        });
-        return;
-      } catch {
-        let ageMs = Infinity;
-        try {
-          const holder = JSON.parse(readFileSync(this.lockPath, 'utf8')) as { epoch?: number };
-          if (typeof holder.epoch === 'number') ageMs = Date.now() - holder.epoch;
-        } catch {
-          // unreadable lock → treat as stale below
-        }
-        if (ageMs > 30_000) {
-          rmSync(this.lockPath, { force: true });
-          continue;
-        }
-        if (Date.now() >= deadline) {
-          throw new Error(
-            `history store is busy (held by another flakefinder process for >2s): ${this.lockPath}. ` +
-              'Run ingest steps serially, or give each CI shard its own storeDir.',
-          );
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      if (this.tryCreateLock()) return;
+      // checked on EVERY iteration — no path below may spin past it
+      if (Date.now() >= deadline) {
+        throw new StoreBusyError(
+          `history store is busy (held by another flakefinder process for >2s): ${this.lockPath}. ` +
+            'Run ingest steps serially, or give each CI shard its own storeDir.',
+        );
       }
+      let content: string;
+      try {
+        content = readFileSync(this.lockPath, 'utf8');
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') continue; // released in between — retry now
+        throw this.lockError(code, 'exists but cannot be read as a lock file');
+      }
+      const ageMs = lockAgeMs(this.lockPath, content);
+      if (ageMs === null) continue; // vanished — retry now
+      if (ageMs > LOCK_STALE_MS && breakStaleLock(this.lockPath, content)) continue;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+
+  private lockError(code: string | undefined, what: string): Error {
+    return new Error(
+      `history store lock ${this.lockPath} ${what} (${code ?? 'error'}) — ` +
+        'check that the store directory is writable and that the lock path is not a directory',
+    );
+  }
+
+  /**
+   * One attempt to take the lock: true on success, false ONLY when another
+   * process holds it (EEXIST). Anything else — read-only directory (EACCES,
+   * EROFS), missing dir, … — throws: retrying cannot fix it, and treating it
+   * as "held" used to spin forever.
+   */
+  private tryCreateLock(): boolean {
+    const token = JSON.stringify({
+      pid: process.pid,
+      epoch: Date.now(),
+      nonce: randomBytes(6).toString('hex'),
+    });
+    const tmp = `${this.lockPath}.${uniqueSuffix()}.tmp`;
+    try {
+      writeFileSync(tmp, token, 'utf8');
+    } catch (err) {
+      throw this.lockError((err as NodeJS.ErrnoException).code, 'cannot be created');
+    }
+    try {
+      linkSync(tmp, this.lockPath);
+      this.lockToken = token;
+      return true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') return false;
+      // filesystems without hard links (EPERM/ENOTSUP/…): exclusive create.
+      // The empty window this leaves is covered by mtime-based aging.
+      try {
+        writeFileSync(this.lockPath, token, { flag: 'wx' });
+        this.lockToken = token;
+        return true;
+      } catch (err2) {
+        const code2 = (err2 as NodeJS.ErrnoException).code;
+        if (code2 === 'EEXIST') return false;
+        throw this.lockError(code2, 'cannot be created');
+      }
+    } finally {
+      rmSync(tmp, { force: true });
     }
   }
 
   private releaseLock(): void {
-    rmSync(this.lockPath, { force: true });
+    const token = this.lockToken;
+    this.lockToken = null;
+    try {
+      // only remove the lock if it is still OURS — it may have been broken as
+      // stale and re-acquired by another process while we held it
+      if (readFileSync(this.lockPath, 'utf8') === token) rmSync(this.lockPath, { force: true });
+    } catch {
+      // already gone
+    }
   }
 
   loadAll(): RunRecord[] {
@@ -203,8 +338,11 @@ export class HistoryStore {
     }
   }
 
+  /**
+   * Appends without reading the store: when this instance has not loaded the
+   * file yet, the record simply becomes part of the next (lazy) read.
+   */
   append(run: RunRecord): void {
-    this.ensureLoaded();
     this.ensureStoreDir(); // the lock file lives in the store dir — it must exist first
     this.assertWritableFile();
     this.acquireLock();
@@ -218,7 +356,7 @@ export class HistoryStore {
           `cannot write history store ${this.path} (${e.code ?? 'error'}) — check it is a writable regular file`,
         );
       }
-      this.records.push(run);
+      if (this.loaded) this.records.push(run);
     } finally {
       this.releaseLock();
     }
@@ -229,51 +367,70 @@ export class HistoryStore {
    * Re-reads the file FRESH inside the lock: a stale in-memory snapshot
    * would silently delete records another process appended between our load
    * and this prune (verified 10/10 with two concurrent ingests before the
-   * fix). In-memory records are resynced to the fresh state.
+   * fix). In-memory records are resynced to the fresh state — including an
+   * empty one: the stale view is only kept when the fresh read FAILED, and
+   * then nothing is rewritten.
    */
   prune(maxRuns: number): void {
-    this.ensureLoaded();
+    if (this.unreadable) return; // never rewrite a store we could not read
     if (!existsSync(this.path)) return;
-    if (this.unreadable) return; // nothing loaded; never rewrite a store we could not read
     this.ensureStoreDir(); // lock file lives in the store dir
-    this.acquireLock();
+    try {
+      this.acquireLock();
+    } catch (err) {
+      // pruning is maintenance: when another writer holds the lock, skip it
+      // (the next write prunes) rather than fail a command whose record was
+      // already appended — a retry would then double-count that run
+      if (!(err instanceof StoreBusyError)) throw err;
+      this.warnings.push(`history store busy — prune skipped this time: ${this.path}`);
+      return;
+    }
     try {
       // fresh read under the lock — the on-disk state may include other
-      // processes' appends made after our ensureLoaded(). The early-return
-      // check MUST use the fresh count: a stale in-memory count (e.g. 3 of
-      // maxRuns=3) hid records another process appended.
-      const fresh: RunRecord[] = [];
-      try {
-        const lines = readFileSync(this.path, 'utf8').split(/\r?\n/);
-        for (const line of lines) {
-          const t = line.trim();
-          if (!t) continue;
-          try {
-            const parsed = JSON.parse(t) as Record<string, unknown>;
-            if (typeof parsed.runId === 'string' && Array.isArray(parsed.results)) {
-              fresh.push(parsed as unknown as RunRecord);
-            }
-          } catch {
-            // corrupt lines are dropped by the rewrite — consistent with load
-          }
+      // processes' appends made after our load. A separate instance parses
+      // it with the same (line-indexed, single-copy) loader.
+      const fresh = new HistoryStore(path.dirname(this.path));
+      const source = fresh.runs();
+      if (fresh.unreadable !== null) {
+        if (this.loaded) {
+          // keep the in-memory view, but do not rewrite from it
+          this.warnings.push(`history store unreadable during prune — not pruned: ${this.path}`);
+        } else {
+          this.adopt(fresh);
         }
-      } catch {
-        // unreadable store: fall through with in-memory records
+        return;
       }
-      const source = fresh.length > 0 ? fresh : this.records;
       if (source.length <= maxRuns) {
-        this.records = source;
+        this.adopt(fresh);
         return;
       }
       const keep = source.slice(-maxRuns);
+      // always (re)write the header; a newer-version header is preserved
+      // rather than downgraded, since unknown fields are kept verbatim
+      const version = Math.max(fresh.formatVersion ?? STORE_FORMAT_VERSION, STORE_FORMAT_VERSION);
       const tmp = `${this.path}.tmp`;
-      const header =
-        this.formatVersion === null ? `${JSON.stringify({ version: STORE_FORMAT_VERSION })}\n` : '';
-      writeFileSync(tmp, `${header}${keep.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf8');
+      const fd = openSync(tmp, 'w');
+      try {
+        writeSync(fd, `${JSON.stringify({ version })}\n`, null, 'utf8');
+        for (const r of keep) writeSync(fd, `${JSON.stringify(r)}\n`, null, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
       renameSync(tmp, this.path);
+      this.adopt(fresh);
       this.records = keep;
+      this.formatVersion = version;
     } finally {
       this.releaseLock();
     }
+  }
+
+  /** Resync this instance's view to a fresh read of the same store. */
+  private adopt(fresh: HistoryStore): void {
+    if (!this.loaded) this.warnings.push(...fresh.warnings);
+    this.loaded = true;
+    this.records = fresh.runs();
+    this.formatVersion = fresh.formatVersion;
+    this.unreadable = fresh.unreadable;
   }
 }

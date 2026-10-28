@@ -852,10 +852,13 @@ export function renderDashboard(data: DashboardData): string {
   function midTrunc(s, max) {
     s = String(s);
     if (s.length <= max) return s;
+    // by code point: slicing UTF-16 units would split surrogate pairs (emoji)
+    var cps = Array.from(s);
+    if (cps.length <= max) return s;
     var keep = max - 1;
     var head = Math.ceil(keep / 2);
     var tail = keep - head;
-    return s.slice(0, head) + '\u2026' + s.slice(s.length - tail);
+    return cps.slice(0, head).join('') + '\u2026' + cps.slice(cps.length - tail).join('');
   }
   function shortSha(s) { return s ? String(s).slice(0, 7) : ''; }
 

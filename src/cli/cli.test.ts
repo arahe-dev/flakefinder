@@ -4,7 +4,7 @@
  * so these never depend on a stale committed dist/.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -185,5 +185,161 @@ describe('unstartable test command (QA A11)', () => {
     );
     expect(r.stdout).not.toContain('no test history yet');
     expect(r.stdout.match(/attempt \d+\/\d+/g)).toEqual(['attempt 1/3']); // no retries
+  });
+});
+
+describe('config found in a parent dir anchors storeDir/quarantineFile (R5 #6)', () => {
+  it('ingest from a subdirectory writes to the store next to the config file', () => {
+    const root = tmp();
+    writeFileSync(path.join(root, 'flakefinder.config.json'), '{"storeDir": ".ff-store"}', 'utf8');
+    const sub = path.join(root, 'packages', 'a');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(path.join(sub, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(['ingest', 'r.xml'], sub);
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(root, '.ff-store', 'history.jsonl'))).toBe(true);
+    expect(existsSync(path.join(sub, '.ff-store'))).toBe(false);
+  });
+
+  it('--config <path> anchors to that file too', () => {
+    const root = tmp();
+    const cfgDir = path.join(root, 'cfg');
+    mkdirSync(cfgDir);
+    writeFileSync(path.join(cfgDir, 'ff.json'), '{"storeDir": "store"}', 'utf8');
+    writeFileSync(path.join(root, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(['--config', path.join('cfg', 'ff.json'), 'ingest', 'r.xml'], root);
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(cfgDir, 'store', 'history.jsonl'))).toBe(true);
+  });
+});
+
+describe('report/html/ci surface store warnings on stderr (R5 #7)', () => {
+  it('report on a directory-shaped store says it is unreadable instead of silently empty', () => {
+    const d = tmp();
+    mkdirSync(path.join(d, '.flakefinder', 'history.jsonl'), { recursive: true });
+    const r = cli(['report', '--format', 'json'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('history store unreadable (EISDIR)');
+    expect(() => JSON.parse(r.stdout)).not.toThrow(); // stdout stays machine-readable
+  });
+
+  it('report and html print corrupt-line warnings', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    writeFileSync(path.join(d, '.flakefinder', 'history.jsonl'), '{ nope\n', { flag: 'a' });
+    expect(cli(['report'], d).stderr).toContain('skipping corrupt line');
+    expect(cli(['html', '-o', 'out.html'], d).stderr).toContain('skipping corrupt line');
+  });
+
+  it('ci prints corrupt-line warnings', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{"reports": ["r.xml"]}', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    writeFileSync(path.join(d, '.flakefinder', 'history.jsonl'), '{ nope\n', { flag: 'a' });
+    const r = cli(['ci'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('skipping corrupt line');
+  });
+});
+
+describe('newer-format store (QA CLI-5)', () => {
+  it('ingest warns about a v2 store and prune keeps the v2 header', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{"maxRuns": 1}', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const hist = path.join(d, '.flakefinder', 'history.jsonl');
+    const lines = readFileSync(hist, 'utf8').split('\n');
+    lines[0] = JSON.stringify({ version: 2 });
+    writeFileSync(hist, lines.join('\n'), 'utf8');
+    const r = cli(['ingest', 'r.xml'], d); // 2 records > maxRuns 1 → prune rewrites
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('store format v2 is newer than this flakefinder');
+    expect(JSON.parse(readFileSync(hist, 'utf8').split('\n')[0]!)).toEqual({ version: 2 });
+    expect(historyRecords(d)).toHaveLength(1);
+  });
+});
+
+describe('ci output cannot inject workflow commands or terminal escapes (QA ACT-2)', () => {
+  it('a hostile test name stays on one visible line in the table, annotations and stderr', () => {
+    const d = tmp();
+    const name = 'x\n::error::Rotate creds\r\n::add-mask::y\x1b]0;pwned\x07\x1b[2J\u202eevil';
+    const mk = (st: 'passed' | 'failed'): string =>
+      JSON.stringify({
+        numTotalTests: 1,
+        success: st === 'passed',
+        testResults: [
+          {
+            name: '/repo/a.test.js',
+            status: st,
+            assertionResults: [
+              {
+                ancestorTitles: ['Suite'],
+                title: name,
+                fullName: name,
+                status: st,
+                failureMessages: st === 'failed' ? ['boom'] : [],
+              },
+            ],
+          },
+        ],
+      });
+    writeFileSync(
+      path.join(d, 'flakefinder.config.json'),
+      '{"reports": ["r.json"], "minRuns": 2}',
+      'utf8',
+    );
+    let r = { status: 0 as number | null, stdout: '', stderr: '' };
+    for (const st of ['passed', 'failed', 'passed', 'failed'] as const) {
+      writeFileSync(path.join(d, 'r.json'), mk(st), 'utf8');
+      r = cli(['ci', '--fail-on-new-flakes'], d);
+    }
+    const all = `${r.stdout}\n${r.stderr}`;
+    expect(all).toContain('flaky'); // the hostile test really was classified and printed
+    for (const line of all.split('\n')) {
+      if (line.startsWith('::'))
+        expect(line.startsWith('::warning title=flakefinder::')).toBe(true);
+    }
+    expect(all).not.toContain('\x1b');
+    expect(all).not.toContain('\x07');
+    expect(all).not.toContain('\u202e');
+    expect(r.stdout).toContain('x\\x0a::error::Rotate creds');
+  });
+});
+
+describe('ci annotations and table are redacted (QA ACT-3)', () => {
+  it('a ghp_ token in a flaky test name never reaches ci output', () => {
+    const d = tmp();
+    const tok = 'ghp_0123456789abcdefABCDEF0123456789abcd';
+    const junit = (fail: boolean): string =>
+      `<testsuites><testsuite name="s"><testcase classname="s" name="auth ${tok}">${fail ? '<failure message="boom"/>' : ''}</testcase></testsuite></testsuites>`;
+    writeFileSync(
+      path.join(d, 'flakefinder.config.json'),
+      '{"reports": ["r.xml"], "minRuns": 2}',
+      'utf8',
+    );
+    let out = '';
+    for (const fail of [false, true, false, true]) {
+      writeFileSync(path.join(d, 'r.xml'), junit(fail), 'utf8');
+      const r = cli(['ci', '--fail-on-new-flakes'], d);
+      out = `${r.stdout}\n${r.stderr}`;
+    }
+    expect(out).toContain('::warning title=flakefinder::');
+    expect(out).toContain('ghp_[REDACTED]');
+    expect(out).not.toContain(tok);
+  });
+});
+
+describe('ci on a first run where nothing parses (QA ACT-5 / CLI-7)', () => {
+  it('does not crash with ENOENT writing the snapshot', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{"reports": ["r.xml"]}', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), 'this is not a test report', 'utf8');
+    const r = cli(['ci'], d);
+    expect(r.stderr).not.toContain('ENOENT');
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(d, '.flakefinder', 'verdicts-snapshot.json'))).toBe(true);
   });
 });
