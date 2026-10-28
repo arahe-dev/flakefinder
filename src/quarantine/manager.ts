@@ -88,20 +88,76 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Files that mark a pytest rootdir candidate / project root: stop looking upward there. */
+const ROOT_MARKERS = ['pytest.ini', 'pyproject.toml', 'tox.ini', 'setup.cfg', 'setup.py', '.git'];
+
+/**
+ * Does `rel` exist under `cwd` or an ancestor up to the project root?
+ * (pytest's rootdir — what node ids are relative to — may sit above cwd.)
+ */
+function existsUpward(cwd: string, rel: string): boolean {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    if (existsSync(path.join(dir, rel))) return true;
+    const parent = path.dirname(dir);
+    if (parent === dir || ROOT_MARKERS.some((m) => existsSync(path.join(dir, m)))) return false;
+    dir = parent;
+  }
+}
+
+/**
+ * pytest node id for a quarantined test. `suite` is normally the JUnit
+ * classname pytest writes — the rootdir-relative node id with `/` and `::`
+ * flattened to dots and `.py` dropped (`tests/test_x.py::TestCls::test_y` →
+ * classname `tests.test_x.TestCls`) — so it is un-flattened here: the module
+ * is the longest dotted prefix that exists as a `.py` file (from `cwd` up),
+ * else everything up to the last non-Capitalized component; the remaining
+ * Capitalized components are (nested) classes. A suite that already looks
+ * like a node id or path is used verbatim.
+ */
+export function pytestNodeId(suite: string, name: string, cwd?: string): string {
+  if (/[\\/]|::|\.py$/.test(suite)) return `${suite.replace(/\\/g, '/')}::${name}`;
+  const parts = suite.split('.').filter((p) => p !== '');
+  if (parts.length === 0) return name;
+  let moduleEnd = 0;
+  if (cwd !== undefined) {
+    for (let i = parts.length; i >= 1; i--) {
+      if (existsUpward(cwd, `${parts.slice(0, i).join('/')}.py`)) {
+        moduleEnd = i;
+        break;
+      }
+    }
+  }
+  if (moduleEnd === 0) {
+    moduleEnd = 1;
+    for (let i = parts.length - 1; i >= 1; i--) {
+      if (!/^[A-Z]/.test(parts[i]!)) {
+        moduleEnd = i + 1;
+        break;
+      }
+    }
+  }
+  const file = `${parts.slice(0, moduleEnd).join('/')}.py`;
+  return [file, ...parts.slice(moduleEnd), name].join('::');
+}
+
 /**
  * Runner flags that exclude the quarantined tests from the next run.
- * go/generic have no per-test exclusion — callers must warn.
+ * `cwd` (optional) lets pytest node ids be resolved against the files on
+ * disk. go/generic have no per-test exclusion — callers must warn.
  */
 export function exclusionArgs(
   runner: Exclude<RunnerKind, 'auto'>,
   entries: QuarantineEntry[],
+  cwd?: string,
 ): string[] {
   if (entries.length === 0) return [];
   switch (runner) {
     case 'pytest': {
-      // --deselect takes a nodeid prefix: <file/module>::<test>
+      // --deselect takes a rootdir-relative node id (prefix):
+      // <path/to/file.py>::[<Class>::]<test>
       const args: string[] = [];
-      for (const e of entries) args.push('--deselect', `${e.suite}::${e.name}`);
+      for (const e of entries) args.push('--deselect', pytestNodeId(e.suite, e.name, cwd));
       return args;
     }
     case 'jest':

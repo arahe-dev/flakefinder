@@ -290,7 +290,7 @@ export async function runLive(
       const qm = new QuarantineManager(path.resolve(cwd, cfg.quarantineFile));
       const entries = qm.list();
       if (entries.length > 0) {
-        quarantineFlags = exclusionArgs(runner, entries);
+        quarantineFlags = exclusionArgs(runner, entries, cwd);
         quarantinedNames = entries.map((e) => e.name);
         console.log(
           `flakefinder: quarantine active — excluding ${entries.length} quarantined test(s) via runner flags`,

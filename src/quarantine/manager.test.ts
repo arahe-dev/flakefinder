@@ -1,9 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { QuarantineEntry, TestVerdict } from '../types.js';
-import { exclusionArgs, QuarantineManager } from './manager.js';
+import { exclusionArgs, pytestNodeId, QuarantineManager } from './manager.js';
 
 let dirs: string[] = [];
 function tmpFile(): string {
@@ -137,9 +137,17 @@ describe('QuarantineManager', () => {
 });
 
 describe('exclusionArgs', () => {
-  it('pytest: --deselect per entry', () => {
-    const args = exclusionArgs('pytest', [entry('a', 'test_one'), entry('b', 'test_two')]);
-    expect(args).toEqual(['--deselect', 's.ts::test_one', '--deselect', 's.ts::test_two']);
+  it('pytest: --deselect per entry, junit classname converted to a node id', () => {
+    const args = exclusionArgs('pytest', [
+      entry('a', 'test_one', { suite: 'test_sample' }),
+      entry('b', 'test_two', { suite: 'tests.test_x.TestCls' }),
+    ]);
+    expect(args).toEqual([
+      '--deselect',
+      'test_sample.py::test_one',
+      '--deselect',
+      'tests/test_x.py::TestCls::test_two',
+    ]);
   });
   it('jest: single -t negative-lookahead pattern, names regex-escaped and deduped', () => {
     const args = exclusionArgs('jest', [
@@ -160,5 +168,42 @@ describe('exclusionArgs', () => {
   });
   it('no entries → no args', () => {
     expect(exclusionArgs('pytest', [])).toEqual([]);
+  });
+});
+
+describe('pytestNodeId (R5 bug 6)', () => {
+  it('heuristic: dots → path segments + .py, trailing Capitalized components → ::Class', () => {
+    expect(pytestNodeId('test_sample', 'test_a')).toBe('test_sample.py::test_a');
+    expect(pytestNodeId('tests.test_x', 'test_mod')).toBe('tests/test_x.py::test_mod');
+    expect(pytestNodeId('tests.test_x.TestCls', 'test_y')).toBe('tests/test_x.py::TestCls::test_y');
+    expect(pytestNodeId('tests.test_x.TestCls.TestInner', 'test_z')).toBe(
+      'tests/test_x.py::TestCls::TestInner::test_z',
+    );
+    expect(pytestNodeId('tests.pkg.sub.test_deep.TestDeep', 'test_d')).toBe(
+      'tests/pkg/sub/test_deep.py::TestDeep::test_d',
+    );
+    expect(pytestNodeId('tests.test_x', 'test_param[1-a]')).toBe(
+      'tests/test_x.py::test_param[1-a]',
+    );
+  });
+
+  it('paths and node ids pass through verbatim', () => {
+    expect(pytestNodeId('tests/test_x.py', 't')).toBe('tests/test_x.py::t');
+    expect(pytestNodeId('tests/test_x.py::TestCls', 't')).toBe('tests/test_x.py::TestCls::t');
+  });
+
+  it('the file system wins over the capitalization heuristic', () => {
+    const dir = path.dirname(tmpFile());
+    mkdirSync(path.join(dir, 'Tests', 'Unit'), { recursive: true });
+    writeFileSync(path.join(dir, 'Tests', 'Unit', 'TestApi.py'), '', 'utf8');
+    writeFileSync(path.join(dir, 'pytest.ini'), '[pytest]\n', 'utf8');
+    expect(pytestNodeId('Tests.Unit.TestApi.TestGet', 'test_ok', dir)).toBe(
+      'Tests/Unit/TestApi.py::TestGet::test_ok',
+    );
+    // run from a subdirectory: node ids stay rootdir-relative
+    const sub = path.join(dir, 'Tests');
+    expect(pytestNodeId('Tests.Unit.TestApi.TestGet', 'test_ok', sub)).toBe(
+      'Tests/Unit/TestApi.py::TestGet::test_ok',
+    );
   });
 });

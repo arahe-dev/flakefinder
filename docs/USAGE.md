@@ -405,8 +405,14 @@ forward what follows `--` to the underlying runner.
 
 Per runner:
 
-- **pytest** — one `--deselect "<suite>::<name>"` pair per entry. pytest
-  skips those node ids; the rest of the suite runs normally.
+- **pytest** — one `--deselect <node id>` pair per entry. The stored suite
+  is pytest's JUnit classname (`tests.test_x.TestCls`), so it is converted
+  back to a rootdir-relative node id (`tests/test_x.py::TestCls::test_y`):
+  the module is the longest dotted prefix that exists as a `.py` file,
+  falling back to "trailing Capitalized components are classes". pytest
+  skips those node ids; the rest of the suite runs normally. Note that pytest
+  matches `--deselect` as a node-id *prefix*, so quarantining `test_mod` also
+  deselects a sibling named `test_mod2` in the same module/class.
 - **Jest** — a single `-t "<pattern>"` where pattern is
   `^(?!.*(?:name1|name2))` (names regex-escaped, deduped): a negative
   lookahead that matches every test name *except* the quarantined ones, so
