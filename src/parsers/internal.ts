@@ -64,3 +64,36 @@ export function firstNonEmptyLine(content: string): string | null {
   }
   return null;
 }
+
+/** How many flaky test names one retry warning lists before summarising. */
+const MAX_FLAKY_NAMES = 10;
+
+/**
+ * Message for a test that FAILED and then PASSED on a runner retry/rerun within
+ * one report. The result stays 'pass' (the runner's verdict), and this note
+ * keeps the failure visible. One ParseResult has no attempt dimension and the
+ * engine collapses same-testId rows per run (last wins), so extra 'fail' rows
+ * could not carry the signal. Shared by junit (Surefire), jest/vitest and mocha.
+ */
+export function flakyRetryMessage(
+  failedAttempts: number,
+  how: string,
+  firstFailure: string | undefined,
+  max: number,
+): string | undefined {
+  const header = `flaky: failed ${failedAttempts} of ${failedAttempts + 1} attempts before passing on ${how}`;
+  const first = trimTo(firstFailure, max);
+  return trimTo(first !== undefined ? `${header} — first failure: ${first}` : header, max);
+}
+
+/** One per-file warning naming the tests that only passed on a retry. */
+export function flakyRetryWarning(
+  format: string,
+  sourcePath: string,
+  how: string,
+  names: string[],
+): string {
+  const shown = names.slice(0, MAX_FLAKY_NAMES).join(', ');
+  const more = names.length > MAX_FLAKY_NAMES ? ` …and ${names.length - MAX_FLAKY_NAMES} more` : '';
+  return `${format}: ${sourcePath}: ${names.length} test(s) FLAKY — failed, then passed on ${how} (recorded as pass with the failure in the message): ${shown}${more}`;
+}

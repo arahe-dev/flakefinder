@@ -244,3 +244,37 @@ describe('jest statuses + suite failures (r5 #10)', () => {
     expect(results.find((r) => r.name === 'not focused')!.status).toBe('skip');
   });
 });
+
+// jest-qa.json: REAL jest 30 `--json` (QA fixture, paths → /repo) with
+// `jest.retryTimes(2)`: `retried` fails once then passes (invocations 2),
+// `slow` times out on all 3 invocations.
+// vitest-qa.json: REAL vitest 3.2 json: `retried` ({retry: 2}) fails once then
+// passes — status "passed" WITH a failureMessage.
+describe('retry-then-pass (QA PAR-6)', () => {
+  it('jest: a test that passed only on retry keeps the failure as a flaky note', () => {
+    const { results, warnings } = jestParser.parse(load('jest-qa.json'), 'jest.json');
+    const retried = results.find((r) => r.name === 'retried')!;
+    expect(retried.status).toBe('pass');
+    expect(retried.message).toMatch(/^flaky: failed 1 of 2 attempts before passing on jest retry/);
+    expect(retried.message).toContain('Expected: 2');
+    const slow = results.find((r) => r.name === 'slow')!;
+    expect(slow.status).toBe('fail');
+    expect(slow.message).toContain('(failed all 3 attempts)');
+    const w = warnings.find((x) => x.includes('FLAKY'));
+    expect(w).toContain('retried');
+  });
+
+  it('vitest: passed-with-failureMessages is a retry rescue, not a clean pass', () => {
+    const { results, warnings } = jestParser.parse(load('vitest-qa.json'), 'vitest.json');
+    const retried = results.find((r) => r.name === 'retried')!;
+    expect(retried.status).toBe('pass');
+    expect(retried.message).toMatch(
+      /^flaky: failed 1 of 2 attempts before passing on vitest retry/,
+    );
+    expect(retried.message).toContain('expected 1 to be 2');
+    expect(
+      results.find((r) => r.name === 'passes' && r.suite === 'Outer > Inner'),
+    ).not.toHaveProperty('message');
+    expect(warnings.some((x) => x.includes('FLAKY') && x.includes('retried'))).toBe(true);
+  });
+});

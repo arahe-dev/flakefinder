@@ -34,14 +34,20 @@
 import { XMLParser } from 'fast-xml-parser';
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
-import { errorMessage, isObj, stripBom, trimTo, XML_OPTIONS } from './internal.js';
+import {
+  errorMessage,
+  flakyRetryMessage,
+  flakyRetryWarning,
+  isObj,
+  stripBom,
+  trimTo,
+  XML_OPTIONS,
+} from './internal.js';
 
 const xml = new XMLParser(XML_OPTIONS);
 
 const MESSAGE_MAX_CHARS = 2000;
 const STACK_MAX_CHARS = 1000;
-/** How many flaky test names one Surefire warning lists before summarising. */
-const MAX_FLAKY_NAMES = 10;
 
 interface Ctx {
   sourcePath: string;
@@ -146,10 +152,10 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
     );
   } else if (status === 'pass' && flakes.length > 0) {
     const first = flakes[0];
-    const firstMessage = detailMessage(first);
-    const header = `flaky: failed ${flakes.length} of ${flakes.length + 1} attempts before passing on Surefire rerun`;
-    result.message = trimTo(
-      firstMessage !== undefined ? `${header} — first failure: ${firstMessage}` : header,
+    result.message = flakyRetryMessage(
+      flakes.length,
+      'Surefire rerun',
+      detailMessage(first),
       MESSAGE_MAX_CHARS,
     );
     const stack = trimTo(detailStack(first), STACK_MAX_CHARS);
@@ -235,14 +241,7 @@ export const junitParser: ReportParser = {
     }
     walk(root, 'unknown', ctx);
     if (ctx.flaky.length > 0) {
-      const shown = ctx.flaky.slice(0, MAX_FLAKY_NAMES).join(', ');
-      const more =
-        ctx.flaky.length > MAX_FLAKY_NAMES
-          ? ` …and ${ctx.flaky.length - MAX_FLAKY_NAMES} more`
-          : '';
-      ctx.warnings.push(
-        `junit: ${sourcePath}: ${ctx.flaky.length} test(s) FLAKY — failed, then passed on Surefire rerun (recorded as pass with the failure in the message): ${shown}${more}`,
-      );
+      ctx.warnings.push(flakyRetryWarning('junit', sourcePath, 'Surefire rerun', ctx.flaky));
     }
     return { results: ctx.results, warnings: ctx.warnings };
   },

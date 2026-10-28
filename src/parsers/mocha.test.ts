@@ -262,3 +262,13 @@ describe('mocha QA fixture (QA PAR-3)', () => {
     expect(dups[1]!.message).toBe('dup describe fails');
   });
 });
+
+describe('mocha retries (QA PAR-6)', () => {
+  it('a test that passed with currentRetry > 0 is flagged flaky', () => {
+    const { results, warnings } = mochaParser.parse(load('mocha-qa.json'), 'mocha.json');
+    const retried = results.find((r) => r.name === 'retried')!;
+    expect(retried.status).toBe('pass');
+    expect(retried.message).toBe('flaky: failed 1 of 2 attempts before passing on mocha retry');
+    expect(warnings.some((w) => w.includes('FLAKY') && w.includes('Outer retried'))).toBe(true);
+  });
+});

@@ -21,6 +21,10 @@
  * is recognised and flattened into the same entries — status from `state`, never-run tests
  * (`skipped`) → skip, failed hooks → failures — so both reporters give the same identities.
  *
+ * Retries (`this.retries(n)`): a passing test with `currentRetry` > 0 failed that many times
+ * first — it stays 'pass' with a "flaky: failed k of n attempts before passing on mocha retry"
+ * message and one warning per file (same representation as Surefire reruns).
+ *
  * suite = fullTitle with the title stripped (the describe chain), else `file`, else 'unknown'.
  * err.message trimmed to 2000 chars; err.stack trimmed to 1000 chars.
  *
@@ -28,7 +32,14 @@
  */
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
-import { errorMessage, isObj, stripBom, trimTo } from './internal.js';
+import {
+  errorMessage,
+  flakyRetryMessage,
+  flakyRetryWarning,
+  isObj,
+  stripBom,
+  trimTo,
+} from './internal.js';
 
 /** Match key: (file, fullTitle); empty when the entry has no fullTitle (unmatchable). */
 function keyOf(entry: Record<string, unknown>): string {
@@ -248,6 +259,7 @@ export const mochaParser: ReportParser = {
     }
 
     const hooks: string[] = [];
+    const flaky: string[] = [];
     for (let n = 0; n < entries.length; n++) {
       const entry = entries[n]!;
       const fullTitle = typeof entry.fullTitle === 'string' ? entry.fullTitle.trim() : '';
@@ -287,8 +299,16 @@ export const mochaParser: ReportParser = {
         if (message !== undefined) result.message = message;
         if (stack !== undefined) result.stack = stack;
       }
+      const retries =
+        typeof entry.currentRetry === 'number' && entry.currentRetry > 0 ? entry.currentRetry : 0;
+      if (retries > 0 && finalStatus === 'pass') {
+        result.message = flakyRetryMessage(retries, 'mocha retry', result.message, 2000);
+        flaky.push(`${suite} ${name}`);
+      }
       results.push(result);
     }
+    if (flaky.length > 0)
+      warnings.push(flakyRetryWarning('mocha', sourcePath, 'mocha retry', flaky));
     if (hooks.length > 0) {
       warnings.push(
         `mocha: ${sourcePath}: ${hooks.length} hook failure(s) — the tests they guard did not run; recorded as failures: ${hooks.join(', ')}`,

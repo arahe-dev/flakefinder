@@ -16,6 +16,11 @@
  * - name = title (fullName as fallback)
  * - durationMs = duration ?? null
  * - message = failureMessages[0] trimmed to 2000 chars
+ * - retries: a passed test with jest `invocations` > 1, or a vitest passed test that still
+ *   carries failureMessages (its failed attempts), stays 'pass' with a
+ *   "flaky: failed k of n attempts before passing on jest/vitest retry" message and one
+ *   warning per file (same representation as Surefire reruns, see internal.ts). A failed
+ *   test with invocations > 1 gets "(failed all n attempts)".
  *
  * Suite-level failures: a file whose status is 'failed' (or that carries testExecError) while
  * NONE of its assertions failed — a syntax error, no tests, or an afterAll/beforeAll that threw
@@ -26,7 +31,15 @@
  */
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
-import { errorMessage, isObj, stripBom, toArray, trimTo } from './internal.js';
+import {
+  errorMessage,
+  flakyRetryMessage,
+  flakyRetryWarning,
+  isObj,
+  stripBom,
+  toArray,
+  trimTo,
+} from './internal.js';
 
 const SUITE_PLACEHOLDER = '(suite)';
 
@@ -82,6 +95,8 @@ export const jestParser: ReportParser = {
       return { results, warnings: [`jest: ${sourcePath}: missing testResults[] array`] };
     }
 
+    const flaky: string[] = [];
+    const flakyHow = new Set<string>();
     for (const file of doc.testResults) {
       if (!isObj(file)) {
         warnings.push(`jest: ${sourcePath}: skipping non-object entry in testResults[]`);
@@ -123,8 +138,34 @@ export const jestParser: ReportParser = {
           typeof assertion.duration === 'number' && Number.isFinite(assertion.duration)
             ? assertion.duration
             : null;
-        const message = trimTo(failureMessages[0], 2000);
+        let message = trimTo(failureMessages[0], 2000);
         if (status === 'fail') anyAssertionFailed = true;
+        // retries: jest reports invocations (+ retryReasons); vitest a passed
+        // test that still carries the failed attempts' failureMessages
+        const invocations =
+          typeof assertion.invocations === 'number' && assertion.invocations > 1
+            ? assertion.invocations
+            : undefined;
+        if (status === 'pass' && (invocations !== undefined || failureMessages.length > 0)) {
+          const reasons = [
+            ...toArray(assertion.retryReasons),
+            ...toArray(assertion.retryMessages),
+            ...failureMessages,
+          ];
+          const how = invocations !== undefined ? 'jest retry' : 'vitest retry';
+          const failedAttempts =
+            invocations !== undefined ? invocations - 1 : failureMessages.length;
+          message = flakyRetryMessage(
+            failedAttempts,
+            how,
+            reasons.find((r) => typeof r === 'string'),
+            2000,
+          );
+          flaky.push(`${suite} > ${name}`);
+          flakyHow.add(how);
+        } else if (status === 'fail' && invocations !== undefined && message !== undefined) {
+          message = trimTo(`${message}\n(failed all ${invocations} attempts)`, 2000);
+        }
 
         const result: TestCaseResult = {
           testId: makeTestId(suite, name),
@@ -155,6 +196,9 @@ export const jestParser: ReportParser = {
         if (message !== undefined) result.message = message;
         results.push(result);
       }
+    }
+    if (flaky.length > 0) {
+      warnings.push(flakyRetryWarning('jest', sourcePath, [...flakyHow].join('/'), flaky));
     }
     return { results, warnings };
   },
