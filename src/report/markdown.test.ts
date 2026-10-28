@@ -163,3 +163,45 @@ describe('markdown injection is neutralised (R5 #9)', () => {
     expect(body).toContain('```text\nboom\n```\n');
   });
 });
+
+describe('PR comment size cap (QA ACT-1)', () => {
+  const many = (n: number, over: Partial<TestVerdict> = {}): TestVerdict[] =>
+    Array.from({ length: n }, (_, i) =>
+      verdict({ testId: `t${i}`, name: `flaky test number ${i}`, flakeScore: 50, ...over }),
+    );
+
+  it('2000 flakes: rows capped, "…and K more", body under GitHub’s 65,536 limit', () => {
+    const body = buildPrComment(many(2000), null);
+    expect(body.length).toBeLessThan(65_536);
+    const rows = body.split('\n').filter((l) => l.startsWith('| flaky test number'));
+    expect(rows).toHaveLength(50);
+    expect(body).toContain('…and 1950 more flaky test(s) not shown');
+    expect(body.split('\n')[0]).toBe(PR_COMMENT_MARKER);
+  });
+
+  it('hostile, escape-heavy names still fit under the hard cap with intact fences', () => {
+    const name = `${'&<>[]@|'.repeat(200)}😀`.repeat(3);
+    const msg = `${'`'.repeat(50)}\n${'😀'.repeat(1000)}`;
+    const body = buildPrComment(many(500, { name, lastMessage: msg }), null, {
+      maxRows: 500,
+      maxChars: 20_000,
+    });
+    expect(body.length).toBeLessThanOrEqual(20_000);
+    // every <details> is closed and fences are balanced
+    expect((body.match(/<details>/g) ?? []).length).toBe((body.match(/<\/details>/g) ?? []).length);
+    const fences = body.split('\n').filter((l) => /^`{3,}/.test(l));
+    expect(fences.length % 2).toBe(0);
+    // no lone surrogates anywhere
+    expect(body).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    expect(body).toMatch(/…and \d+ more flaky test\(s\) not shown/);
+    expect(body.endsWith('docs: `docs/github-action.md`_')).toBe(true);
+  });
+
+  it('small runs are unchanged: every row shown, no overflow note', () => {
+    const body = buildPrComment(many(3), null);
+    expect(body).not.toContain('not shown');
+    expect(body.split('\n').filter((l) => l.startsWith('| flaky test number'))).toHaveLength(3);
+  });
+});

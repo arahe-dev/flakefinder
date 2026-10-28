@@ -29,14 +29,20 @@ export function escapeMarkdownInline(s: string): string {
     .replace(/\|/g, '\\|');
 }
 
+/** First `max` code points (never splits a surrogate pair), with `…` when cut. */
+export function truncateCodePoints(s: string, max: number): string {
+  if (s.length <= max) return s; // UTF-16 length ≥ code points: nothing to cut
+  const cps = Array.from(s);
+  return cps.length <= max ? s : `${cps.slice(0, max - 1).join('')}…`;
+}
+
 /** Table-cell safe: one line, capped length, secrets redacted, markdown/HTML neutralised. */
 function cell(s: string | undefined, max = 80): string {
   if (!s) return '';
   // redact BEFORE truncating (a split token can't survive), escape AFTER (an
   // entity can't be cut in half)
   const oneLine = redact(s).replace(/\r?\n/g, ' ');
-  const out = oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
-  return escapeMarkdownInline(out);
+  return escapeMarkdownInline(truncateCodePoints(oneLine, max));
 }
 
 /**
@@ -118,11 +124,35 @@ export function renderMarkdown(verdicts: TestVerdict[], opts: { flakesOnly: bool
   return sections.join('\n');
 }
 
+/** Rows shown in the PR/MR comment table; the rest are summarised in one line. */
+export const PR_COMMENT_MAX_ROWS = 50;
+/**
+ * Hard cap on the comment body. GitHub rejects bodies over 65,536 characters
+ * with a 422 (GitLab allows 1,000,000), so stay well below the smaller one.
+ */
+export const PR_COMMENT_MAX_CHARS = 60_000;
+
+export interface PrCommentOptions {
+  maxRows?: number;
+  maxChars?: number;
+}
+
 /**
  * PR comment body (PLAN §10): marker first line so the action can upsert.
  * `previous` is the verdict snapshot from the previous CI run (null on first run).
+ *
+ * Size-bounded: at most `maxRows` table rows and 5 details blocks, and the
+ * whole body stays under `maxChars`. The body is assembled from whole lines and
+ * blocks, so the cap never cuts a code fence, an HTML tag or a multibyte
+ * character in half. Anything left out is counted in an "…and K more" line.
  */
-export function buildPrComment(verdicts: TestVerdict[], previous: TestVerdict[] | null): string {
+export function buildPrComment(
+  verdicts: TestVerdict[],
+  previous: TestVerdict[] | null,
+  opts: PrCommentOptions = {},
+): string {
+  const maxRows = opts.maxRows ?? PR_COMMENT_MAX_ROWS;
+  const maxChars = opts.maxChars ?? PR_COMMENT_MAX_CHARS;
   const prevFlaky = new Set((previous ?? []).filter(isFlaky).map((v) => v.testId));
   const prevScore = new Map((previous ?? []).map((v) => [v.testId, v.flakeScore]));
   const flaky = verdicts.filter(isFlaky).sort((a, b) => b.flakeScore - a.flakeScore);
@@ -131,50 +161,85 @@ export function buildPrComment(verdicts: TestVerdict[], previous: TestVerdict[] 
     (v) => v.classification === 'failing' || v.classification === 'new-failure',
   );
 
-  const rows = flaky.map((v) => {
-    if (!previous) return { v, delta: '—' };
-    if (!prevFlaky.has(v.testId)) return { v, delta: '**new**' };
+  const deltaOf = (v: TestVerdict): string => {
+    if (!previous) return '—';
+    if (!prevFlaky.has(v.testId)) return '**new**';
     const d = v.flakeScore - (prevScore.get(v.testId) ?? 0);
-    return { v, delta: d === 0 ? '=' : d > 0 ? `↑${d}` : `↓${-d}` };
-  });
+    return d === 0 ? '=' : d > 0 ? `↑${d}` : `↓${-d}`;
+  };
 
-  const out: string[] = [PR_COMMENT_MARKER, '## 🐍 flakefinder', ''];
+  const head: string[] = [PR_COMMENT_MARKER, '## 🐍 flakefinder', ''];
   const summary =
     flaky.length === 0
       ? `✅ no flakes detected among ${verdicts.length} tracked tests`
       : `**${flaky.length} flaky** (${newFlakes.length} new · ${flaky.length - newFlakes.length} known) · ${failing.length} failing · ${verdicts.length} tracked`;
-  out.push(summary);
-  if (previous === null && flaky.length > 0) out.push('_first run — building history_');
-  out.push('');
+  head.push(summary);
+  if (previous === null && flaky.length > 0) head.push('_first run — building history_');
+  head.push('');
+  const footer = [
+    '---',
+    '_📊 HTML dashboard uploaded as artifact `flakefinder-dashboard` · docs: `docs/github-action.md`_',
+  ];
 
-  if (flaky.length > 0) out.push(table(rows), '');
+  // budget for everything between head and footer, leaving room for the
+  // two "…and K more" notes (each < 200 chars)
+  const size = (lines: string[]): number => lines.reduce((n, l) => n + l.length + 1, 0);
+  let budget = maxChars - size(head) - size(footer) - 400;
+  const body: string[] = [];
 
-  const detailCount = Math.min(newFlakes.length, 5);
-  for (let i = 0; i < detailCount; i++) {
-    const v = newFlakes[i]!;
-    out.push(
+  if (flaky.length > 0) {
+    const tableLines = table([]).split('\n');
+    budget -= size(tableLines);
+    let shown = 0;
+    for (const v of flaky) {
+      if (shown >= maxRows) break;
+      const row = table([{ v, delta: deltaOf(v) }]).split('\n')[2]!;
+      if (row.length + 1 > budget) break;
+      tableLines.push(row);
+      budget -= row.length + 1;
+      shown++;
+    }
+    body.push(...tableLines);
+    if (flaky.length > shown) {
+      body.push('', `_…and ${flaky.length - shown} more flaky test(s) not shown in this table._`);
+    }
+    body.push('');
+  }
+
+  let detailCount = 0;
+  for (const v of newFlakes.slice(0, 5)) {
+    // redact BEFORE truncating so a token split by the slice can't survive partially
+    const message = truncateCodePoints(
+      redact(v.lastMessage ?? '(no failure message recorded)'),
+      400,
+    );
+    const fence = fenceFor(message);
+    const block = [
       `<details><summary><code>${cell(v.name, 60)}</code> — score ${v.flakeScore}</summary>`,
       '',
-    );
-    // redact BEFORE truncating so a token split by the slice can't survive partially
-    const message = redact(v.lastMessage ?? '(no failure message recorded)').slice(0, 400);
-    const fence = fenceFor(message);
-    out.push(`${fence}text`, message, fence, '');
-    out.push('Quarantine it:', '');
-    out.push('```bash');
-    out.push(`flakefinder quarantine add ${v.testId}`);
-    out.push('```', '');
-    out.push('</details>', '');
+      `${fence}text`,
+      message,
+      fence,
+      '',
+      'Quarantine it:',
+      '',
+      '```bash',
+      `flakefinder quarantine add ${v.testId}`,
+      '```',
+      '',
+      '</details>',
+      '',
+    ];
+    if (size(block) > budget) break;
+    body.push(...block);
+    budget -= size(block);
+    detailCount++;
   }
   if (newFlakes.length > detailCount) {
-    out.push(
+    body.push(
       `_…and ${newFlakes.length - detailCount} more new flake(s) — see the dashboard artifact._`,
       '',
     );
   }
-  out.push(
-    '---',
-    '_📊 HTML dashboard uploaded as artifact `flakefinder-dashboard` · docs: `docs/github-action.md`_',
-  );
-  return out.join('\n');
+  return [...head, ...body, ...footer].join('\n');
 }
