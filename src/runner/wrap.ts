@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { detectRunner } from '../config.js';
 import { classifyAll } from '../engine/classify.js';
@@ -139,7 +139,7 @@ function spawnCommand(
   timeoutSeconds: number | null,
   currentChild: { ref: ReturnType<typeof spawn> | null },
 ): Promise<number> {
-  const shellArgv = command.map((t) => (isShellOperator(t) ? t : shellQuote(t)));
+  const shellArgv = shellArgvFor(command, cwd);
   return new Promise((resolve) => {
     const done = (code: number): void => {
       if (currentChild.ref) currentChild.ref = null;
@@ -432,11 +432,111 @@ export function isPackageManagerWrapper(command: string[]): boolean {
   return first === 'npm' || first === 'yarn' || first === 'pnpm' || first === 'bun';
 }
 
-/** Quote a single argument for spawn({shell:true}) on the current platform. No-op for safe tokens. */
-export function shellQuote(s: string): string {
-  if (!/[\s"&|<>^()%!'"\\]/.test(s)) return s;
-  if (process.platform === 'win32') {
-    return `"${s.replace(/"/g, '""')}"`;
+/** Tokens POSIX sh never interprets — left bare for readable logs. */
+const POSIX_SAFE = /^[A-Za-z0-9_\-+=.,/:@%]+$/;
+/** Tokens cmd.exe and the MSVCRT argv parser never interpret. */
+const CMD_SAFE = /^[A-Za-z0-9_\-+./:@]+$/;
+/** cmd.exe metacharacters, caret-escaped (same set as cross-spawn). */
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+
+/**
+ * Quote a single argument for spawn({shell:true}). Every token that is not
+ * provably inert is quoted — values here can be attacker-influenced (test
+ * names flow into quarantine and re-run patterns), so `` ` ``, `$`, `;`, `*`,
+ * `?`, `[`, `~`, newlines etc. must reach the program literally.
+ *
+ * - POSIX sh: single quotes (nothing is special inside them); an embedded `'`
+ *   becomes `'\''`.
+ * - win32 cmd.exe: MSVCRT-quote the argument (backslashes before `"` and at
+ *   the end are doubled, `"` → `\"`), wrap it in `"`, then caret-escape every
+ *   cmd metacharacter INCLUDING the quotes, so cmd never toggles its quote
+ *   state and never expands `%VAR%`. `doubleEscape` adds a second caret layer
+ *   for batch shims (`npm.cmd`, `jest.cmd`): cmd re-parses `%*` inside them.
+ */
+export function shellQuote(
+  s: string,
+  opts: { platform?: NodeJS.Platform; doubleEscape?: boolean } = {},
+): string {
+  const platform = opts.platform ?? process.platform;
+  if (platform === 'win32') {
+    if (CMD_SAFE.test(s)) return s;
+    let a = s.replace(/(\\*)"/g, '$1$1\\"');
+    a = a.replace(/(\\*)$/, '$1$1');
+    a = `"${a}"`.replace(CMD_META, '^$1');
+    return opts.doubleEscape ? a.replace(CMD_META, '^$1') : a;
   }
+  if (POSIX_SAFE.test(s)) return s;
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Control operators start a new command; redirects do not. */
+function isControlOperator(token: string): boolean {
+  return /^(?:\|\|?|\|&|&&?|;)$/.test(token);
+}
+
+/** A redirect whose NEXT token is its file target (`>`, `2>>`; not `2>&1`). */
+function takesRedirectTarget(token: string): boolean {
+  return isShellOperator(token) && !isControlOperator(token) && !/&(?:\d+|-)$/.test(token);
+}
+
+/**
+ * Does `cmd` resolve to a batch file on win32? Mirrors cmd.exe lookup: an
+ * explicit extension wins; otherwise cwd then PATH, trying PATHEXT in order.
+ */
+export function isBatchCommand(
+  cmd: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (/\.(?:cmd|bat)$/i.test(cmd)) return true;
+  if (path.extname(cmd) !== '') return false;
+  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+  const hasDir = /[\\/]/.test(cmd);
+  const dirs = hasDir ? [''] : [cwd, ...(env.PATH ?? env.Path ?? '').split(';').filter(Boolean)];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = dir ? path.join(dir, cmd + ext) : path.resolve(cwd, cmd + ext);
+      if (existsSync(candidate)) return /^\.(?:cmd|bat)$/i.test(ext);
+    }
+  }
+  return false;
+}
+
+/**
+ * The argv for shell mode: operators stay bare, everything else is quoted.
+ * On win32 a segment's command token is only caret-escaped (cmd must still
+ * resolve it), and its arguments are double-escaped when it is a batch shim;
+ * redirect targets are single-escaped (cmd opens them itself).
+ */
+export function shellArgvFor(
+  command: string[],
+  cwd: string,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (platform !== 'win32') {
+    return command.map((t) => (isShellOperator(t) ? t : shellQuote(t, { platform })));
+  }
+  const out: string[] = [];
+  let expectCommand = true;
+  let redirectTarget = false;
+  let batch = false;
+  for (const t of command) {
+    if (isShellOperator(t)) {
+      out.push(t);
+      if (isControlOperator(t)) expectCommand = true;
+      redirectTarget = takesRedirectTarget(t);
+      continue;
+    }
+    if (redirectTarget) {
+      out.push(shellQuote(t, { platform }));
+      redirectTarget = false;
+    } else if (expectCommand) {
+      batch = isBatchCommand(t, cwd);
+      out.push(t.replace(CMD_META, '^$1'));
+      expectCommand = false;
+    } else {
+      out.push(shellQuote(t, { platform, doubleEscape: batch }));
+    }
+  }
+  return out;
 }

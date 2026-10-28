@@ -555,8 +555,9 @@ recover within a few runs.
 **Windows paths** — use forward slashes in globs (`test-results/*.xml` works
 everywhere). `run` spawns your command directly (no shell) so arguments with
 spaces survive intact; commands with `>` redirects or pipes automatically
-switch to shell mode where they behave as in your terminal — quote paths
-containing spaces in that case. The store and reports use `path.join`, so
+switch to shell mode, where every argument token is quoted for the shell
+(POSIX single quotes; caret-escaping for cmd.exe) so it still arrives
+verbatim — only the operator tokens themselves are interpreted. The store and reports use `path.join`, so
 mixed separators in existing files are tolerated. In scripts that wrap the
 CLI, pass the go redirect as **argument tokens**
 (`… -- go test -json ./... ">" test-output.jsonl`) rather than letting an

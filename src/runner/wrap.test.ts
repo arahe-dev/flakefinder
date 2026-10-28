@@ -571,3 +571,117 @@ describe('shell operator detection (R5 bug 1)', () => {
     ).toEqual(['go', 'test', '-p', '1', '-run', 'A', '2>&1', '|', 'tee', 'x']);
   });
 });
+
+describe('shell-mode quoting (R5 bug 2)', () => {
+  const NASTY = [
+    '$(touch pwned)',
+    '`touch pwned`',
+    'a; touch pwned',
+    '*',
+    'test?[ab]',
+    '~',
+    '~/x',
+    '$HOME',
+    "it's",
+    'line1\nline2',
+    'a\\b',
+    '',
+    '!event',
+    '{a,b}',
+    '#comment',
+    '^(?!(?:.* )?(?:a|b)$)',
+  ];
+
+  it('POSIX: every token round-trips through /bin/sh verbatim', async () => {
+    if (process.platform === 'win32') return;
+    const { shellQuote } = await import('./wrap.js');
+    const { spawnSync } = await import('node:child_process');
+    const cwd = tmpCwd();
+    const line = `printf '%s\\0' ${NASTY.map((t) => shellQuote(t)).join(' ')}`;
+    const out = spawnSync('/bin/sh', ['-c', line], { cwd, encoding: 'utf8' });
+    expect(out.status).toBe(0);
+    expect(out.stdout.split('\0').slice(0, -1)).toEqual(NASTY);
+    expect(existsSync(path.join(cwd, 'pwned'))).toBe(false);
+  });
+
+  it('POSIX: inert tokens stay bare, everything else is single-quoted', async () => {
+    const { shellQuote } = await import('./wrap.js');
+    const opts = { platform: 'linux' as const };
+    expect(shellQuote('--maxWorkers=2', opts)).toBe('--maxWorkers=2');
+    expect(shellQuote('./src/a.test.ts', opts)).toBe('./src/a.test.ts');
+    expect(shellQuote('$x', opts)).toBe("'$x'");
+    expect(shellQuote("it's", opts)).toBe("'it'\\''s'");
+    expect(shellQuote('', opts)).toBe("''");
+  });
+
+  it('win32: cmd metacharacters (incl. quotes and %) are caret-escaped', async () => {
+    const { shellQuote } = await import('./wrap.js');
+    const w = { platform: 'win32' as const };
+    expect(shellQuote('jest', w)).toBe('jest');
+    expect(shellQuote('a b', w)).toBe('^"a^ b^"');
+    expect(shellQuote('a&calc', w)).toBe('^"a^&calc^"');
+    expect(shellQuote('%PATH%', w)).toBe('^"^%PATH^%^"');
+    expect(shellQuote('say "hi"', w)).toBe('^"say^ \\^"hi\\^"^"');
+    expect(shellQuote('dir\\', w)).toBe('^"dir\\\\^"');
+    expect(shellQuote('a|b', { ...w, doubleEscape: true })).toBe('^^^"a^^^|b^^^"');
+  });
+
+  it('win32: batch shims get double escaping, redirect targets single', async () => {
+    const { shellArgvFor } = await import('./wrap.js');
+    const argv = shellArgvFor(
+      ['x.cmd', '-t', 'a b', '>', 'o u t.txt', '&&', 'x.exe', 'c&d'],
+      '.',
+      'win32',
+    );
+    expect(argv).toEqual([
+      'x.cmd',
+      '-t',
+      '^^^"a^^^ b^^^"',
+      '>',
+      '^"o^ u^ t.txt^"',
+      '&&',
+      'x.exe',
+      '^"c^&d^"',
+    ]);
+  });
+
+  it('end-to-end: a malicious quarantined name cannot execute in shell mode', async () => {
+    if (process.platform === 'win32') return;
+    const cwd = tmpCwd();
+    writeFileSync(
+      path.join(cwd, 'echo-args.js'),
+      "require('fs').writeFileSync('argv.json', JSON.stringify(process.argv.slice(2)));",
+      'utf8',
+    );
+    const evil = '$(touch pwned1)`touch pwned2`; touch pwned3 *';
+    writeFileSync(
+      path.join(cwd, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: 'x',
+            suite: 's.test.js',
+            name: evil,
+            reason: 'flaky',
+            quarantinedAt: new Date().toISOString(),
+            flakeScore: 90,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runLive(['node', 'echo-args.js', '|', 'cat'], cfg({ reports: [], runner: 'jest' }), {
+      retries: 0,
+      cwd,
+      applyQuarantine: true,
+    });
+    for (const f of ['pwned1', 'pwned2', 'pwned3'])
+      expect(existsSync(path.join(cwd, f))).toBe(false);
+    const argv = JSON.parse(readFileSync(path.join(cwd, 'argv.json'), 'utf8')) as string[];
+    expect(argv[0]).toBe('-t');
+    expect(argv[1]).toContain(evil.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  }, 60_000);
+});
