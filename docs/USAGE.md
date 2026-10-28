@@ -529,6 +529,14 @@ suite; if it persists, open the file and check it's the format you think it
 is. Malformed-but-detected files produce warnings, not crashes, and every
 parsable test case still records.
 
+**Reports behind symlinks/junctions are not discovered** — glob matching
+(`reports` in the config, and `run`/`ingest`/`ci`/`doctor` discovery) walks
+real files and directories only: a symlinked report file, or a report inside
+a symlinked directory or Windows junction, is silently not matched. This is
+deliberate — following links risks cycles and walking outside the project.
+Point globs at the real path instead. Files passed **explicitly** to
+`ingest <files…>` are read normally, links included.
+
 **Renamed tests fork their history** — identity is `sha256(suite + name)`, so
 after a rename the old id goes `gone` and the new id starts empty. This is
 honest (a renamed test *is* a new test observably). If the fork bothers you:
