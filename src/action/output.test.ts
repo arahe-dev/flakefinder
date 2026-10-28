@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TestVerdict } from '../types.js';
-import { newFlakesFailure, summaryRows } from './output.js';
+import { jobSummaryHtml, newFlakesFailure, summaryRows } from './output.js';
 
 function verdict(over: Partial<TestVerdict>): TestVerdict {
   return {
@@ -48,5 +48,29 @@ describe('action outputs are redacted and escaped (R5 #12)', () => {
     expect(label).not.toContain(TOKEN);
     expect(cls).toBe('flaky-confirmed');
     expect(score).toBe('70');
+  });
+});
+
+describe('job summary HTML (QA ACT-8)', () => {
+  it('headline is HTML, not literal markdown', () => {
+    const html = jobSummaryHtml([verdict({})], 1, 0);
+    expect(html).toContain('<p><strong>1 flaky</strong> (1 new) · 0 failing · 1 tracked</p>');
+    expect(html).not.toContain('**');
+  });
+  it('no flakes → no empty header-only table', () => {
+    const html = jobSummaryHtml([verdict({ classification: 'passing' })], 0, 0);
+    expect(html).not.toContain('<table>');
+    expect(html).toContain('No flaky tests detected');
+  });
+  it('more than 20 flakes → 20 rows and an explicit "…and K more"', () => {
+    const vs = Array.from({ length: 23 }, (_, i) => verdict({ testId: `t${i}`, name: `n${i}` }));
+    const html = jobSummaryHtml(vs, 0, 0);
+    expect(html.match(/<tr><td>/g)).toHaveLength(20);
+    expect(html).toContain('…and 3 more flaky test(s)');
+  });
+  it('cells stay escaped and redacted', () => {
+    const html = jobSummaryHtml([verdict({ name: `<script>x</script> ${TOKEN}` })], 0, 0);
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain(TOKEN);
   });
 });

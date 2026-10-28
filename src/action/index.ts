@@ -14,7 +14,7 @@ import { computeNewFlakes } from './diff.js';
 import { githubEnv, upsertPrComment } from './github.js';
 import { cacheUsable, restoreHistory, saveHistory } from './history-cache.js';
 import { ingestReports } from './ingest.js';
-import { newFlakesFailure, summaryRows } from './output.js';
+import { jobSummaryHtml, newFlakesFailure } from './output.js';
 
 async function expandGlobs(patterns: string[], cwd: string): Promise<string[]> {
   const globModule = await import('@actions/glob');
@@ -101,20 +101,7 @@ async function actionMain(): Promise<void> {
   writeFileSync(reportJsonPath, renderJson(verdicts, cfg), 'utf8');
   core.setOutput('report-json', reportJsonPath);
 
-  await core.summary
-    .addHeading('flakefinder')
-    .addRaw(
-      `**${flakyCount} flaky** (${newFlakes.length} new) · ${failingCount} failing · ${verdicts.length} tracked\n`,
-    )
-    .addTable([
-      [
-        { data: 'Test', header: true },
-        { data: 'Class', header: true },
-        { data: 'Score', header: true },
-      ],
-      ...summaryRows(verdicts),
-    ])
-    .write();
+  await core.summary.addRaw(jobSummaryHtml(verdicts, newFlakes.length, failingCount)).write();
 
   // 7. dashboard artifact — BEFORE the comment, which only mentions it if
   // the upload actually happened
