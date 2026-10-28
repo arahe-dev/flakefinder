@@ -31,6 +31,13 @@ export class HistoryStore {
   readonly warnings: string[] = [];
   /** Schema version read from the file header; null for legacy header-less stores. */
   formatVersion: number | null = null;
+  /**
+   * Set when `history.jsonl` exists but could not be read at all (EISDIR,
+   * EACCES, …): the store then behaves as empty, but callers that diagnose
+   * setup (doctor) must treat it as a hard failure, not as "0 runs".
+   * Holds `<errno>: <message>`; null when the file was read or is absent.
+   */
+  unreadable: string | null = null;
 
   private loaded = false;
   private records: RunRecord[] = [];
@@ -57,10 +64,13 @@ export class HistoryStore {
     try {
       raw = readFileSync(this.path, 'utf8');
     } catch (err) {
-      // e.g. the path exists but is a DIRECTORY (EISDIR) — degrade, don't die
-      if (this.warnings.length < 10) {
-        this.warnings.push(`history store unreadable: ${(err as Error).message}`);
-      }
+      // e.g. the path exists but is a DIRECTORY (EISDIR) or unreadable
+      // (EACCES) — degrade to an empty store instead of dying; doctor fails.
+      const e = err as NodeJS.ErrnoException;
+      const code = e.code ?? 'error';
+      // node's fs messages already start with the errno ("EISDIR: illegal …")
+      this.unreadable = e.message.startsWith(code) ? e.message : `${code}: ${e.message}`;
+      this.warnings.push(`history store unreadable (${code}): ${this.path}`);
       return;
     }
     let start = 0;
@@ -180,13 +190,34 @@ export class HistoryStore {
     return [...this.records];
   }
 
+  /**
+   * Write paths must not surface raw EISDIR/EACCES: a directory (or other
+   * non-file) at the store path would otherwise slip past ensureHeader()
+   * (a directory's stat size is non-zero) and crash in appendFileSync.
+   */
+  private assertWritableFile(): void {
+    if (existsSync(this.path) && !statSync(this.path).isFile()) {
+      throw new Error(
+        `history store ${this.path} exists but is not a regular file — delete or rename it (flakefinder recreates it on the next write)`,
+      );
+    }
+  }
+
   append(run: RunRecord): void {
     this.ensureLoaded();
     this.ensureStoreDir(); // the lock file lives in the store dir — it must exist first
+    this.assertWritableFile();
     this.acquireLock();
     try {
-      this.ensureHeader();
-      appendFileSync(this.path, `${JSON.stringify(run)}\n`, 'utf8');
+      try {
+        this.ensureHeader();
+        appendFileSync(this.path, `${JSON.stringify(run)}\n`, 'utf8');
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        throw new Error(
+          `cannot write history store ${this.path} (${e.code ?? 'error'}) — check it is a writable regular file`,
+        );
+      }
       this.records.push(run);
     } finally {
       this.releaseLock();
@@ -203,6 +234,7 @@ export class HistoryStore {
   prune(maxRuns: number): void {
     this.ensureLoaded();
     if (!existsSync(this.path)) return;
+    if (this.unreadable) return; // nothing loaded; never rewrite a store we could not read
     this.ensureStoreDir(); // lock file lives in the store dir
     this.acquireLock();
     try {

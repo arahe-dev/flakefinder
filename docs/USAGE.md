@@ -297,7 +297,7 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 |---|---|
 | `0` | Clean run, **or** failures that were all proven flakes (unless `--fail-on-flake` / `failOnFlakes`) |
 | `1` | A deterministic failure persisted to the final attempt (`run`); a quarantined testId wasn't found; `ci --fail-on-new-flakes` saw new flakes |
-| `1` (doctor) | `doctor` found at least one FAIL-level problem (e.g. invalid config, unreadable quarantine file) |
+| `1` (doctor) | `doctor` found at least one FAIL-level problem (e.g. invalid config, unreadable quarantine file, unreadable `history.jsonl`) |
 | `2` | Usage or environment error: bad flags, unreadable config, no report files matched for `ingest`/`ci`, unknown quarantine action |
 
 These are stable and scriptable — gate CI on `run`'s exit code directly.
@@ -498,7 +498,11 @@ safely; readers tolerate legacy header-less stores (v0.1.x files) unchanged.
 
 Pruning: after each append the store is atomically rewritten (tmp + rename)
 to the last `maxRuns` records (default 300). Corrupt lines are skipped on
-load, never crash the CLI. A second file, `<storeDir>/verdicts-snapshot.json`,
+load, never crash the CLI. If `history.jsonl` itself cannot be read (it is a
+directory, or permissions deny access) read-only commands treat history as
+empty, `doctor` reports it as a FAIL, and any command that writes history
+(`run`, `ingest`, `ci`) stops with an error naming the path instead of a raw
+`EISDIR`/`EACCES`. A second file, `<storeDir>/verdicts-snapshot.json`,
 holds the previous classification used by `ci --fail-on-new-flakes` and the
 action's new-vs-known diff.
 

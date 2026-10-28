@@ -1,6 +1,8 @@
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -274,13 +276,68 @@ describe('read paths do not create directories (QA A4)', () => {
 });
 
 describe('history.jsonl as a directory degrades gracefully (QA A5)', () => {
-  it('runs() returns [] with a warning instead of throwing EISDIR', () => {
+  function dirShapedStore(): HistoryStore {
     const dir = mkdtempSync(path.join(tmpdir(), 'ff-eisdir-'));
     dirs.push(dir);
     const s = new HistoryStore(dir);
     // constructor no longer mkdirs; create the dir-shaped store file ourselves
     mkdirSync(s.path, { recursive: true });
+    return s;
+  }
+
+  it('runs() returns [] with a warning and flags the store unreadable instead of throwing EISDIR', () => {
+    const s = dirShapedStore();
     expect(s.runs()).toEqual([]);
-    expect(s.warnings.some((w) => w.includes('history store unreadable'))).toBe(true);
+    expect(s.warnings).toEqual([`history store unreadable (EISDIR): ${s.path}`]);
+    expect(s.unreadable).toMatch(/^EISDIR: /);
+  });
+
+  it('append fails with an actionable message naming the path, not a raw EISDIR', () => {
+    const s = dirShapedStore();
+    let message = '';
+    try {
+      s.append(record('r1', 'pass'));
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain(s.path);
+    expect(message).toContain('is not a regular file');
+    expect(message).toContain('delete or rename it');
+    expect(message).not.toContain('EISDIR');
+    // the lock was not left behind (nor even taken)
+    expect(existsSync(`${s.path}.lock`)).toBe(false);
+  });
+
+  it('prune on a dir-shaped store is a no-op, not a crash', () => {
+    const s = dirShapedStore();
+    expect(() => s.prune(1)).not.toThrow();
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'an unreadable regular file (EACCES) is flagged unreadable; append names the path',
+    () => {
+      const s = tmpStore();
+      s.append(record('r1', 'pass'));
+      chmodSync(s.path, 0o000);
+      try {
+        const fresh = new HistoryStore(path.dirname(s.path));
+        expect(fresh.runs()).toEqual([]);
+        expect(fresh.unreadable).toMatch(/^EACCES: /);
+        expect(() => fresh.append(record('r2', 'pass'))).toThrow(
+          `cannot write history store ${s.path} (EACCES)`,
+        );
+        expect(existsSync(`${s.path}.lock`)).toBe(false);
+      } finally {
+        chmodSync(s.path, 0o644);
+      }
+    },
+  );
+
+  it('a readable store is not flagged unreadable', () => {
+    const s = tmpStore();
+    s.append(record('r1', 'pass'));
+    const fresh = new HistoryStore(path.dirname(s.path));
+    expect(fresh.runs()).toHaveLength(1);
+    expect(fresh.unreadable).toBeNull();
   });
 });

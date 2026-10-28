@@ -129210,17 +129210,35 @@ var HistoryStore = class {
   warnings = [];
   /** Schema version read from the file header; null for legacy header-less stores. */
   formatVersion = null;
+  /**
+   * Set when `history.jsonl` exists but could not be read at all (EISDIR,
+   * EACCES, …): the store then behaves as empty, but callers that diagnose
+   * setup (doctor) must treat it as a hard failure, not as "0 runs".
+   * Holds `<errno>: <message>`; null when the file was read or is absent.
+   */
+  unreadable = null;
   loaded = false;
   records = [];
   constructor(storeDir) {
-    (0, import_node_fs4.mkdirSync)(storeDir, { recursive: true });
     this.path = import_node_path2.default.join(storeDir, "history.jsonl");
+  }
+  ensureStoreDir() {
+    (0, import_node_fs4.mkdirSync)(import_node_path2.default.dirname(this.path), { recursive: true });
   }
   ensureLoaded() {
     if (this.loaded) return;
     this.loaded = true;
     if (!(0, import_node_fs4.existsSync)(this.path)) return;
-    const raw = (0, import_node_fs4.readFileSync)(this.path, "utf8");
+    let raw;
+    try {
+      raw = (0, import_node_fs4.readFileSync)(this.path, "utf8");
+    } catch (err) {
+      const e = err;
+      const code = e.code ?? "error";
+      this.unreadable = e.message.startsWith(code) ? e.message : `${code}: ${e.message}`;
+      this.warnings.push(`history store unreadable (${code}): ${this.path}`);
+      return;
+    }
     let start = 0;
     let lineNo = 0;
     while (start < raw.length) {
@@ -129324,13 +129342,34 @@ var HistoryStore = class {
     this.ensureLoaded();
     return [...this.records];
   }
+  /**
+   * Write paths must not surface raw EISDIR/EACCES: a directory (or other
+   * non-file) at the store path would otherwise slip past ensureHeader()
+   * (a directory's stat size is non-zero) and crash in appendFileSync.
+   */
+  assertWritableFile() {
+    if ((0, import_node_fs4.existsSync)(this.path) && !(0, import_node_fs4.statSync)(this.path).isFile()) {
+      throw new Error(
+        `history store ${this.path} exists but is not a regular file \u2014 delete or rename it (flakefinder recreates it on the next write)`
+      );
+    }
+  }
   append(run) {
     this.ensureLoaded();
+    this.ensureStoreDir();
+    this.assertWritableFile();
     this.acquireLock();
     try {
-      this.ensureHeader();
-      (0, import_node_fs4.appendFileSync)(this.path, `${JSON.stringify(run)}
+      try {
+        this.ensureHeader();
+        (0, import_node_fs4.appendFileSync)(this.path, `${JSON.stringify(run)}
 `, "utf8");
+      } catch (err) {
+        const e = err;
+        throw new Error(
+          `cannot write history store ${this.path} (${e.code ?? "error"}) \u2014 check it is a writable regular file`
+        );
+      }
       this.records.push(run);
     } finally {
       this.releaseLock();
@@ -129346,6 +129385,8 @@ var HistoryStore = class {
   prune(maxRuns) {
     this.ensureLoaded();
     if (!(0, import_node_fs4.existsSync)(this.path)) return;
+    if (this.unreadable) return;
+    this.ensureStoreDir();
     this.acquireLock();
     try {
       const fresh = [];
@@ -130028,7 +130069,13 @@ var junitParser = {
       return { results: ctx.results, warnings: ctx.warnings };
     }
     const rootKey = Object.keys(doc).find((k) => /(?:^|:)testsuites?$/.test(k));
-    const root = rootKey !== void 0 ? doc[rootKey] : void 0;
+    let root = rootKey !== void 0 ? doc[rootKey] : void 0;
+    if (Array.isArray(root)) {
+      ctx.warnings.push(
+        `junit: ${sourcePath}: multiple <testsuites> roots found \u2014 using the first`
+      );
+      root = root[0];
+    }
     if (root === void 0) {
       ctx.warnings.push(`junit: ${sourcePath}: no <testsuites> or <testsuite> root element found`);
       return { results: ctx.results, warnings: ctx.warnings };
@@ -130087,7 +130134,14 @@ var mochaParser = {
     if (!isObj(doc)) {
       return { results, warnings: [`mocha: ${sourcePath}: not a JSON object`] };
     }
-    const all = Array.isArray(doc.results) ? doc.results : Array.isArray(doc.tests) ? doc.tests : null;
+    const all = Array.isArray(doc.results) ? doc.results : Array.isArray(doc.tests) ? doc.tests : Array.isArray(doc.passes) || Array.isArray(doc.failures) ? (
+      // passes/failures-only shape (sniff accepts it): merge the buckets
+      [
+        ...Array.isArray(doc.passes) ? doc.passes : [],
+        ...Array.isArray(doc.failures) ? doc.failures : [],
+        ...Array.isArray(doc.pending) ? doc.pending : []
+      ]
+    ) : null;
     if (all === null) {
       return { results, warnings: [`mocha: ${sourcePath}: missing "tests"/"results" array`] };
     }
@@ -130165,15 +130219,15 @@ var tapParser = {
       const line = lines[i];
       const sub = line.match(/^\s*# Subtest: (.+?)\s*$/);
       if (sub) {
-        ancestors.push({ name: sub[1], children: 0 });
+        ancestors.push({ name: sub[1].replace(/\\#/g, "#"), children: 0 });
         continue;
       }
       const assertion = line.match(
-        /^\s*(not ok|ok)\s+\d+\s+-\s+(.+?)(?:\s+#\s*(SKIP|TODO)\b(.*))?$/
+        /^\s*(not ok|ok)\s+\d+\s+-\s+(.+?)(?:\s+#\s*([A-Za-z]+)\b(.*))?$/
       );
       if (assertion) {
         const [, verdict, rawName, directive, directiveText] = assertion;
-        const name = rawName.trim();
+        const name = rawName.trim().replace(/\\#/g, "#");
         let yaml = { isSuite: false };
         if (lines[i + 1]?.trim() === "---") {
           let j = i + 2;
@@ -130195,7 +130249,8 @@ var tapParser = {
         const suite = chain.length > 0 ? chain.map((a) => a.name).join(" > ") : ROOT_SUITE;
         let status = verdict === "not ok" ? "fail" : "pass";
         let message = yaml.error;
-        if (directive === "SKIP" || directive === "TODO") {
+        const directiveKind = directive?.toUpperCase();
+        if (directiveKind === "SKIP" || directiveKind === "TODO") {
           status = "skip";
           const reason = directiveText?.replace(/^\s*-\s*/, "").trim();
           if (reason) message = reason;
@@ -130280,13 +130335,14 @@ function textOf2(node) {
 }
 function durationMs(raw) {
   if (raw === void 0) return null;
-  const m = raw.match(/^(?:(\d+)):([0-5]?\d):([0-5]?\d(?:\.\d+)?)$/);
+  const m = raw.match(/^(?:(\d+)\.)?(?:(\d+)):([0-5]?\d):([0-5]?\d(?:\.\d+)?)$/);
   if (!m) return null;
-  const h = Number.parseInt(m[1], 10);
-  const min = Number.parseInt(m[2], 10);
-  const sec = Number.parseFloat(m[3]);
+  const days = m[1] !== void 0 ? Number.parseInt(m[1], 10) : 0;
+  const h = Number.parseInt(m[2], 10);
+  const min = Number.parseInt(m[3], 10);
+  const sec = Number.parseFloat(m[4]);
   if (!Number.isFinite(h) || !Number.isFinite(min) || !Number.isFinite(sec) || sec < 0) return null;
-  return Math.round(((h * 60 + min) * 60 + sec) * 1e3);
+  return Math.round((((days * 24 + h) * 60 + min) * 60 + sec) * 1e3);
 }
 function outcomeStatus(outcome, hasErrorInfo) {
   switch (outcome) {
@@ -130329,7 +130385,11 @@ var trxParser = {
       ctx.warnings.push(`trx: ${sourcePath}: no <TestRun> root element found`);
       return { results: ctx.results, warnings: ctx.warnings };
     }
-    const root = doc[rootKey];
+    let root = doc[rootKey];
+    if (Array.isArray(root)) {
+      ctx.warnings.push(`trx: ${sourcePath}: multiple <TestRun> roots found \u2014 using the first`);
+      root = root[0];
+    }
     if (!isObj(root)) return { results: ctx.results, warnings: ctx.warnings };
     const suiteByTestName = /* @__PURE__ */ new Map();
     const defKey = Object.keys(root).find((k) => /(?:^|:)TestDefinitions$/.test(k));

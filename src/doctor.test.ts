@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -69,5 +69,57 @@ describe('doctor resilience (QA round 4)', () => {
     expect(q.status).toBe('fail');
     expect(q.message).toContain('unreadable');
     expect(q.hint).toContain('a `run` would also fail');
+  });
+});
+
+describe('doctor history section (QA A5)', () => {
+  const run = (id: string) =>
+    JSON.stringify({ runId: id, timestamp: new Date().toISOString(), results: [] });
+
+  it('history.jsonl as a DIRECTORY: FAIL, ok=false (exit 1), no misleading "0 run(s)"', () => {
+    const d = tmp();
+    mkdirSync(path.join(d, '.flakefinder', 'history.jsonl'), { recursive: true });
+    const { lines, ok } = runDoctor(d);
+    expect(ok).toBe(false);
+    const hist = lines.filter((l) => l.message.startsWith('history:'));
+    expect(hist).toHaveLength(1);
+    expect(hist[0]!.status).toBe('fail');
+    expect(hist[0]!.message).toContain('unreadable — EISDIR');
+    expect(hist[0]!.hint).toContain('readable regular file');
+    // the remaining sections still ran
+    expect(lines.some((l) => l.message.startsWith('quarantine:'))).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'unreadable regular file (EACCES): FAIL, not an ok "0 run(s)" + "parallel writers" warning',
+    () => {
+      const d = tmp();
+      const file = path.join(d, '.flakefinder', 'history.jsonl');
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, `${run('r1')}\n`, 'utf8');
+      chmodSync(file, 0o000);
+      try {
+        const { lines, ok } = runDoctor(d);
+        expect(ok).toBe(false);
+        const hist = lines.filter((l) => l.message.startsWith('history:'));
+        expect(hist).toHaveLength(1);
+        expect(hist[0]!.status).toBe('fail');
+        expect(hist[0]!.message).toContain('unreadable — EACCES');
+      } finally {
+        chmodSync(file, 0o644);
+      }
+    },
+  );
+
+  it('readable store: ok line with the run count', () => {
+    const d = tmp();
+    const file = path.join(d, '.flakefinder', 'history.jsonl');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `{"version":1}\n${run('r1')}\n${run('r2')}\n`, 'utf8');
+    const { lines, ok } = runDoctor(d);
+    expect(ok).toBe(true);
+    const hist = lines.find((l) => l.message.startsWith('history:'))!;
+    expect(hist.status).toBe('ok');
+    expect(hist.message).toMatch(/^history: 2 run\(s\), \d+ KB, format v1$/);
   });
 });

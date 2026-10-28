@@ -76,47 +76,51 @@ export function runDoctor(cwd: string): DoctorResult {
   }
 
   // 4. history store
-  const storeDir = path.resolve(cwd, config.storeDir);
-  const historyFile = path.join(storeDir, 'history.jsonl');
-  if (existsSync(historyFile) && !statSync(historyFile).isFile()) {
-    ok = false;
-    lines.push({
-      status: 'fail',
-      message: `history: ${historyFile} exists but is not a regular file`,
-      hint: 'delete or rename it — flakefinder cannot read a directory as a store',
-    });
-  } else if (existsSync(historyFile)) {
+  const store = new HistoryStore(path.resolve(cwd, config.storeDir));
+  if (existsSync(store.path)) {
     try {
-      const store = new HistoryStore(storeDir);
-      const runs = store.runs();
-      const sizeKb = Math.round(statSync(store.path).size / 1024);
-      lines.push({
-        status: 'ok',
-        message: `history: ${runs.length} run(s), ${sizeKb} KB${store.formatVersion ? `, format v${store.formatVersion}` : ' (legacy, no header)'}`,
-      });
-      if (store.warnings.length > 0) {
+      const runs = store.runs(); // never throws on read: unreadable → store.unreadable
+      if (store.unreadable !== null) {
+        // EISDIR / EACCES: every command would see an empty history (and
+        // writes would fail) — that is a broken setup, not "0 runs".
+        ok = false;
         lines.push({
-          status: 'warn',
-          message: `history: ${store.warnings.length}+ skipped/corrupt line(s)`,
-          hint: 'history is tolerant, but repeated corruption suggests parallel writers — give each CI shard its own storeDir',
+          status: 'fail',
+          message: `history: unreadable — ${store.unreadable}`,
+          hint: `check that ${store.path} is a readable regular file (delete or rename it if it is a directory)`,
         });
-      }
-      if (runs.length > 0) {
-        const last = runs[runs.length - 1]!.timestamp;
-        const ageDays = (Date.now() - Date.parse(last)) / DAY_MS;
-        if (Number.isFinite(ageDays) && ageDays > 7) {
+      } else {
+        const sizeKb = Math.round(statSync(store.path).size / 1024);
+        lines.push({
+          status: 'ok',
+          message: `history: ${runs.length} run(s), ${sizeKb} KB${store.formatVersion ? `, format v${store.formatVersion}` : ' (legacy, no header)'}`,
+        });
+        if (store.warnings.length > 0) {
           lines.push({
             status: 'warn',
-            message: `history: last run ${Math.round(ageDays)} days ago`,
-            hint: 'flakefinder only knows what it ingests — is CI actually calling it?',
+            message: `history: ${store.warnings.length}+ skipped/corrupt line(s)`,
+            hint: 'history is tolerant, but repeated corruption suggests parallel writers — give each CI shard its own storeDir',
           });
+        }
+        if (runs.length > 0) {
+          const last = runs[runs.length - 1]!.timestamp;
+          const ageDays = (Date.now() - Date.parse(last)) / DAY_MS;
+          if (Number.isFinite(ageDays) && ageDays > 7) {
+            lines.push({
+              status: 'warn',
+              message: `history: last run ${Math.round(ageDays)} days ago`,
+              hint: 'flakefinder only knows what it ingests — is CI actually calling it?',
+            });
+          }
         }
       }
     } catch (err) {
+      // defensive: e.g. the file vanished between read and stat
       ok = false;
       lines.push({
         status: 'fail',
         message: `history: unreadable — ${(err as Error).message}`,
+        hint: `check that ${store.path} is a readable regular file`,
       });
     }
   } else {
