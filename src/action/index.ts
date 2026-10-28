@@ -14,6 +14,7 @@ import { computeNewFlakes } from './diff.js';
 import { githubEnv, upsertPrComment } from './github.js';
 import { cacheUsable, restoreHistory, saveHistory } from './history-cache.js';
 import { ingestReports } from './ingest.js';
+import { type ActionInputs, readInputs } from './inputs.js';
 import { jobSummaryHtml, newFlakesFailure } from './output.js';
 
 async function expandGlobs(patterns: string[], cwd: string): Promise<string[]> {
@@ -24,19 +25,24 @@ async function expandGlobs(patterns: string[], cwd: string): Promise<string[]> {
 }
 
 async function actionMain(): Promise<void> {
-  const workingDirectory = core.getInput('working-directory') || '.';
-  const cwd = path.resolve(process.cwd(), workingDirectory);
+  // validate every input before doing anything (no half-done runs)
+  let inputs: ActionInputs;
+  try {
+    inputs = readInputs((name) => core.getInput(name), process.cwd());
+  } catch (err) {
+    core.setFailed(`flakefinder: ${(err as Error).message}`);
+    return;
+  }
+  const cwd = inputs.cwd;
   process.chdir(cwd);
   const gh = githubEnv();
 
   const { config } = loadConfig(cwd);
-  const reportsInput = core.getInput('reports');
-  const historyMaxRuns = Number.parseInt(core.getInput('history-max-runs') || '300', 10);
   const cfg = resolveConfig(
     config,
-    reportsInput
-      ? { reports: reportsInput.split(',').map((s) => s.trim()), maxRuns: historyMaxRuns }
-      : { maxRuns: historyMaxRuns },
+    inputs.reports
+      ? { reports: inputs.reports, maxRuns: inputs.historyMaxRuns }
+      : { maxRuns: inputs.historyMaxRuns },
   );
   const storeDir = path.resolve(cwd, cfg.storeDir);
 
@@ -106,7 +112,7 @@ async function actionMain(): Promise<void> {
   // 7. dashboard artifact — BEFORE the comment, which only mentions it if
   // the upload actually happened
   let dashboardArtifact: string | undefined;
-  if (core.getBooleanInput('upload-dashboard')) {
+  if (inputs.uploadDashboard) {
     try {
       const runs = outcome.store
         .runs()
@@ -137,8 +143,8 @@ async function actionMain(): Promise<void> {
   }
 
   // 8. PR comment
-  if (core.getBooleanInput('comment') && gh.isPr) {
-    const token = core.getInput('github-token');
+  if (inputs.comment && gh.isPr) {
+    const token = inputs.githubToken;
     try {
       const result = await upsertPrComment(
         token,
@@ -152,7 +158,7 @@ async function actionMain(): Promise<void> {
   }
 
   // 9. fail gate
-  if (core.getBooleanInput('fail-on-new-flakes') && newFlakes.length > 0) {
+  if (inputs.failOnNewFlakes && newFlakes.length > 0) {
     core.setFailed(newFlakesFailure(newFlakes));
   }
 }

@@ -96,6 +96,11 @@ history is saved (the others log a warning). Give each leg its own
 | `history-max-runs` | `300` | History retention (number of runs) |
 | `working-directory` | `.` | Directory with config + reports (monorepos) |
 
+All inputs are validated before the action does anything. Booleans must be
+`true`/`false`, `history-max-runs` an integer 1–100000, and
+`working-directory` must exist. Every problem is listed in one failure
+message.
+
 ## Outputs
 
 | output | description |
