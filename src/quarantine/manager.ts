@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { QuarantineEntry, RunnerKind, TestVerdict } from '../types.js';
 
@@ -79,8 +79,20 @@ export class QuarantineManager {
     return removed;
   }
 
+  /**
+   * Atomic write: a temp file in the same directory, then rename over the
+   * target — a crash or a concurrent reader never sees a torn/half-written
+   * quarantine file (rename replaces the directory entry in one step).
+   */
   save(): void {
-    writeFileSync(this.filePath, `${JSON.stringify(this.file, null, 2)}\n`, 'utf8');
+    const tmp = `${this.filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify(this.file, null, 2)}\n`, 'utf8');
+      renameSync(tmp, this.filePath);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      throw err;
+    }
   }
 }
 

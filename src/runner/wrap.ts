@@ -7,7 +7,7 @@ import { classifyAll } from '../engine/classify.js';
 import { detectParser } from '../parsers/index.js';
 import { exclusionArgs, QuarantineManager } from '../quarantine/manager.js';
 import { HistoryStore } from '../store/history-store.js';
-import type { ResolvedConfig, RunRecord, TestVerdict } from '../types.js';
+import type { QuarantineEntry, ResolvedConfig, RunRecord, TestVerdict } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
 import { failedNamesOf, failedOnlyArgs } from './adapters.js';
 
@@ -286,9 +286,8 @@ export async function runLive(
   let quarantineFlags: string[] = [];
   let quarantinedNames: string[] = [];
   if (opts.applyQuarantine) {
+    const entries = loadQuarantine(path.resolve(cwd, cfg.quarantineFile));
     if (runner === 'pytest' || runner === 'jest' || runner === 'mocha') {
-      const qm = new QuarantineManager(path.resolve(cwd, cfg.quarantineFile));
-      const entries = qm.list();
       if (entries.length > 0) {
         quarantineFlags = exclusionArgs(runner, entries, cwd);
         quarantinedNames = entries.map((e) => e.name);
@@ -297,8 +296,7 @@ export async function runLive(
         );
       }
     } else if (runner === 'go' || runner === 'generic') {
-      const qm = new QuarantineManager(path.resolve(cwd, cfg.quarantineFile));
-      if (qm.list().length > 0) {
+      if (entries.length > 0) {
         console.log(
           `flakefinder: quarantine has entries but runner "${runner}" has no per-test exclusion — report only`,
         );
@@ -472,6 +470,23 @@ export async function runLive(
     usedReportFiles: [...usedReportFiles],
     suiteFlake,
   };
+}
+
+/**
+ * The quarantine entries for a run. An unreadable/corrupt file (e.g. torn by
+ * a crash mid-write before saves were atomic, or hand-edited) must not stop
+ * the test run: warn and run without exclusions. `doctor` still reports it
+ * as a FAIL, and `quarantine add/remove` still refuse to overwrite it.
+ */
+function loadQuarantine(file: string): QuarantineEntry[] {
+  try {
+    return new QuarantineManager(file).list();
+  } catch (err) {
+    console.warn(
+      `flakefinder: ${(err as Error).message} — running WITHOUT quarantine exclusions (see \`flakefinder doctor\`)`,
+    );
+    return [];
+  }
 }
 
 function dim(s: string): string {

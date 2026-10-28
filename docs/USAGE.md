@@ -433,6 +433,12 @@ Why so strict: a quarantined test is excluded from runs, so "not seen lately"
 is exactly what quarantine looks like when it's working. Treating absence as
 health would silently un-quarantine the entire list. Empty history → no-op.
 
+The file is written atomically (temp file + rename), so a crash mid-save
+never leaves it half-written. If it is unreadable anyway (e.g. a bad hand
+edit), `run` warns and runs **without** exclusions rather than failing;
+`doctor` reports it as a FAIL and `quarantine add/remove` refuse to touch it
+until it is fixed or deleted.
+
 flakefinder never edits your test files, never comments out tests, never
 touches your runner config. `quarantine remove <id>` (or delete the JSON
 file) restores the previous behavior exactly.

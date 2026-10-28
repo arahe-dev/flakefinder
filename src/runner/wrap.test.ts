@@ -825,3 +825,28 @@ setInterval(() => {}, 1000);
     }
   }, 30_000);
 });
+
+describe('corrupt quarantine file (R5 bug 9)', () => {
+  it('run warns and proceeds without exclusions instead of crashing', async () => {
+    const cwd = tmpCwd();
+    writeFileSync(path.join(cwd, 'script.js'), SCRIPT_ALL_PASS, 'utf8');
+    // torn write: truncated JSON
+    writeFileSync(
+      path.join(cwd, 'flakefinder.quarantine.json'),
+      '{"version":1,"entries":[{"te',
+      'utf8',
+    );
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await runLive(['node', 'script.js'], cfg({ runner: 'jest' }), {
+      retries: 0,
+      cwd,
+      applyQuarantine: true,
+    });
+    expect(result.finalExitCode).toBe(0);
+    expect(result.verdicts.map((v) => v.name)).toEqual(['stable test']);
+    expect(
+      warn.mock.calls.some((c) => String(c[0]).includes('WITHOUT quarantine exclusions')),
+    ).toBe(true);
+  }, 60_000);
+});

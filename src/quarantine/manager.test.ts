@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -127,6 +135,23 @@ describe('QuarantineManager', () => {
     qm.add(entry('t1'));
     expect(qm.prune([])).toEqual([]);
     expect(qm.list()).toHaveLength(1);
+  });
+
+  it('save is atomic: temp file + rename, no leftovers (R5 bug 9)', () => {
+    const file = tmpFile();
+    const qm = new QuarantineManager(file);
+    qm.add(entry('a'));
+    qm.save();
+    const before = statSync(file).ino;
+    const oldContent = readFileSync(file, 'utf8');
+    qm.add(entry('b'));
+    qm.save();
+    // rename swaps in a NEW inode; an in-place writeFileSync would truncate
+    // and rewrite the same one (a reader could see it torn)
+    if (process.platform !== 'win32') expect(statSync(file).ino).not.toBe(before);
+    expect(readFileSync(file, 'utf8')).not.toBe(oldContent);
+    expect(new QuarantineManager(file).list().map((e) => e.testId)).toEqual(['a', 'b']);
+    expect(readdirSync(path.dirname(file))).toEqual(['flakefinder.quarantine.json']);
   });
 
   it('corrupt file throws with the path', () => {
