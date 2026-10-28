@@ -21,6 +21,7 @@ import { renderDashboard } from '../report/html.js';
 import { renderJson } from '../report/json.js';
 import { buildPrComment, renderMarkdown } from '../report/markdown.js';
 import { renderTerminal } from '../report/terminal.js';
+import { escapeControlChars } from '../report/text.js';
 import { runLive } from '../runner/wrap.js';
 import { HistoryStore, snapshotPath } from '../store/history-store.js';
 import type {
@@ -629,7 +630,7 @@ export async function main(argv: string[]): Promise<number> {
 
       for (const v of verdicts.filter((x) => x.classification.startsWith('flaky-'))) {
         console.log(
-          `::warning title=flakefinder::${ghEscape(`${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`)}`,
+          `::warning title=flakefinder::${ghEscape(escapeControlChars(`${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`))}`,
         );
       }
 
@@ -670,7 +671,9 @@ export async function main(argv: string[]): Promise<number> {
       if (opts.failOnNewFlakes && newFlakes.length > 0) {
         console.error(`flakefinder ci: ${newFlakes.length} NEW flake(s):`);
         for (const v of newFlakes)
-          console.error(`  ${v.suite} :: ${v.name} (score ${v.flakeScore})`);
+          console.error(
+            `  ${escapeControlChars(v.suite)} :: ${escapeControlChars(v.name)} (score ${v.flakeScore})`,
+          );
         exitCode = 1;
       }
     });

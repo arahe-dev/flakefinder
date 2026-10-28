@@ -1,4 +1,5 @@
 import type { Classification, TestVerdict } from '../types.js';
+import { escapeControlChars } from './text.js';
 
 interface ClassMeta {
   label: string;
@@ -73,6 +74,8 @@ export function renderTerminal(
     list.push(v);
     byClass.set(v.classification, list);
   }
+  // untrusted strings: render control characters visibly (no raw ESC/CR/LF)
+  const safe = (s: string): string => escapeControlChars(s);
   for (const [, list] of byClass) {
     list.sort((a, b) => b.flakeScore - a.flakeScore || a.name.localeCompare(b.name));
   }
@@ -113,9 +116,9 @@ export function renderTerminal(
       const runs = String(v.runsObserved).padStart(3);
       const pass = `${Math.round(v.passRate * 100)}%`.padStart(4);
       const med = fmtMs(v.medianDurationMs).padStart(6);
-      const tags = v.tags.length > 0 ? dim(` [${v.tags.join(', ')}]`) : '';
+      const tags = v.tags.length > 0 ? dim(` [${safe(v.tags.join(', '))}]`) : '';
       lines.push(
-        `  ${color(meta.colorCode, score)}  conf ${conf}  runs ${runs}  pass ${pass}  med ${med}  ${v.suite} ${dim('::')} ${bold(truncateMiddle(v.name, 48))}${tags}`,
+        `  ${color(meta.colorCode, score)}  conf ${conf}  runs ${runs}  pass ${pass}  med ${med}  ${safe(v.suite)} ${dim('::')} ${bold(truncateMiddle(safe(v.name), 48))}${tags}`,
       );
     }
     lines.push('');
@@ -130,9 +133,9 @@ export function renderTerminal(
       const shown = cls === 'passing' ? list.slice(0, 20) : list;
       for (const v of shown) {
         const med = fmtMs(v.medianDurationMs).padStart(6);
-        const tags = v.tags.length > 0 ? dim(` [${v.tags.join(', ')}]`) : '';
+        const tags = v.tags.length > 0 ? dim(` [${safe(v.tags.join(', '))}]`) : '';
         lines.push(
-          `  ${dim(String(v.flakeScore).padStart(3))}  runs ${String(v.runsObserved).padStart(3)}  med ${med}  ${v.suite} ${dim('::')} ${truncateMiddle(v.name, 48)}${tags}`,
+          `  ${dim(String(v.flakeScore).padStart(3))}  runs ${String(v.runsObserved).padStart(3)}  med ${med}  ${safe(v.suite)} ${dim('::')} ${truncateMiddle(safe(v.name), 48)}${tags}`,
         );
       }
       if (cls === 'passing' && list.length > 20) lines.push(dim(`  …and ${list.length - 20} more`));
@@ -158,7 +161,7 @@ export function renderTerminal(
     lines.push('next steps:');
     if (worst) {
       lines.push(`  ${dim('•')} quarantine the worst offender:`);
-      lines.push(`      ${color('36', `flakefinder quarantine add ${worst.testId}`)}`);
+      lines.push(`      ${color('36', `flakefinder quarantine add ${safe(worst.testId)}`)}`);
     }
     lines.push(`  ${dim('•')} full interactive report: ${color('36', 'flakefinder html')}`);
   }

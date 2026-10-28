@@ -261,3 +261,50 @@ describe('newer-format store (QA CLI-5)', () => {
     expect(historyRecords(d)).toHaveLength(1);
   });
 });
+
+describe('ci output cannot inject workflow commands or terminal escapes (QA ACT-2)', () => {
+  it('a hostile test name stays on one visible line in the table, annotations and stderr', () => {
+    const d = tmp();
+    const name = 'x\n::error::Rotate creds\r\n::add-mask::y\x1b]0;pwned\x07\x1b[2J\u202eevil';
+    const mk = (st: 'passed' | 'failed'): string =>
+      JSON.stringify({
+        numTotalTests: 1,
+        success: st === 'passed',
+        testResults: [
+          {
+            name: '/repo/a.test.js',
+            status: st,
+            assertionResults: [
+              {
+                ancestorTitles: ['Suite'],
+                title: name,
+                fullName: name,
+                status: st,
+                failureMessages: st === 'failed' ? ['boom'] : [],
+              },
+            ],
+          },
+        ],
+      });
+    writeFileSync(
+      path.join(d, 'flakefinder.config.json'),
+      '{"reports": ["r.json"], "minRuns": 2}',
+      'utf8',
+    );
+    let r = { status: 0 as number | null, stdout: '', stderr: '' };
+    for (const st of ['passed', 'failed', 'passed', 'failed'] as const) {
+      writeFileSync(path.join(d, 'r.json'), mk(st), 'utf8');
+      r = cli(['ci', '--fail-on-new-flakes'], d);
+    }
+    const all = `${r.stdout}\n${r.stderr}`;
+    expect(all).toContain('flaky'); // the hostile test really was classified and printed
+    for (const line of all.split('\n')) {
+      if (line.startsWith('::'))
+        expect(line.startsWith('::warning title=flakefinder::')).toBe(true);
+    }
+    expect(all).not.toContain('\x1b');
+    expect(all).not.toContain('\x07');
+    expect(all).not.toContain('\u202e');
+    expect(r.stdout).toContain('x\\x0a::error::Rotate creds');
+  });
+});

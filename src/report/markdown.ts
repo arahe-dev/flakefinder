@@ -1,5 +1,6 @@
 import type { TestVerdict } from '../types.js';
 import { redact } from '../util/redact.js';
+import { escapeControlChars, truncateCodePoints } from './text.js';
 
 export const PR_COMMENT_MARKER = '<!-- flakefinder:report -->';
 
@@ -29,19 +30,12 @@ export function escapeMarkdownInline(s: string): string {
     .replace(/\|/g, '\\|');
 }
 
-/** First `max` code points (never splits a surrogate pair), with `…` when cut. */
-export function truncateCodePoints(s: string, max: number): string {
-  if (s.length <= max) return s; // UTF-16 length ≥ code points: nothing to cut
-  const cps = Array.from(s);
-  return cps.length <= max ? s : `${cps.slice(0, max - 1).join('')}…`;
-}
-
 /** Table-cell safe: one line, capped length, secrets redacted, markdown/HTML neutralised. */
 function cell(s: string | undefined, max = 80): string {
   if (!s) return '';
   // redact BEFORE truncating (a split token can't survive), escape AFTER (an
   // entity can't be cut in half)
-  const oneLine = redact(s).replace(/\r?\n/g, ' ');
+  const oneLine = escapeControlChars(redact(s).replace(/\r?\n/g, ' '));
   return escapeMarkdownInline(truncateCodePoints(oneLine, max));
 }
 

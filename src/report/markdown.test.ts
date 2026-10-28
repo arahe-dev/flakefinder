@@ -112,7 +112,7 @@ describe('secret redaction (v0.2.0)', () => {
 });
 
 describe('markdown injection is neutralised (R5 #9)', () => {
-  const ZWJ = '‍';
+  const ZWJ = '\u200d';
 
   it('@mentions in names/suites do not ping anyone', () => {
     const md = renderMarkdown([verdict({ name: 'ping @octocat and @org/team', suite: '@x' })], {
