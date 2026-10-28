@@ -111,9 +111,12 @@ Commands containing shell operators (`>`, `|`, `&&`) automatically fall back
 to shell mode so redirects keep working. After each attempt it parses the
 report files that **changed** (attempt 1 ingests only files created/changed
 since the invocation started — stale reports from previous runs are ignored)
-and records them as attempts of one run. Retry attempts re-record **all**
-matched reports: identical content is still a new attempt observation, so a
-fail-fail-pass sequence with a deterministic report is detected as a rescue.
+and records them as attempts of one run. Retry attempts record every report
+the attempt **wrote** — a byte-identical rewrite still counts (its mtime
+moves), so a fail-fail-pass sequence with a deterministic report is detected
+as a rescue — while files nobody touched (stale reports from another job, or
+the previous attempt's report when a retry crashed before writing) are not
+recorded again.
 Then it classifies and prints a terminal report restricted to the tests
 observed in this invocation.
 
@@ -124,19 +127,27 @@ observed in this invocation.
   (`run -R/--retries must be an integer 0–10 (got 50)`), not the config.
 - `--fail-on-flake` — exit non-zero when *flakes* (not just real failures) are
   detected. Default behavior: flakes alone exit 0, so known flakes don't fail
-  your CI gate.
+  your CI gate. Only tests that actually executed in this invocation count:
+  quarantined tests (even if the runner lists them as skipped) and tests
+  that only skipped never trip it.
 - `--no-quarantine` — run the full suite, ignoring the quarantine list.
 - `--timeout <seconds>` — kill the attempt (whole process tree) after N
   seconds (an integer 1–2147483); the attempt counts as failed (exit 124, GNU-timeout convention)
   and the retry loop proceeds. Default: config `timeoutSeconds`, itself
-  unlimited. SIGINT/SIGTERM (Ctrl-C) kill the current tree, stop the loop,
-  and exit 130 while keeping everything observed so far in history.
+  unlimited. SIGINT/SIGTERM (Ctrl-C) are forwarded to the current tree, stop
+  the loop, and exit 130 while keeping everything observed so far in history.
+  On POSIX each attempt runs in its own process group (that is how the whole
+  tree is reached), so when stdin is a terminal the test command gets an empty
+  stdin — interactive/watch modes are not supported under `run`.
 - `--retry-mode auto|failed|full` — retry strategy (default: config `retryMode`,
-  itself default `auto`). `auto`: attempt 1 runs everything; re-runs execute
-  **only the failed tests** — jest/vitest via `-t`, mocha via `--grep`, go via
+  itself default `auto`). `auto`: attempt 1 runs everything; each re-run
+  executes **only the tests that failed on the previous attempt** (a test that
+  already recovered is not re-run again) — jest/vitest via `-t`, mocha via `--grep`, go via
   `-run`, pytest via `--lf` — falling back to a full re-run when the runner has
-  no adapter or attempt 1 recorded no failures. `full` restores re-running the
-  entire command every attempt.
+  no adapter, the previous attempt recorded no failures, or the selector would
+  be too long to pass to the OS (more than 32 KiB — thousands of failures;
+  6000 chars on Windows). `full` restores re-running the entire command every
+  attempt.
 
 **Targeted re-runs** cut retry cost from 3×(whole suite) to roughly
 suite + 2×(failed tests only). One honest caveat: order-dependent flakes may
@@ -147,10 +158,16 @@ explicitly *passes* on a re-run, so an empty or partial re-run can never fake
 a rescue. Two implementation notes: targeted selectors match failed test
 names as space-delimited final segments of the full name (a failure named
 `update` does not drag in `math re-update`), and quarantined tests are
-excluded from re-runs even on name collisions. pytest's `--lf` trusts pytest's
+excluded from re-runs even on name collisions (pytest `--lf` retries keep the
+`--deselect` flags; with `-p no:cacheprovider` on the command line `--lf` is
+unavailable, so pytest retries are full re-runs). pytest's `--lf` trusts pytest's
 own last-failed cache — a stale cache from a *manual* pytest run outside
 flakefinder could re-run a quarantined test once; clear it with
-`pytest --cache-clear` if that ever bites.
+`pytest --cache-clear` if that ever bites. If your command already passes
+its own jest `-t`/`--testNamePattern` or mocha `--grep`/`-g`/`--fgrep`, it is
+folded into flakefinder's selector (both must match) instead of being passed
+twice. A go `-run` (or mocha `--invert`) cannot be combined — flakefinder
+warns once that its injected selector comes later and wins.
 
 If quarantined entries exist and the runner supports exclusion, the exclusion
 flags are appended automatically (with a notice); see
@@ -401,12 +418,23 @@ forward what follows `--` to the underlying runner.
 
 Per runner:
 
-- **pytest** — one `--deselect "<suite>::<name>"` pair per entry. pytest
-  skips those node ids; the rest of the suite runs normally.
+- **pytest** — one `--deselect <node id>` pair per entry. The stored suite
+  is pytest's JUnit classname (`tests.test_x.TestCls`), so it is converted
+  back to a rootdir-relative node id (`tests/test_x.py::TestCls::test_y`):
+  the module is the longest dotted prefix that exists as a `.py` file,
+  falling back to "trailing Capitalized components are classes". pytest
+  skips those node ids; the rest of the suite runs normally. Note that pytest
+  matches `--deselect` as a node-id *prefix*, so quarantining `test_mod` also
+  deselects a sibling named `test_mod2` in the same module/class.
 - **Jest** — a single `-t "<pattern>"` where pattern is
-  `^(?!.*(?:name1|name2))` (names regex-escaped, deduped): a negative
+  `^(?!(?:.* )?(?:name1|name2)\s*$)` (names regex-escaped, deduped): a negative
   lookahead that matches every test name *except* the quarantined ones, so
-  Jest's name filter keeps everything else.
+  Jest's name filter keeps everything else. `-t` sees the full name
+  (describe chain + title, space-joined), and each quarantined title must be
+  its whole final segment: quarantining `login` excludes `login` and
+  `ui login`, but not `login ok works` or `relogin`. vitest's JUnit names
+  (`suite > test`) match the space-joined name `-t` sees, and a title with
+  trailing whitespace still matches.
 - **Mocha** — same construction via `--grep`.
 - **Go / generic** — **no per-test exclusion exists** in `go test`; entries
   are stored and reported (you'll see exactly which tests are quarantined)
@@ -414,11 +442,17 @@ Per runner:
 
 **Prune policy (deliberately conservative).** `quarantine prune` removes an
 entry only on *positive* evidence: the verdict is `passing` with ≥ 10 runs
-observed (i.e. it ran — with quarantine disabled or a full-suite run — and
-was stable), or the test is `gone` while the entry is older than 90 days.
+observed and the test was last seen *after* it was quarantined (i.e. it ran —
+with quarantine disabled or a full-suite run — and was stable), or the test is `gone` while the entry is older than 90 days.
 Why so strict: a quarantined test is excluded from runs, so "not seen lately"
 is exactly what quarantine looks like when it's working. Treating absence as
 health would silently un-quarantine the entire list. Empty history → no-op.
+
+The file is written atomically (temp file + rename), so a crash mid-save
+never leaves it half-written. If it is unreadable anyway (e.g. a bad hand
+edit), `run` warns and runs **without** exclusions rather than failing;
+`doctor` reports it as a FAIL and `quarantine add/remove` refuse to touch it
+until it is fixed or deleted.
 
 flakefinder never edits your test files, never comments out tests, never
 touches your runner config. `quarantine remove <id>` (or delete the JSON
@@ -555,8 +589,9 @@ recover within a few runs.
 **Windows paths** — use forward slashes in globs (`test-results/*.xml` works
 everywhere). `run` spawns your command directly (no shell) so arguments with
 spaces survive intact; commands with `>` redirects or pipes automatically
-switch to shell mode where they behave as in your terminal — quote paths
-containing spaces in that case. The store and reports use `path.join`, so
+switch to shell mode, where every argument token is quoted for the shell
+(POSIX single quotes; caret-escaping for cmd.exe) so it still arrives
+verbatim — only the operator tokens themselves are interpreted. The store and reports use `path.join`, so
 mixed separators in existing files are tolerated. In scripts that wrap the
 CLI, pass the go redirect as **argument tokens**
 (`… -- go test -json ./... ">" test-output.jsonl`) rather than letting an
