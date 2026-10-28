@@ -9,12 +9,15 @@
  * Per `<testcase>`:
  * - name   = @_name (testcases without a name are skipped with a warning)
  * - suite  = @_classname when present, else the nearest enclosing testsuite's @_name
- * - status = fail (child <failure>) | error (child <error>) | skip (child <skipped>) | pass
+ * - status = skip (child <skipped>, unless an <error> is also present — a failing TODO test is
+ *   a skip, as in TAP) | fail (<failure>) | error (<error>) | pass. With several
+ *   <failure>/<error> children the first one is used and the rest are counted in the message.
  * - durationMs = round(@_time * 1000) when @_time parses as a finite number, else null
  *   (decimal comma `1,5` → 1.5 s; grouping commas `1,033.42` → 1033.42 s)
  * - text and attribute values are never coerced to numbers; numeric character
  *   references (`&#65;`) are decoded
- * - message = failure/error @_message or its text content, trimmed to 2000 chars
+ * - message = failure/error @_message (ignored when it is a bare "Failed", as gotestsum
+ *   writes) or its text content, else its @_type; trimmed to 2000 chars
  * - stack   = failure/error text content, trimmed to 1000 chars
  *
  * Maven Surefire/Failsafe reruns (`-Dsurefire.rerunFailingTestsCount=N`):
@@ -28,6 +31,10 @@
  *   'fail' rows could not carry the signal — see the parser report notes.
  * - `<rerunFailure>`/`<rerunError>` next to `<failure>`/`<error>`: it failed on
  *   every attempt — still 'fail'/'error', message notes the attempt count.
+ *
+ * pytest-rerunfailures (`<testsuite name="pytest">` reports): rerun attempts are written as
+ * empty duplicate testcases; they are collapsed into the final result with the same flaky
+ * note / "(failed all n attempts)" representation (see collapsePytestReruns).
  *
  * Never throws: malformed input produces warnings.
  */
@@ -55,6 +62,8 @@ interface Ctx {
   warnings: string[];
   /** `suite.name` of tests that passed only after a Surefire rerun. */
   flaky: string[];
+  /** The report came from pytest (`<testsuite name="pytest">`). */
+  pytest: boolean;
 }
 
 /** Attribute value as a non-empty string (whitespace-only counts as absent). */
@@ -91,8 +100,18 @@ function durationOf(timeAttr: string | undefined): number | null {
 
 /** message attribute, else text content, else the Surefire `<stackTrace>` child's text. */
 function detailMessage(detail: unknown): string | undefined {
-  const fromAttr = isObj(detail) ? attr(detail, '@_message') : undefined;
-  return trimTo(fromAttr, MESSAGE_MAX_CHARS) ?? trimTo(detailStack(detail), MESSAGE_MAX_CHARS);
+  let fromAttr = isObj(detail) ? attr(detail, '@_message') : undefined;
+  // gotestsum writes message="Failed" on every failure — no information; the
+  // text content (the test's output) is the real message
+  if (fromAttr !== undefined && /^\s*(?:failed|failure|error)\s*$/i.test(fromAttr)) {
+    fromAttr = undefined;
+  }
+  return (
+    trimTo(fromAttr, MESSAGE_MAX_CHARS) ??
+    trimTo(detailStack(detail), MESSAGE_MAX_CHARS) ??
+    // `<error type="java.lang.NPE"/>`: the type is all there is
+    (isObj(detail) ? trimTo(attr(detail, '@_type'), MESSAGE_MAX_CHARS) : undefined)
+  );
 }
 
 /** Text content, else the Surefire `<stackTrace>` child (rerun/flaky elements nest it). */
@@ -115,17 +134,26 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
   }
   const suite = attr(tc, '@_classname') ?? suiteName;
 
+  const failures = children(tc, 'failure');
+  const errors = children(tc, 'error');
+  const skipped = children(tc, 'skipped').length > 0;
+
+  // <skipped> + <failure> is a skipped/TODO test that failed anyway (node:test
+  // TODO) → skip, as TAP reports it. A real <error> still wins over <skipped>.
   let status: TestStatus = 'pass';
-  let detail: unknown;
-  if (tc.failure !== undefined) {
+  let details: unknown[] = [];
+  if (skipped && errors.length === 0) {
+    status = 'skip';
+  } else if (failures.length > 0) {
     status = 'fail';
-    detail = tc.failure;
-  } else if (tc.error !== undefined) {
+    details = failures;
+  } else if (errors.length > 0) {
     status = 'error';
-    detail = tc.error;
-  } else if (tc.skipped !== undefined) {
+    details = errors;
+  } else if (skipped) {
     status = 'skip';
   }
+  const detail = details[0];
 
   const result: TestCaseResult = {
     testId: makeTestId(suite, name),
@@ -135,7 +163,13 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
     durationMs: durationOf(attr(tc, '@_time')),
   };
   if (detail !== undefined) {
-    const message = detailMessage(detail);
+    let message = detailMessage(detail);
+    if (details.length > 1) {
+      // several <failure>/<error> children: keep the first, count the rest
+      const kind = status === 'fail' ? 'failure' : 'error';
+      const more = `(+${details.length - 1} more ${kind}${details.length > 2 ? 's' : ''})`;
+      message = trimTo(message !== undefined ? `${message}\n${more}` : more, MESSAGE_MAX_CHARS);
+    }
     const stack = trimTo(textOf(detail), STACK_MAX_CHARS);
     if (message !== undefined) result.message = message;
     if (stack !== undefined) result.stack = stack;
@@ -166,6 +200,48 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
 }
 
 /**
+ * pytest-rerunfailures writes every rerun attempt as an EMPTY duplicate
+ * <testcase> before the final one (the rerun outcome has no JUnit form), so a
+ * fail→pass test looked like two clean passes. In a pytest report, a test
+ * whose earlier duplicates are all empty passes is collapsed into its final
+ * result: pass → flaky note (like Surefire reruns), fail → "(failed all n
+ * attempts)". Other duplicates are left as they are.
+ */
+function collapsePytestReruns(ctx: Ctx): void {
+  const groups = new Map<string, TestCaseResult[]>();
+  for (const r of ctx.results) {
+    const g = groups.get(r.testId);
+    if (g) g.push(r);
+    else groups.set(r.testId, [r]);
+  }
+  const out: TestCaseResult[] = [];
+  for (const group of groups.values()) {
+    const final = group[group.length - 1]!;
+    const earlier = group.slice(0, -1);
+    const reruns =
+      earlier.length > 0 &&
+      earlier.every((r) => r.status === 'pass' && r.message === undefined && r.stack === undefined);
+    if (!reruns) {
+      out.push(...group);
+      continue;
+    }
+    const how = 'pytest-rerunfailures rerun';
+    if (final.status === 'pass') {
+      final.message = flakyRetryMessage(earlier.length, how, undefined, MESSAGE_MAX_CHARS);
+      ctx.flaky.push(`${final.suite}.${final.name}`);
+    } else if (final.status === 'fail' || final.status === 'error') {
+      const note = `(failed all ${group.length} attempts)`;
+      final.message = trimTo(
+        final.message !== undefined ? `${final.message}\n${note}` : note,
+        MESSAGE_MAX_CHARS,
+      );
+    }
+    out.push(final);
+  }
+  ctx.results = out;
+}
+
+/**
  * Namespace-tolerant child lookup: matches `testcase`, `x:testcase`, etc.
  * fast-xml-parser keeps the namespace prefix in tag names.
  */
@@ -187,6 +263,7 @@ function children(el: Record<string, unknown>, localName: string): unknown[] {
 function walk(el: unknown, inheritedSuite: string, ctx: Ctx): void {
   if (!isObj(el)) return;
   const ownSuite = attr(el, '@_name') ?? inheritedSuite;
+  if (ownSuite === 'pytest') ctx.pytest = true;
   for (const tc of children(el, 'testcase')) mapTestCase(tc, ownSuite, ctx);
   for (const ts of children(el, 'testsuite')) walk(ts, ownSuite, ctx);
 }
@@ -201,7 +278,7 @@ export const junitParser: ReportParser = {
   },
 
   parse(content: string, sourcePath: string): { results: TestCaseResult[]; warnings: string[] } {
-    const ctx: Ctx = { sourcePath, results: [], warnings: [], flaky: [] };
+    const ctx: Ctx = { sourcePath, results: [], warnings: [], flaky: [], pytest: false };
     const body = stripBom(content);
 
     if (body.trim() === '') {
@@ -240,8 +317,10 @@ export const junitParser: ReportParser = {
       return { results: ctx.results, warnings: ctx.warnings };
     }
     walk(root, 'unknown', ctx);
+    if (ctx.pytest) collapsePytestReruns(ctx);
     if (ctx.flaky.length > 0) {
-      ctx.warnings.push(flakyRetryWarning('junit', sourcePath, 'Surefire rerun', ctx.flaky));
+      const how = ctx.pytest ? 'pytest-rerunfailures rerun' : 'Surefire rerun';
+      ctx.warnings.push(flakyRetryWarning('junit', sourcePath, how, ctx.flaky));
     }
     return { results: ctx.results, warnings: ctx.warnings };
   },

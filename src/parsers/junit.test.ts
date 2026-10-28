@@ -279,3 +279,63 @@ describe('XML text fidelity (r5 #8)', () => {
     expect(results.map((r) => r.durationMs)).toEqual([1500, 25, 1033420, 2500]);
   });
 });
+
+// QA fixtures (real tool output, paths → /repo):
+// junit-pytest-reruns.xml — pytest 9 + pytest-rerunfailures `--reruns 2`:
+//   test_flips fails once then passes; test_always fails all 3 attempts. Each
+//   rerun attempt is written as an EMPTY duplicate <testcase>.
+// junit-node-test.xml — node 20 `--test-reporter=junit` (a failing TODO test
+//   carries both <skipped> and <failure>).
+// junit-gotestsum.xml — gotestsum 1.12 (message="Failed" on every failure).
+// junit-attrs.xml — QA's hand-made edge cases (multiple <failure>, bare <error type>).
+describe('JUnit QA findings (PAR-13, PAR-14, PAR-17)', () => {
+  it('PAR-13: pytest-rerunfailures duplicates collapse into one flaky/failing result', () => {
+    const { results, warnings } = junitParser.parse(load('junit-pytest-reruns.xml'), 'r.xml');
+    expect(results.map((r) => `${r.name}:${r.status}`)).toEqual([
+      'test_flips:pass',
+      'test_always:fail',
+    ]);
+    expect(results[0]!.message).toBe(
+      'flaky: failed 1 of 2 attempts before passing on pytest-rerunfailures rerun',
+    );
+    expect(results[1]!.message).toContain('AssertionError: always');
+    expect(results[1]!.message).toContain('(failed all 3 attempts)');
+    expect(warnings.some((w) => w.includes('FLAKY') && w.includes('rr.test_rr.test_flips'))).toBe(
+      true,
+    );
+  });
+
+  it('PAR-13: duplicates outside pytest reports are left alone', () => {
+    const content =
+      '<testsuites><testsuite name="a"><testcase classname="c" name="t"/></testsuite>' +
+      '<testsuite name="b"><testcase classname="c" name="t"/></testsuite></testsuites>';
+    const { results, warnings } = junitParser.parse(content, 'inline');
+    expect(results).toHaveLength(2);
+    expect(warnings).toEqual([]);
+  });
+
+  it('PAR-14: <skipped> + <failure> (node TODO that failed) is a skip, like TAP', () => {
+    const { results } = junitParser.parse(load('junit-node-test.xml'), 'node.xml');
+    expect(results.find((r) => r.name === 'todo failing')!.status).toBe('skip');
+    const attrs = junitParser.parse(load('junit-attrs.xml'), 'attrs.xml').results;
+    expect(attrs.find((r) => r.name === 'skipped-and-failure')!.status).toBe('skip');
+  });
+
+  it('PAR-17: multiple <failure>s keep the first message; bare <error type> uses the type', () => {
+    const { results } = junitParser.parse(load('junit-attrs.xml'), 'attrs.xml');
+    const both = results.find((r) => r.name === 'both')!;
+    expect(both).toMatchObject({ status: 'fail', message: 'm1\n(+1 more failure)', stack: 't1' });
+    expect(results.find((r) => r.name === 'err-attr-only')).toMatchObject({
+      status: 'error',
+      message: 'java.lang.NPE',
+    });
+  });
+
+  it('PAR-17: gotestsum\'s generic message="Failed" yields to the real output', () => {
+    const { results } = junitParser.parse(load('junit-gotestsum.xml'), 'g.xml');
+    const fails = results.filter((r) => r.status === 'fail');
+    expect(fails.length).toBeGreaterThan(0);
+    expect(fails.every((r) => r.message !== 'Failed')).toBe(true);
+    expect(fails.some((r) => r.message?.includes('unicode fail'))).toBe(true);
+  });
+});
