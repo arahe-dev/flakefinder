@@ -129086,7 +129086,7 @@ ${hasVerdicts ? drawerMarkup : ""}
 }
 
 // src/types.ts
-var FLAKEFINDER_VERSION = "1.1.0";
+var FLAKEFINDER_VERSION = "1.1.1";
 
 // src/report/json.ts
 function renderJson(verdicts, cfg) {
