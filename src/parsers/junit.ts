@@ -11,6 +11,9 @@
  * - suite  = @_classname when present, else the nearest enclosing testsuite's @_name
  * - status = fail (child <failure>) | error (child <error>) | skip (child <skipped>) | pass
  * - durationMs = round(@_time * 1000) when @_time parses as a finite number, else null
+ *   (decimal comma `1,5` → 1.5 s; grouping commas `1,033.42` → 1033.42 s)
+ * - text and attribute values are never coerced to numbers; numeric character
+ *   references (`&#65;`) are decoded
  * - message = failure/error @_message or its text content, trimmed to 2000 chars
  * - stack   = failure/error text content, trimmed to 1000 chars
  *
@@ -31,9 +34,9 @@
 import { XMLParser } from 'fast-xml-parser';
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
-import { errorMessage, isObj, stripBom, trimTo } from './internal.js';
+import { errorMessage, isObj, stripBom, trimTo, XML_OPTIONS } from './internal.js';
 
-const xml = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+const xml = new XMLParser(XML_OPTIONS);
 
 const MESSAGE_MAX_CHARS = 2000;
 const STACK_MAX_CHARS = 1000;
@@ -65,9 +68,18 @@ function textOf(node: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * `time` in seconds → ms. Localized writers emit a decimal comma (`1,5`);
+ * old Surefire emits grouping commas (`1,033.42`). A lone comma is a
+ * decimal separator; commas alongside a '.' are grouping.
+ */
 function durationOf(timeAttr: string | undefined): number | null {
   if (timeAttr === undefined) return null;
-  const seconds = Number.parseFloat(timeAttr);
+  const raw = timeAttr.trim();
+  const normalized = raw.includes('.')
+    ? raw.replace(/,/g, '')
+    : raw.replace(/^(\d*),(\d+)$/, '$1.$2');
+  const seconds = Number.parseFloat(normalized);
   return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : null;
 }
 

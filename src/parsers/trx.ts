@@ -40,9 +40,9 @@
 import { XMLParser } from 'fast-xml-parser';
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
-import { errorMessage, isObj, stripBom, toArray, trimTo } from './internal.js';
+import { errorMessage, isObj, stripBom, toArray, trimTo, XML_OPTIONS } from './internal.js';
 
-const xml = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+const xml = new XMLParser(XML_OPTIONS);
 
 interface Ctx {
   sourcePath: string;

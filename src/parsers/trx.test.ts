@@ -205,3 +205,14 @@ describe('TRX real dotnet output (r5 #7)', () => {
     expect(results[1]!.message).toBe('cleanup blew up');
   });
 });
+
+describe('TRX XML text fidelity (r5 #8)', () => {
+  it('keeps numeric ErrorInfo text and decodes numeric character references', () => {
+    const content =
+      '<TestRun><Results><UnitTestResult testName="Caf&#xE9;Test" outcome="Failed">' +
+      '<Output><ErrorInfo><Message>42</Message><StackTrace>1</StackTrace></ErrorInfo></Output>' +
+      '</UnitTestResult></Results></TestRun>';
+    const { results } = trxParser.parse(content, 'inline');
+    expect(results[0]).toMatchObject({ name: 'CaféTest', message: '42', stack: '1' });
+  });
+});

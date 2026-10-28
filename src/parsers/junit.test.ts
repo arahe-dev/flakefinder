@@ -249,3 +249,33 @@ describe('Surefire reruns (r5 #1)', () => {
     expect(warnings).toHaveLength(1);
   });
 });
+
+describe('XML text fidelity (r5 #8)', () => {
+  it('keeps numeric-looking failure text as a string (no number coercion)', () => {
+    const content =
+      '<testsuite name="s">' +
+      '<testcase classname="c" name="n1"><failure>42</failure></testcase>' +
+      '<testcase classname="c" name="n2"><error type="E">007</error></testcase>' +
+      '</testsuite>';
+    const { results } = junitParser.parse(content, 'inline');
+    expect(results[0]).toMatchObject({ status: 'fail', message: '42', stack: '42' });
+    expect(results[1]).toMatchObject({ status: 'error', message: '007', stack: '007' });
+  });
+
+  it('decodes numeric character references in names and messages', () => {
+    const content =
+      '<testsuite name="s"><testcase classname="caf&#233;" name="&#x41;dds &#65;">' +
+      '<failure message="expected &#x2264; 3">x</failure></testcase></testsuite>';
+    const { results } = junitParser.parse(content, 'inline');
+    expect(results[0]).toMatchObject({ suite: 'café', name: 'Adds A', message: 'expected ≤ 3' });
+    expect(results[0]!.testId).toBe(makeTestId('café', 'Adds A'));
+  });
+
+  it('reads comma-decimal and grouped times correctly', () => {
+    const tc = (name: string, time: string) =>
+      `<testcase classname="c" name="${name}" time="${time}"/>`;
+    const content = `<testsuite name="s">${tc('a', '1,5')}${tc('b', '0,025')}${tc('c', '1,033.42')}${tc('d', '2.5')}</testsuite>`;
+    const { results } = junitParser.parse(content, 'inline');
+    expect(results.map((r) => r.durationMs)).toEqual([1500, 25, 1033420, 2500]);
+  });
+});

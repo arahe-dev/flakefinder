@@ -2,6 +2,23 @@
  * Shared helpers internal to src/parsers — not part of the frozen public contract.
  */
 
+/**
+ * fast-xml-parser options shared by the XML parsers (junit, trx):
+ * - parseTagValue/parseAttributeValue false: text stays text — otherwise
+ *   `<failure>42</failure>` becomes the number 42 (and `007` becomes 7), which
+ *   text extraction then drops.
+ * - htmlEntities true: numeric character references (`&#65;`, `&#x41;`) in
+ *   names and messages are decoded (the default only handles the five XML
+ *   named entities). CDATA content is left verbatim.
+ */
+export const XML_OPTIONS = {
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  parseTagValue: false,
+  parseAttributeValue: false,
+  htmlEntities: true,
+} as const;
+
 /** True for a non-null, non-array object. */
 export function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
