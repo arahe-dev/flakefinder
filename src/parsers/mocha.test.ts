@@ -161,3 +161,48 @@ describe('mocha pass/fail-only shape (QA B-F1)', () => {
     });
   });
 });
+
+// mocha-same-title-hook.json: REAL `mocha --reporter json` (mocha 10.8) for
+// a.spec.js + b.spec.js (both `describe('api') > it('responds')`; only b's
+// fails) and c.spec.js (`describe('db')` whose before() throws, so
+// `it('queries')` never runs). Paths rewritten to /repo/test.
+describe('mocha status matching + hook failures (r5 #9)', () => {
+  it('one failure does not mark every same-titled test failed', () => {
+    const { results } = mochaParser.parse(load('mocha-same-title-hook.json'), 'mocha.json');
+    const responds = results.filter((r) => r.name === 'responds');
+    expect(responds).toHaveLength(2);
+    expect(responds.map((r) => r.status)).toEqual(['pass', 'fail']);
+    expect(responds[0]).not.toHaveProperty('message');
+    expect(responds[1]!.message).toContain('second api broke');
+  });
+
+  it('surfaces a "before all" hook failure that the tests array never lists', () => {
+    const { results, warnings } = mochaParser.parse(
+      load('mocha-same-title-hook.json'),
+      'mocha.json',
+    );
+    const hook = results.find((r) => r.name.includes('hook'))!;
+    expect(hook).toMatchObject({
+      suite: 'db',
+      name: '"before all" hook',
+      status: 'fail',
+      message: 'cannot connect',
+    });
+    expect(hook.stack).toContain('Error: cannot connect');
+    expect(results).toHaveLength(3);
+    expect(warnings.some((w) => w.includes('hook') && w.includes('db'))).toBe(true);
+  });
+
+  it('matches duplicates within one file in order (multiset, not set membership)', () => {
+    const t = (title: string) => ({ title, fullTitle: `s ${title}`, file: 'f.js' });
+    const doc = {
+      stats: {},
+      tests: [t('dup'), t('dup')],
+      passes: [t('dup')],
+      failures: [{ ...t('dup'), err: { message: 'boom' } }],
+      pending: [],
+    };
+    const { results } = mochaParser.parse(JSON.stringify(doc), 'inline');
+    expect(results.map((r) => r.status).sort()).toEqual(['fail', 'pass']);
+  });
+});
