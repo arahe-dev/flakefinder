@@ -24,6 +24,9 @@ export function snapshotPath(storeDir: string): string {
 /** Current on-disk schema version, stamped as a {"version":N} header line. */
 export const STORE_FORMAT_VERSION = 1;
 
+/** Thrown when the store lock stays held by another process past the wait deadline. */
+export class StoreBusyError extends Error {}
+
 /** A lock older than this is treated as abandoned by a dead process. */
 const LOCK_STALE_MS = 30_000;
 
@@ -230,26 +233,41 @@ export class HistoryStore {
     const deadline = Date.now() + 2000;
     for (;;) {
       if (this.tryCreateLock()) return;
-      let content: string | null = null;
-      try {
-        content = readFileSync(this.lockPath, 'utf8');
-      } catch {
-        continue; // released between our create attempt and this read — retry now
-      }
-      const ageMs = lockAgeMs(this.lockPath, content);
-      if (ageMs === null) continue; // vanished — retry now
-      if (ageMs > LOCK_STALE_MS && breakStaleLock(this.lockPath, content)) continue;
+      // checked on EVERY iteration — no path below may spin past it
       if (Date.now() >= deadline) {
-        throw new Error(
+        throw new StoreBusyError(
           `history store is busy (held by another flakefinder process for >2s): ${this.lockPath}. ` +
             'Run ingest steps serially, or give each CI shard its own storeDir.',
         );
       }
+      let content: string;
+      try {
+        content = readFileSync(this.lockPath, 'utf8');
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') continue; // released in between — retry now
+        throw this.lockError(code, 'exists but cannot be read as a lock file');
+      }
+      const ageMs = lockAgeMs(this.lockPath, content);
+      if (ageMs === null) continue; // vanished — retry now
+      if (ageMs > LOCK_STALE_MS && breakStaleLock(this.lockPath, content)) continue;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
 
-  /** One attempt to take the lock; true on success, false when it is held. */
+  private lockError(code: string | undefined, what: string): Error {
+    return new Error(
+      `history store lock ${this.lockPath} ${what} (${code ?? 'error'}) — ` +
+        'check that the store directory is writable and that the lock path is not a directory',
+    );
+  }
+
+  /**
+   * One attempt to take the lock: true on success, false ONLY when another
+   * process holds it (EEXIST). Anything else — read-only directory (EACCES,
+   * EROFS), missing dir, … — throws: retrying cannot fix it, and treating it
+   * as "held" used to spin forever.
+   */
   private tryCreateLock(): boolean {
     const token = JSON.stringify({
       pid: process.pid,
@@ -257,7 +275,11 @@ export class HistoryStore {
       nonce: randomBytes(6).toString('hex'),
     });
     const tmp = `${this.lockPath}.${uniqueSuffix()}.tmp`;
-    writeFileSync(tmp, token, 'utf8');
+    try {
+      writeFileSync(tmp, token, 'utf8');
+    } catch (err) {
+      throw this.lockError((err as NodeJS.ErrnoException).code, 'cannot be created');
+    }
     try {
       linkSync(tmp, this.lockPath);
       this.lockToken = token;
@@ -271,8 +293,10 @@ export class HistoryStore {
         writeFileSync(this.lockPath, token, { flag: 'wx' });
         this.lockToken = token;
         return true;
-      } catch {
-        return false;
+      } catch (err2) {
+        const code2 = (err2 as NodeJS.ErrnoException).code;
+        if (code2 === 'EEXIST') return false;
+        throw this.lockError(code2, 'cannot be created');
       }
     } finally {
       rmSync(tmp, { force: true });
@@ -351,7 +375,16 @@ export class HistoryStore {
     if (this.unreadable) return; // never rewrite a store we could not read
     if (!existsSync(this.path)) return;
     this.ensureStoreDir(); // lock file lives in the store dir
-    this.acquireLock();
+    try {
+      this.acquireLock();
+    } catch (err) {
+      // pruning is maintenance: when another writer holds the lock, skip it
+      // (the next write prunes) rather than fail a command whose record was
+      // already appended — a retry would then double-count that run
+      if (!(err instanceof StoreBusyError)) throw err;
+      this.warnings.push(`history store busy — prune skipped this time: ${this.path}`);
+      return;
+    }
     try {
       // fresh read under the lock — the on-disk state may include other
       // processes' appends made after our load. A separate instance parses

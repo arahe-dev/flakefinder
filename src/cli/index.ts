@@ -383,6 +383,7 @@ export async function main(argv: string[]): Promise<number> {
         used++;
       }
       store.prune(cfg.maxRuns);
+      printStoreWarnings(store);
       console.log(
         `ingested ${total} test result(s) from ${used}/${targets.length} file(s) (${warnings} warning(s)) → ${store.path}`,
       );

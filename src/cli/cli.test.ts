@@ -243,3 +243,21 @@ describe('report/html/ci surface store warnings on stderr (R5 #7)', () => {
     expect(r.stderr).toContain('skipping corrupt line');
   });
 });
+
+describe('newer-format store (QA CLI-5)', () => {
+  it('ingest warns about a v2 store and prune keeps the v2 header', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{"maxRuns": 1}', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const hist = path.join(d, '.flakefinder', 'history.jsonl');
+    const lines = readFileSync(hist, 'utf8').split('\n');
+    lines[0] = JSON.stringify({ version: 2 });
+    writeFileSync(hist, lines.join('\n'), 'utf8');
+    const r = cli(['ingest', 'r.xml'], d); // 2 records > maxRuns 1 → prune rewrites
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('store format v2 is newer than this flakefinder');
+    expect(JSON.parse(readFileSync(hist, 'utf8').split('\n')[0]!)).toEqual({ version: 2 });
+    expect(historyRecords(d)).toHaveLength(1);
+  });
+});

@@ -498,3 +498,46 @@ describe('lock cannot be stolen from a live holder (R5 #2)', () => {
     expect(readFileSync(lock, 'utf8')).toBe(foreign);
   });
 });
+
+describe('lock failures that retrying cannot fix (QA CLI-1/CLI-12)', () => {
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'a read-only store dir fails fast with a clear error instead of spinning forever',
+    () => {
+      const a = tmpStore();
+      a.append(record('r1', 'pass'));
+      const dir = path.dirname(a.path);
+      chmodSync(dir, 0o555);
+      try {
+        const t0 = Date.now();
+        expect(() => new HistoryStore(dir).append(record('r2', 'pass'))).toThrow(
+          /lock .* cannot be created \(EACCES\).*writable/,
+        );
+        expect(Date.now() - t0).toBeLessThan(1000);
+        expect(() => new HistoryStore(dir).prune(0)).not.toThrow(/busy/);
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+    },
+  );
+
+  it('a DIRECTORY at the lock path is a clear error, not a raw EISDIR or a hang', () => {
+    const a = tmpStore();
+    a.append(record('r1', 'pass'));
+    mkdirSync(`${a.path}.lock`);
+    const t0 = Date.now();
+    expect(() => a.append(record('r2', 'pass'))).toThrow(
+      /history store lock .*\.lock exists but cannot be read as a lock file \(EISDIR\)/,
+    );
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('prune skips (with a warning) instead of throwing when the lock is busy', () => {
+    const a = tmpStore();
+    for (let i = 1; i <= 4; i++) a.append(record(`r${i}`, 'pass'));
+    writeFileSync(`${a.path}.lock`, JSON.stringify({ pid: 1, epoch: Date.now() }), 'utf8');
+    expect(() => a.prune(2)).not.toThrow();
+    expect(a.warnings.some((w) => w.includes('prune skipped'))).toBe(true);
+    rmSync(`${a.path}.lock`);
+    expect(new HistoryStore(path.dirname(a.path)).runs()).toHaveLength(4); // untouched
+  });
+});
