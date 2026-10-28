@@ -278,3 +278,24 @@ describe('retry-then-pass (QA PAR-6)', () => {
     expect(warnings.some((x) => x.includes('FLAKY') && x.includes('retried'))).toBe(true);
   });
 });
+
+describe('jest error status + vitest hook failures (QA PAR-7, PAR-8)', () => {
+  it('maps assertion status "error" (jest-junit suite errors) instead of dropping it', () => {
+    const { results, warnings } = jestParser.parse(load('jest-qa.json'), 'jest.json');
+    expect(warnings.some((w) => w.includes('unknown assertion status'))).toBe(false);
+    const syntax = results.filter((r) => r.suite === '/repo/js/jt/b/syntax.test.js');
+    // one row, on the same '(suite)' identity a plain jest --json run produces
+    expect(syntax.map((r) => `${r.name}:${r.status}`)).toEqual(['(suite):error']);
+    expect(syntax[0]!.message).toContain('Test suite failed to run');
+  });
+
+  it('vitest: a failing beforeAll (tests skipped, file failed) is a (suite) failure', () => {
+    const { results } = jestParser.parse(load('vitest-qa.json'), 'vitest.json');
+    const b = results.filter((r) => r.suite === '/repo/vt/t/b.test.ts' || r.name === 'passes');
+    expect(results.find((r) => r.suite === 'Outer' && r.name === 'passes')!.status).toBe('skip');
+    const suite = b.find((r) => r.name === '(suite)')!;
+    expect(suite.status).toBe('fail');
+    // vitest leaves the file message empty — say what happened instead of nothing
+    expect(suite.message).toContain('failed outside any test');
+  });
+});

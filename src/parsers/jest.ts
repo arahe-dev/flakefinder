@@ -7,7 +7,9 @@
  * `{ "testResults": [] }` (e.g. `--passWithNoTests` on an empty tree) is jest with 0 results.
  *
  * Mapping:
- * - passed → 'pass', failed → 'fail'
+ * - passed → 'pass', failed → 'fail', error → 'error' (jest-junit's reportTestSuiteErrors adds an
+ *   untitled `status: "error"` row for a suite that failed to run; it is named '(suite)', the
+ *   identity a plain jest run gives that failure)
  * - pending/skipped (vitest)/todo/disabled → 'skip'
  * - focused (a `.only`/`fit` test that ran) → 'fail' when it has failureMessages, else 'pass'
  * - suite = ancestorTitles.join(' > ') when non-empty, else the file path with forward slashes
@@ -49,6 +51,8 @@ function statusOf(status: unknown, failureMessages: unknown[]): TestStatus | nul
       return 'pass';
     case 'failed':
       return 'fail';
+    case 'error': // jest-junit `reportTestSuiteErrors`: the suite failed to run
+      return 'error';
     case 'focused': // ran because it was focused; the outcome is in its failure messages
       return failureMessages.length > 0 ? 'fail' : 'pass';
     case 'pending':
@@ -133,13 +137,15 @@ export const jestParser: ReportParser = {
             ? assertion.title
             : typeof assertion.fullName === 'string' && assertion.fullName.trim() !== ''
               ? assertion.fullName
-              : '(unnamed)';
+              : status === 'error'
+                ? SUITE_PLACEHOLDER // jest-junit's untitled suite-error row = the file's '(suite)'
+                : '(unnamed)';
         const durationMs =
           typeof assertion.duration === 'number' && Number.isFinite(assertion.duration)
             ? assertion.duration
             : null;
         let message = trimTo(failureMessages[0], 2000);
-        if (status === 'fail') anyAssertionFailed = true;
+        if (status === 'fail' || status === 'error') anyAssertionFailed = true;
         // retries: jest reports invocations (+ retryReasons); vitest a passed
         // test that still carries the failed attempts' failureMessages
         const invocations =
@@ -185,7 +191,9 @@ export const jestParser: ReportParser = {
         const message =
           trimTo(file.message, 2000) ??
           trimTo(file.failureMessage, 2000) ??
-          trimTo(execError?.message, 2000);
+          trimTo(execError?.message, 2000) ??
+          // vitest leaves the message empty when e.g. beforeAll threw
+          'test file failed outside any test (beforeAll/afterAll hook, import or collection error) — no test carried the failure';
         const result: TestCaseResult = {
           testId: makeTestId(filePath, SUITE_PLACEHOLDER),
           suite: filePath,
@@ -193,7 +201,7 @@ export const jestParser: ReportParser = {
           status: 'fail',
           durationMs: null,
         };
-        if (message !== undefined) result.message = message;
+        result.message = message;
         results.push(result);
       }
     }
