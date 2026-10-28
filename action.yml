@@ -26,6 +26,10 @@ inputs:
   working-directory:
     description: 'Directory containing reports/config (for monorepos)'
     default: '.'
+  history-key:
+    description: 'Extra key separating history caches, e.g. the matrix values for matrix legs (default: one history per job + working-directory)'
+    required: false
+    default: ''
 
 outputs:
   flaky-count:

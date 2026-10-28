@@ -53,10 +53,33 @@ describe('cache keys (R5 #11)', () => {
   it('save key is unique per run attempt and job; restore is by prefix', () => {
     const a1 = cacheKeys({ sha: 'abc', runId: '100', runAttempt: '1', job: 'test' });
     const a2 = cacheKeys({ sha: 'abc', runId: '100', runAttempt: '2', job: 'test' });
-    expect(a1.saveKey).toBe('flakefinder-history-abc-100-1-test');
+    expect(a1.saveKey).toMatch(/^flakefinder-history-[0-9a-f]{8}-abc-100-1$/);
     expect(a2.saveKey).not.toBe(a1.saveKey);
-    expect(a1.restoreKeys).toEqual(['flakefinder-history-']);
+    expect(a1.restoreKeys).toEqual([a1.saveKey.slice(0, 29), 'flakefinder-history-']);
     expect(a1.saveKey.startsWith(a1.restoreKeys[0]!)).toBe(true);
+  });
+});
+
+describe('cache key scope (QA ACT-4)', () => {
+  const gh = { sha: 'abc', runId: '100', runAttempt: '1', job: 'test' };
+  it('matrix legs with distinct history-keys get distinct save keys AND restore prefixes', () => {
+    const a = cacheKeys(gh, { workingDirectory: '.', historyKey: 'node18' });
+    const b = cacheKeys(gh, { workingDirectory: '.', historyKey: 'node20' });
+    expect(a.saveKey).not.toBe(b.saveKey);
+    expect(a.restoreKeys[0]).not.toBe(b.restoreKeys[0]);
+    expect(b.saveKey.startsWith(a.restoreKeys[0]!)).toBe(false); // A never restores B first
+  });
+  it('two steps on different working directories do not collide', () => {
+    const a = cacheKeys(gh, { workingDirectory: 'packages/a', historyKey: '' });
+    const b = cacheKeys(gh, { workingDirectory: 'packages/b', historyKey: '' });
+    expect(a.saveKey).not.toBe(b.saveKey);
+  });
+  it('the stream id is stable across runs, branches and attempts', () => {
+    const s = { workingDirectory: '.', historyKey: '' };
+    const k1 = cacheKeys(gh, s);
+    const k2 = cacheKeys({ ...gh, sha: 'def', runId: '200', runAttempt: '3' }, s);
+    expect(k1.restoreKeys).toEqual(k2.restoreKeys);
+    expect(k2.saveKey.startsWith(k1.restoreKeys[0]!)).toBe(true);
   });
 });
 

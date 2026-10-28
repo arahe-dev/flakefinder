@@ -12,6 +12,10 @@ export interface ActionInputs {
   uploadDashboard: boolean;
   failOnNewFlakes: boolean;
   githubToken: string;
+  /** Extra cache-stream discriminator (e.g. the matrix values). */
+  historyKey: string;
+  /** working-directory relative to the base dir, posix separators. */
+  workingDirectoryRel: string;
 }
 
 /** Thrown with EVERY invalid input listed; nothing has been done yet. */
@@ -76,6 +80,8 @@ export function readInputs(get: (name: string) => string, baseDir: string): Acti
     uploadDashboard: bool('upload-dashboard', true),
     failOnNewFlakes: bool('fail-on-new-flakes', false),
     githubToken: get('github-token'),
+    historyKey: get('history-key').trim(),
+    workingDirectoryRel: path.relative(baseDir, cwd).split(path.sep).join('/') || '.',
   };
   if (problems.length > 0) {
     throw new InputError(`invalid action input(s):\n  - ${problems.join('\n  - ')}`);

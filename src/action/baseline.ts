@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { snapshotPath } from '../store/history-store.js';
@@ -6,20 +7,50 @@ import type { GithubContext } from './github.js';
 
 export const CACHE_KEY_PREFIX = 'flakefinder-history-';
 
+/** What distinguishes one history stream from another within a repository. */
+export interface CacheScope {
+  /** Working directory relative to the workspace (posix separators). */
+  workingDirectory: string;
+  /** The `history-key` input — e.g. `${{ matrix.node }}` for matrix legs. */
+  historyKey: string;
+}
+
+/**
+ * Short, stable id of one history stream: job + working directory +
+ * history-key. Two flakefinder steps (monorepo packages) or matrix legs
+ * with distinct history-keys get separate caches instead of overwriting or
+ * inheriting each other's history.
+ */
+export function cacheLeg(job: string, scope: CacheScope): string {
+  return createHash('sha256')
+    .update(`${job}\0${scope.workingDirectory}\0${scope.historyKey}`)
+    .digest('hex')
+    .slice(0, 8);
+}
+
 /**
  * Cache keys for the history store.
  *
- * Saves are keyed per run ATTEMPT (and job): cache entries are immutable, so
- * a re-run that reused the first attempt's key could never save, and its
- * history was silently dropped. Restores go by prefix only — the most recent
- * entry on this branch, falling back to the base/default branch.
+ * Saves are keyed per stream and run ATTEMPT: cache entries are immutable,
+ * so a re-run that reused the first attempt's key could never save, and its
+ * history was silently dropped. Restores go by prefix — this stream's most
+ * recent entry on this branch (falling back to the base/default branch),
+ * then, for a stream's very first run or caches from before 1.2, any
+ * flakefinder history (warm start).
  */
-export function cacheKeys(gh: Pick<GithubContext, 'sha' | 'runId' | 'runAttempt' | 'job'>): {
+export function cacheKeys(
+  gh: Pick<GithubContext, 'sha' | 'runId' | 'runAttempt' | 'job'>,
+  scope: CacheScope = { workingDirectory: '.', historyKey: '' },
+): {
   saveKey: string;
   restoreKeys: string[];
 } {
-  const parts = [gh.sha, gh.runId, gh.runAttempt, gh.job].filter((p) => p !== '');
-  return { saveKey: `${CACHE_KEY_PREFIX}${parts.join('-')}`, restoreKeys: [CACHE_KEY_PREFIX] };
+  const leg = cacheLeg(gh.job, scope);
+  const parts = [gh.sha, gh.runId, gh.runAttempt].filter((p) => p !== '');
+  return {
+    saveKey: `${CACHE_KEY_PREFIX}${leg}-${parts.join('-')}`,
+    restoreKeys: [`${CACHE_KEY_PREFIX}${leg}-`, CACHE_KEY_PREFIX],
+  };
 }
 
 /** Where the action records which baseline a workflow run compared against. */

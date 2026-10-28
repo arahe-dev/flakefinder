@@ -48,7 +48,10 @@ async function actionMain(): Promise<void> {
 
   // 1. restore history cache (best-effort — miss on first run is normal).
   // Saved per run attempt + job, restored by prefix: see baseline.ts.
-  const { saveKey, restoreKeys } = cacheKeys(gh);
+  const { saveKey, restoreKeys } = cacheKeys(gh, {
+    workingDirectory: inputs.workingDirectoryRel,
+    historyKey: inputs.historyKey,
+  });
   const useCache = cacheUsable(cache, core);
   if (useCache) await restoreHistory(cache, core, storeDir, saveKey, restoreKeys);
 

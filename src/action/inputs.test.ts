@@ -31,6 +31,8 @@ describe('action inputs are validated up front (QA ACT-15)', () => {
       uploadDashboard: true,
       failOnNewFlakes: false,
       githubToken: 't',
+      historyKey: '',
+      workingDirectoryRel: '.',
     });
   });
 
@@ -49,6 +51,7 @@ describe('action inputs are validated up front (QA ACT-15)', () => {
       d,
     );
     expect(i.cwd).toBe(path.join(d, 'pkg'));
+    expect(i.workingDirectoryRel).toBe('pkg');
     expect(i.reports).toEqual(['a.xml', 'b/*.json']);
     expect(i.historyMaxRuns).toBe(50);
     expect([i.comment, i.uploadDashboard, i.failOnNewFlakes]).toEqual([false, true, true]);
