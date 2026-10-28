@@ -44,8 +44,42 @@ export function stripJsonComments(text: string): string {
     out += c;
     i++;
   }
-  // tolerate trailing commas before } or ]
-  return out.replace(/,(\s*[}\]])/g, '$1');
+  return stripTrailingCommas(out);
+}
+
+/**
+ * Drop a comma whose next non-whitespace character is `}` or `]` — but only
+ * OUTSIDE string literals, so a glob like "r-{a,}.xml" is left intact.
+ * Runs after comment stripping, so comments between the comma and the
+ * bracket are already gone.
+ */
+function stripTrailingCommas(text: string): string {
+  let out = '';
+  let inString = false;
+  let quote = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inString) {
+      out += c;
+      if (c === '\\') {
+        out += text[i + 1] ?? '';
+        i++;
+      } else if (c === quote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inString = true;
+      quote = c;
+    } else if (c === ',') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]!)) j++;
+      if (text[j] === '}' || text[j] === ']') continue; // trailing comma: drop it
+    }
+    out += c;
+  }
+  return out;
 }
 
 export function defaultConfig(): FlakefinderConfig {
@@ -209,7 +243,33 @@ export function resolveConfig(
   };
 }
 
-/** Look for flakefinder.config.json in `cwd` and up to 3 parent directories. */
+/**
+ * Anchor the file-system paths written IN a config file (`storeDir`,
+ * `quarantineFile`) to that file's directory, so a config discovered in a
+ * parent directory (or passed with --config) points at the same store and
+ * quarantine list no matter which subdirectory flakefinder runs from.
+ * Returns a copy; absolute paths and non-string (invalid — validation
+ * reports them) values are left alone. `reports` globs are intentionally NOT
+ * anchored: they stay relative to the working directory, where test runners
+ * write their reports.
+ */
+export function anchorConfigPaths(config: FlakefinderConfig, configDir: string): FlakefinderConfig {
+  if (config === null || typeof config !== 'object' || Array.isArray(config)) return config;
+  const out: FlakefinderConfig = { ...config };
+  for (const key of ['storeDir', 'quarantineFile'] as const) {
+    const v = out[key];
+    if (typeof v === 'string' && v.trim() !== '' && !path.isAbsolute(v)) {
+      out[key] = path.resolve(configDir, v);
+    }
+  }
+  return out;
+}
+
+/**
+ * Look for flakefinder.config.json in `cwd` and up to 3 parent directories.
+ * `storeDir`/`quarantineFile` set in the file come back resolved against the
+ * file's directory (see anchorConfigPaths).
+ */
 export function loadConfig(cwd: string): { config: FlakefinderConfig; path: string | null } {
   let dir = path.resolve(cwd);
   for (let depth = 0; depth <= 3; depth++) {
@@ -227,7 +287,7 @@ export function loadConfig(cwd: string): { config: FlakefinderConfig; path: stri
         const parsed = JSON.parse(
           stripJsonComments(raw.replace(/^\uFEFF/, '')),
         ) as FlakefinderConfig;
-        return { config: parsed, path: candidate };
+        return { config: anchorConfigPaths(parsed, dir), path: candidate };
       } catch (err) {
         throw new Error(`invalid config in ${candidate}: ${(err as Error).message}`);
       }

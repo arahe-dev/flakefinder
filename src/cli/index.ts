@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Command } from 'commander';
 import { computeNewFlakes } from '../action/diff.js';
 import {
+  anchorConfigPaths,
   CONFIG_FILE_NAME,
   detectRunner,
   loadConfig,
@@ -55,7 +56,10 @@ function resolveCfg(g: Globals, overrides: Partial<FlakefinderConfig> = {}): Res
     } catch (err) {
       throw new Error(`invalid config ${g.config}: ${(err as Error).message}`);
     }
-    return resolveConfig(parsed, overrides);
+    return resolveConfig(
+      anchorConfigPaths(parsed, path.dirname(path.resolve(g.config))),
+      overrides,
+    );
   }
   const { config } = loadConfig(g.cwd);
   return resolveConfig(config, overrides);

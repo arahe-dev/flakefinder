@@ -79,7 +79,10 @@ Global options, valid before any command:
 | `--no-color` | Disable ANSI colors |
 
 Config discovery: `flakefinder.config.json` in `--cwd`, walking up to 3 parent
-levels. JSONC (comments) is allowed.
+levels. JSONC (comments) is allowed. Relative `storeDir` and `quarantineFile`
+values written in a config file resolve against **that file's directory**
+(also with `--config`), so every subdirectory shares one store; `reports`
+globs and the built-in defaults stay relative to `--cwd`.
 
 ### `init`
 
@@ -292,14 +295,14 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `reports` | `string[]` | `[]` | Globs (relative to cwd) for report files: `**`, `*`, `?` supported; `node_modules`, `.git`, `dist`, and the store dir are skipped. Example: `["junit*.xml", "test-results/*.json"]` |
-| `storeDir` | string | `".flakefinder"` | History directory (holds `history.jsonl` and the verdict snapshot) |
+| `storeDir` | string | `".flakefinder"` | History directory (holds `history.jsonl` and the verdict snapshot); relative to the config file's directory |
 | `maxRuns` | integer 1–100000 | `300` | Prune history to the last N runs after each append |
 | `minRuns` | integer 1–1000 | `3` | Minimum observations before statistical claims (gates `flaky-suspected` and `failing`) |
 | `liveRetries` | integer 0–10 | `2` | Extra attempts for `run` (override per invocation with `-R`) |
 | `flakeScoreThreshold` | integer 0–100 | `30` | Score bar for including `flaky-suspected` in reports; confirmed/retry always included |
 | `slowThresholdMs` | number \| null | `10000` | Absolute bar for the `slow` tag (median duration above this) |
 | `slowMultiplier` | number > 0 | `5` | Relative bar: p95 above `slowMultiplier ×` suite median also tags `slow` |
-| `quarantineFile` | string | `"flakefinder.quarantine.json"` | Quarantine list location |
+| `quarantineFile` | string | `"flakefinder.quarantine.json"` | Quarantine list location; relative to the config file's directory |
 | `runner` | enum | `"auto"` | `auto` (detect per run), `pytest`, `jest`, `mocha`, `go`, `generic`. Controls quarantine exclusion flags and `init` hints |
 | `failOnFlakes` | boolean | `false` | Flakes make `run` exit non-zero (same as `--fail-on-flake`) |
 
@@ -491,7 +494,8 @@ keep history-aware verdicts.
 ## History store
 
 Location: `<storeDir>/history.jsonl` (default `.flakefinder/history.jsonl`),
-relative to `--cwd`. Format: JSON Lines, one run record per line, preceded by
+relative to `--cwd` (a `storeDir` set in a config file is relative to that
+file's directory). Format: JSON Lines, one run record per line, preceded by
 a schema header (v0.2.0+):
 
 ```json

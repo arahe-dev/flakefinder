@@ -4,7 +4,7 @@
  * so these never depend on a stale committed dist/.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -185,5 +185,30 @@ describe('unstartable test command (QA A11)', () => {
     );
     expect(r.stdout).not.toContain('no test history yet');
     expect(r.stdout.match(/attempt \d+\/\d+/g)).toEqual(['attempt 1/3']); // no retries
+  });
+});
+
+describe('config found in a parent dir anchors storeDir/quarantineFile (R5 #6)', () => {
+  it('ingest from a subdirectory writes to the store next to the config file', () => {
+    const root = tmp();
+    writeFileSync(path.join(root, 'flakefinder.config.json'), '{"storeDir": ".ff-store"}', 'utf8');
+    const sub = path.join(root, 'packages', 'a');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(path.join(sub, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(['ingest', 'r.xml'], sub);
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(root, '.ff-store', 'history.jsonl'))).toBe(true);
+    expect(existsSync(path.join(sub, '.ff-store'))).toBe(false);
+  });
+
+  it('--config <path> anchors to that file too', () => {
+    const root = tmp();
+    const cfgDir = path.join(root, 'cfg');
+    mkdirSync(cfgDir);
+    writeFileSync(path.join(cfgDir, 'ff.json'), '{"storeDir": "store"}', 'utf8');
+    writeFileSync(path.join(root, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(['--config', path.join('cfg', 'ff.json'), 'ingest', 'r.xml'], root);
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(cfgDir, 'store', 'history.jsonl'))).toBe(true);
   });
 });
