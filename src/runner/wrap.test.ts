@@ -1166,3 +1166,41 @@ process.exit(n === 1 ? 1 : 0);
     expect(argv2).toEqual(['-p', 'no:cacheprovider']);
   }, 60_000);
 });
+
+describe('injection targets the runner segment (QA RUN-10)', () => {
+  it('runnerSegment skips setup segments and env assignments', async () => {
+    const { runnerSegment } = await import('./wrap.js');
+    expect(runnerSegment(['cd', '.', '&&', 'npx', 'jest'])).toEqual({ cmd: 3, end: 5 });
+    expect(runnerSegment(['jest', '|', 'tee', 'log'])).toEqual({ cmd: 0, end: 1 });
+    expect(runnerSegment(['go', 'test', './...', '>', 'o.jsonl'])).toEqual({ cmd: 0, end: 3 });
+    expect(runnerSegment(['CI=1', 'jest', '--ci'])).toEqual({ cmd: 1, end: 3 });
+    expect(runnerSegment(['echo', 'x', ';', 'python', '-m', 'pytest'])).toEqual({ cmd: 3, end: 6 });
+    expect(runnerSegment(['make', 'prep', '&&', 'node', 'run.js'])).toEqual({ cmd: 3, end: 5 });
+    expect(runnerSegment(['./run-tests.sh', 'a'])).toEqual({ cmd: 0, end: 2 }); // unknown: first
+  });
+
+  it('insertRunnerArgs lands in the runner segment (with npm separator logic per segment)', async () => {
+    const { insertRunnerArgs } = await import('./wrap.js');
+    expect(insertRunnerArgs(['cd', '.', '&&', 'npx', 'jest'], ['-t', 'p'])).toEqual([
+      'cd',
+      '.',
+      '&&',
+      'npx',
+      'jest',
+      '-t',
+      'p',
+    ]);
+    expect(insertRunnerArgs(['cd', 'app', '&&', 'npm', 'test', '>', 'o'], ['-t', 'p'])).toEqual([
+      'cd',
+      'app',
+      '&&',
+      'npm',
+      'test',
+      '--',
+      '-t',
+      'p',
+      '>',
+      'o',
+    ]);
+  });
+});

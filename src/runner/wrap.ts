@@ -93,23 +93,68 @@ export function isShellOperator(token: string): boolean {
   return /^(?:\|\|?|\|&|&&?|;|&>>?|\d*(?:<<?|>>?|>\||<>)(?:&(?:\d+|-))?)$/.test(token);
 }
 
+/** Binaries that run tests themselves or wrap a test script. */
+const RUNNER_BINS = /^(?:jest|vitest|mocha|pytest|py\.test|go|npm|npx|yarn|pnpm|bun|bunx)$/;
+/** Test runners recognizable anywhere in a segment (`npx jest`, `python -m pytest`). */
+const RUNNER_WORDS = /^(?:jest|vitest|mocha|pytest|py\.test)$/;
+/** Generic script hosts: a plausible runner when nothing better is found. */
+const SCRIPT_HOSTS = /^(?:node|python3?|deno)$/;
+
+function commandBase(token: string): string {
+  return token
+    .replace(/^.*[\\/]/, '')
+    .toLowerCase()
+    .replace(/\.(?:cmd|exe|bat)$/, '');
+}
+
 /**
- * Insert runner args (flag/value pairs) into the command: package-manager
- * wrappers get a `--` separator first (unless the command already has one),
- * and shell operators split the command
- * into segments — the args must join the RUNNER's segment (the first one),
- * not the last shell word. Injection matches whole operator tokens only, so
+ * The shell segment that holds the test runner: `cmd` is its command word
+ * (after any leading `VAR=value` assignments), `end` the first operator
+ * after it (a redirect or the next control operator) or the command's end.
+ * `cd app && npx jest` → the `npx jest` segment, not `cd`. Preference: a
+ * segment naming a known runner/wrapper, then one started by node/python,
+ * then the first segment.
+ */
+export function runnerSegment(command: string[]): { cmd: number; end: number } {
+  const segments: Array<{ cmd: number; end: number }> = [];
+  let start = 0;
+  for (let i = 0; i <= command.length; i++) {
+    if (i < command.length && !isControlOperator(command[i]!)) continue;
+    let cmd = start;
+    while (cmd < i && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command[cmd]!)) cmd++;
+    let end = cmd;
+    while (end < i && !isShellOperator(command[end]!)) end++;
+    if (cmd < end) segments.push({ cmd, end });
+    start = i + 1;
+  }
+  const words = (seg: { cmd: number; end: number }) =>
+    command.slice(seg.cmd, seg.end).map(commandBase);
+  return (
+    segments.find((seg) => {
+      const w = words(seg);
+      return RUNNER_BINS.test(w[0]!) || w.some((t) => RUNNER_WORDS.test(t));
+    }) ??
+    segments.find((seg) => SCRIPT_HOSTS.test(words(seg)[0]!)) ??
+    segments[0] ?? { cmd: 0, end: command.length }
+  );
+}
+
+/**
+ * Insert runner args (flag/value pairs) into the command: they join the end
+ * of the RUNNER's shell segment (see runnerSegment) — before any redirect —
+ * and package-manager wrappers get a `--` separator first (unless that
+ * segment already has one). Injection matches whole operator tokens only, so
  * an argument VALUE like `w1&&w2` is never mistaken for a segment boundary.
  */
 export function insertRunnerArgs(command: string[], args: string[]): string[] {
   if (args.length === 0) return [...command];
-  const opIdx = command.findIndex((t) => isShellOperator(t));
-  const insertAt = opIdx === -1 ? command.length : opIdx;
+  const seg = runnerSegment(command);
   // `npm test -- --ci` already forwards everything after its `--`: a second
   // separator would reach the runner as a literal `--` argument
-  const hasSeparator = command.slice(1, insertAt).includes('--');
-  const separator = isPackageManagerWrapper(command) && !hasSeparator ? ['--'] : [];
-  return [...command.slice(0, insertAt), ...separator, ...args, ...command.slice(insertAt)];
+  const hasSeparator = command.slice(seg.cmd + 1, seg.end).includes('--');
+  const wrapper = isPackageManagerWrapper(command.slice(seg.cmd));
+  const separator = wrapper && !hasSeparator ? ['--'] : [];
+  return [...command.slice(0, seg.end), ...separator, ...args, ...command.slice(seg.end)];
 }
 
 /**
@@ -560,14 +605,16 @@ export function mergeUserSelector(
     return unchanged;
   }
   const aliases = SELECTOR_ALIASES[flag]!;
-  const opIdx = command.findIndex((t) => isShellOperator(t));
-  const end = opIdx === -1 ? command.length : opIdx;
-  if (flag === '--grep' && command.slice(1, end).some((t) => t === '--invert' || t === '-i')) {
+  const { cmd, end } = runnerSegment(command);
+  if (
+    flag === '--grep' &&
+    command.slice(cmd + 1, end).some((t) => t === '--invert' || t === '-i')
+  ) {
     return unchanged;
   }
-  const kept: string[] = [command[0]!];
+  const kept: string[] = command.slice(0, cmd + 1);
   const userPatterns: string[] = [];
-  for (let i = 1; i < end; i++) {
+  for (let i = cmd + 1; i < end; i++) {
     const t = command[i]!;
     const alias = aliases.find((a) => t === a || t.startsWith(`${a}=`));
     if (!alias) {
@@ -605,8 +652,8 @@ export function mergeUserSelector(
 export function userSelectorClash(command: string[], extraArgs: string[]): boolean {
   const aliases = SELECTOR_ALIASES[extraArgs[0] ?? ''];
   if (!aliases) return false;
-  const opIdx = command.findIndex((t) => isShellOperator(t));
-  const segment = command.slice(1, opIdx === -1 ? command.length : opIdx);
+  const { cmd, end } = runnerSegment(command);
+  const segment = command.slice(cmd + 1, end);
   return segment.some((t) => aliases.some((a) => t === a || t.startsWith(`${a}=`)));
 }
 
