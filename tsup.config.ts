@@ -20,6 +20,10 @@ export default defineConfig([
     format: ['cjs'],
     platform: 'node',
     target: 'node24',
+    // bundle EVERYTHING: a checked-out action has no node_modules, and tsup
+    // externalizes package.json `dependencies` by default — the bundle then
+    // died with "Cannot find module 'fast-xml-parser'" on every runner
+    noExternal: [/.*/],
     sourcemap: false,
     clean: false,
     splitting: false,
