@@ -94,6 +94,21 @@ export function breakStaleLock(lockPath: string, observed: string): boolean {
   return false;
 }
 
+const warningListeners = new Set<(message: string) => void>();
+
+/**
+ * Receive every warning any HistoryStore records from now on (corrupt lines,
+ * unreadable store, newer format, busy prune skipped, …). Each warning is
+ * delivered once — a prune's fresh re-read is not reported twice. Returns
+ * the unsubscribe function.
+ */
+export function subscribeStoreWarnings(listener: (message: string) => void): () => void {
+  warningListeners.add(listener);
+  return () => {
+    warningListeners.delete(listener);
+  };
+}
+
 /**
  * The records of the last `maxRuns` distinct runIds, in file order. Counting
  * records instead used to cut a retried run in half (attempt 1 dropped,
@@ -141,6 +156,17 @@ export class HistoryStore {
     this.path = path.join(storeDir, 'history.jsonl');
   }
 
+  /**
+   * Record a warning on this instance and tell any subscribers. Callers that
+   * never see the instance — `run` goes through runLive, which keeps its
+   * store private — subscribe instead of losing e.g. "prune skipped".
+   */
+  private warn(message: string, first = false): void {
+    if (first) this.warnings.unshift(message);
+    else this.warnings.push(message);
+    for (const listener of warningListeners) listener(message);
+  }
+
   private ensureStoreDir(): void {
     mkdirSync(path.dirname(this.path), { recursive: true });
   }
@@ -162,7 +188,7 @@ export class HistoryStore {
       const code = e.code ?? 'error';
       // node's fs messages already start with the errno ("EISDIR: illegal …")
       this.unreadable = e.message.startsWith(code) ? e.message : `${code}: ${e.message}`;
-      this.warnings.push(`history store unreadable (${code}): ${this.path}`);
+      this.warn(`history store unreadable (${code}): ${this.path}`);
       return;
     }
     let start = 0;
@@ -176,8 +202,9 @@ export class HistoryStore {
       start = end + 1;
     }
     if (this.formatVersion !== null && this.formatVersion > STORE_FORMAT_VERSION) {
-      this.warnings.unshift(
+      this.warn(
         `store format v${this.formatVersion} is newer than this flakefinder (v${STORE_FORMAT_VERSION}) — unknown fields will be preserved`,
+        true,
       );
     }
   }
@@ -189,7 +216,7 @@ export class HistoryStore {
       parsed = JSON.parse(line) as Record<string, unknown>;
     } catch {
       if (this.warnings.length < 10) {
-        this.warnings.push(`skipping corrupt line ${i} in ${this.path}`);
+        this.warn(`skipping corrupt line ${i} in ${this.path}`);
       }
       return;
     }
@@ -200,12 +227,12 @@ export class HistoryStore {
       if (typeof parsed.version === 'number') {
         if (i === 1) this.formatVersion = parsed.version;
         else if (this.warnings.length < 10) {
-          this.warnings.push(`unexpected schema marker at line ${i} — skipped`);
+          this.warn(`unexpected schema marker at line ${i} — skipped`);
         }
         return;
       }
       if (this.warnings.length < 10) {
-        this.warnings.push(`skipping record-shaped garbage at line ${i} in ${this.path}`);
+        this.warn(`skipping record-shaped garbage at line ${i} in ${this.path}`);
       }
       return;
     }
@@ -213,7 +240,7 @@ export class HistoryStore {
     // skipped with a warning instead of blowing up the classifier later.
     if (typeof parsed.runId !== 'string' || !Array.isArray(parsed.results)) {
       if (this.warnings.length < 10) {
-        this.warnings.push(`skipping invalid record at line ${i} in ${this.path}`);
+        this.warn(`skipping invalid record at line ${i} in ${this.path}`);
       }
       return;
     }
@@ -399,7 +426,7 @@ export class HistoryStore {
       // (the next write prunes) rather than fail a command whose record was
       // already appended — a retry would then double-count that run
       if (!(err instanceof StoreBusyError)) throw err;
-      this.warnings.push(`history store busy — prune skipped this time: ${this.path}`);
+      this.warn(`history store busy — prune skipped this time: ${this.path}`);
       return;
     }
     try {
@@ -411,7 +438,7 @@ export class HistoryStore {
       if (fresh.unreadable !== null) {
         if (this.loaded) {
           // keep the in-memory view, but do not rewrite from it
-          this.warnings.push(`history store unreadable during prune — not pruned: ${this.path}`);
+          this.warn(`history store unreadable during prune — not pruned: ${this.path}`);
         } else {
           this.adopt(fresh);
         }

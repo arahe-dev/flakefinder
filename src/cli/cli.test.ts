@@ -690,3 +690,21 @@ describe('ci commit sha from the CI environment (QA ACT-18)', () => {
     expect(shaOf(tmp(), { GITHUB_SHA: 'not-a-sha', CI_COMMIT_SHA: undefined })).toBeUndefined();
   });
 });
+
+describe('run surfaces history-store warnings', () => {
+  it('a corrupt history line is reported on stderr after a run', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    mkdirSync(path.join(d, '.flakefinder'));
+    writeFileSync(path.join(d, '.flakefinder', 'history.jsonl'), '{"version":1}\n{ corrupt\n');
+    writeFileSync(
+      path.join(d, 'write.js'),
+      `require('fs').writeFileSync('r.xml', ${JSON.stringify(JUNIT)});`,
+      'utf8',
+    );
+    const r = cli(['run', '--', process.execPath, 'write.js'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('skipping corrupt line 2');
+    expect(r.stderr.match(/skipping corrupt line 2/g)).toHaveLength(1);
+  });
+});

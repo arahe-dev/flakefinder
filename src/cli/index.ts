@@ -23,7 +23,7 @@ import { buildPrComment, renderMarkdown } from '../report/markdown.js';
 import { renderTerminal } from '../report/terminal.js';
 import { escapeControlChars } from '../report/text.js';
 import { runLive } from '../runner/wrap.js';
-import { HistoryStore, snapshotPath } from '../store/history-store.js';
+import { HistoryStore, snapshotPath, subscribeStoreWarnings } from '../store/history-store.js';
 import type {
   FlakefinderConfig,
   ResolvedConfig,
@@ -361,14 +361,27 @@ export async function main(argv: string[]): Promise<number> {
           overrides.timeoutSeconds = seconds;
         }
         const cfg = resolveCfg(g, overrides);
-        const result = await runLive(command, cfg, {
-          retries: retries ?? cfg.liveRetries,
-          cwd: g.cwd,
-          applyQuarantine: opts.quarantine !== false,
-        });
+        // runLive keeps its HistoryStore private: collect what it warns about
+        // (corrupt lines, busy prune skipped, …) and show it after the report
+        const storeWarnings: string[] = [];
+        const unsubscribe = subscribeStoreWarnings((w) => storeWarnings.push(w));
+        let result: Awaited<ReturnType<typeof runLive>>;
+        try {
+          result = await runLive(command, cfg, {
+            retries: retries ?? cfg.liveRetries,
+            cwd: g.cwd,
+            applyQuarantine: opts.quarantine !== false,
+          });
+        } finally {
+          unsubscribe();
+        }
+        const printRunStoreWarnings = (): void => {
+          for (const w of new Set(storeWarnings)) console.warn(`flakefinder: ${w}`);
+        };
         if (result.finalExitCode === 2 && result.attempts.length === 0) {
           // the command could not be started — runLive already said why; a
           // "no test history yet" report here would only mislead
+          printRunStoreWarnings();
           exitCode = 2;
           return;
         }
@@ -378,6 +391,7 @@ export async function main(argv: string[]): Promise<number> {
             flakesOnly: false,
           }),
         );
+        printRunStoreWarnings();
         exitCode = result.finalExitCode;
       },
     );

@@ -14,7 +14,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { RunRecord } from '../types.js';
-import { breakStaleLock, HistoryStore, lastRuns, snapshotPath } from './history-store.js';
+import {
+  breakStaleLock,
+  HistoryStore,
+  lastRuns,
+  snapshotPath,
+  subscribeStoreWarnings,
+} from './history-store.js';
 
 let dirs: string[] = [];
 
@@ -585,4 +591,35 @@ describe('maxRuns counts runs, not records (QA CLI-15)', () => {
     expect(lastRuns(recs, 3)).toBe(recs);
     expect(lastRuns(recs, 1).map((r) => r.runId)).toEqual(['c']);
   });
+});
+
+describe('subscribeStoreWarnings (run surfaces store warnings)', () => {
+  it('delivers each warning once, including a busy prune, until unsubscribed', () => {
+    const a = tmpStore();
+    a.append(record('r1', 'pass'));
+    appendFileSync(a.path, '{ corrupt\n', 'utf8');
+    a.append(record('r2', 'pass'));
+    const seen: string[] = [];
+    const off = subscribeStoreWarnings((w) => seen.push(w));
+    try {
+      // fresh instance, never loaded: prune's fresh re-read reports the corrupt
+      // line; adopting it must not report it a second time
+      const b = new HistoryStore(path.dirname(a.path));
+      b.prune(1);
+      expect(seen.filter((w) => w.includes('corrupt line'))).toHaveLength(1);
+      expect(b.warnings.some((w) => w.includes('corrupt line'))).toBe(true);
+      // a held lock: prune is skipped with a warning the subscriber sees
+      writeFileSync(`${a.path}.lock`, JSON.stringify({ pid: 1, epoch: Date.now() }), 'utf8');
+      new HistoryStore(path.dirname(a.path)).prune(1);
+      expect(seen.some((w) => w.includes('prune skipped'))).toBe(true);
+    } finally {
+      off();
+      rmSync(`${a.path}.lock`, { force: true });
+    }
+    const before = seen.length;
+    const c = new HistoryStore(path.dirname(a.path));
+    appendFileSync(a.path, '{ more corrupt\n', 'utf8');
+    c.runs();
+    expect(seen).toHaveLength(before);
+  }, 10_000);
 });
