@@ -271,4 +271,31 @@ describe('mocha retries (QA PAR-6)', () => {
     expect(retried.message).toBe('flaky: failed 1 of 2 attempts before passing on mocha retry');
     expect(warnings.some((w) => w.includes('FLAKY') && w.includes('Outer retried'))).toBe(true);
   });
+
+  it('sets attempts for retried tests and none for single runs', () => {
+    const { results } = mochaParser.parse(load('mocha-qa.json'), 'mocha.json');
+    expect(results.find((r) => r.name === 'retried')!.attempts).toEqual(['fail', 'pass']);
+    for (const r of results.filter((x) => x.name !== 'retried')) {
+      expect(r).not.toHaveProperty('attempts');
+    }
+  });
+
+  it('a test that failed after its retries failed all attempts', () => {
+    const t = {
+      title: 'net',
+      fullTitle: 'S net',
+      file: '/r/a.js',
+      duration: 12.6,
+      currentRetry: 2,
+      err: { message: 'ECONNRESET' },
+    };
+    const doc = { stats: {}, tests: [t], passes: [], failures: [t], pending: [] };
+    const { results } = mochaParser.parse(JSON.stringify(doc), 'inline');
+    expect(results[0]).toMatchObject({
+      status: 'fail',
+      attempts: ['fail', 'fail', 'fail'],
+      message: 'ECONNRESET\n(failed all 3 attempts)',
+      durationMs: 13, // rounded (QA PAR-18)
+    });
+  });
 });

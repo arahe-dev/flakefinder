@@ -16,13 +16,16 @@
  *   (NOTE: two files with the same describe+title collide on one testId — a known identity
  *   limitation, deliberately unchanged because ids are persisted in histories/quarantine files)
  * - name = title (fullName as fallback)
- * - durationMs = duration ?? null
+ * - durationMs = duration rounded to whole ms (vitest reports fractions) ?? null
  * - message = failureMessages[0] trimmed to 2000 chars
  * - retries: a passed test with jest `invocations` > 1, or a vitest passed test that still
  *   carries failureMessages (its failed attempts), stays 'pass' with a
  *   "flaky: failed k of n attempts before passing on jest/vitest retry" message and one
  *   warning per file (same representation as Surefire reruns, see internal.ts). A failed
- *   test with invocations > 1 gets "(failed all n attempts)".
+ *   test with invocations > 1 gets "(failed all n attempts)". Either way `attempts` lists
+ *   every attempt (['fail', …, final]); it is left undefined for a test that ran once, and
+ *   for a FAILED vitest test (its several failureMessages may be one attempt's expect.soft
+ *   errors, so they are not counted as retries).
  *
  * Suite-level failures: a file whose status is 'failed' (or that carries testExecError) while
  * NONE of its assertions failed — a syntax error, no tests, or an afterAll/beforeAll that threw
@@ -34,11 +37,12 @@
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
 import {
-  errorMessage,
   flakyRetryMessage,
   flakyRetryWarning,
   isObj,
-  stripBom,
+  msOf,
+  parseJson,
+  retryAttempts,
   toArray,
   trimTo,
 } from './internal.js';
@@ -65,19 +69,11 @@ function statusOf(status: unknown, failureMessages: unknown[]): TestStatus | nul
   }
 }
 
-function tryParseJson(content: string): { doc: unknown } | { error: string } {
-  try {
-    return { doc: JSON.parse(stripBom(content)) };
-  } catch (err) {
-    return { error: errorMessage(err) };
-  }
-}
-
 export const jestParser: ReportParser = {
   name: 'jest',
 
   sniff(content: string): boolean {
-    const parsed = tryParseJson(content);
+    const parsed = parseJson(content);
     if (!('doc' in parsed)) return false;
     const doc = parsed.doc;
     if (!isObj(doc) || !Array.isArray(doc.testResults)) return false;
@@ -90,7 +86,7 @@ export const jestParser: ReportParser = {
     const results: TestCaseResult[] = [];
     const warnings: string[] = [];
 
-    const parsed = tryParseJson(content);
+    const parsed = parseJson(content);
     if (!('doc' in parsed)) {
       return { results, warnings: [`jest: ${sourcePath}: invalid JSON: ${parsed.error}`] };
     }
@@ -140,18 +136,18 @@ export const jestParser: ReportParser = {
               : status === 'error'
                 ? SUITE_PLACEHOLDER // jest-junit's untitled suite-error row = the file's '(suite)'
                 : '(unnamed)';
-        const durationMs =
-          typeof assertion.duration === 'number' && Number.isFinite(assertion.duration)
-            ? assertion.duration
-            : null;
+        const durationMs = msOf(assertion.duration);
         let message = trimTo(failureMessages[0], 2000);
         if (status === 'fail' || status === 'error') anyAssertionFailed = true;
         // retries: jest reports invocations (+ retryReasons); vitest a passed
         // test that still carries the failed attempts' failureMessages
         const invocations =
-          typeof assertion.invocations === 'number' && assertion.invocations > 1
+          typeof assertion.invocations === 'number' &&
+          Number.isInteger(assertion.invocations) &&
+          assertion.invocations > 1
             ? assertion.invocations
             : undefined;
+        let attempts: TestStatus[] | undefined;
         if (status === 'pass' && (invocations !== undefined || failureMessages.length > 0)) {
           const reasons = [
             ...toArray(assertion.retryReasons),
@@ -167,10 +163,15 @@ export const jestParser: ReportParser = {
             reasons.find((r) => typeof r === 'string'),
             2000,
           );
+          attempts = retryAttempts(failedAttempts, 'pass');
           flaky.push(`${suite} > ${name}`);
           flakyHow.add(how);
-        } else if (status === 'fail' && invocations !== undefined && message !== undefined) {
-          message = trimTo(`${message}\n(failed all ${invocations} attempts)`, 2000);
+        } else if (status === 'fail' && invocations !== undefined) {
+          // (vitest is not inferred here: several failureMessages on a failed
+          // test may be one attempt's expect.soft errors, not retries)
+          attempts = retryAttempts(invocations - 1, 'fail');
+          const note = `(failed all ${invocations} attempts)`;
+          message = trimTo(message !== undefined ? `${message}\n${note}` : note, 2000);
         }
 
         const result: TestCaseResult = {
@@ -181,6 +182,7 @@ export const jestParser: ReportParser = {
           durationMs,
         };
         if (message !== undefined) result.message = message;
+        if (attempts !== undefined) result.attempts = attempts;
         results.push(result);
       }
 
