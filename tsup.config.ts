@@ -14,11 +14,12 @@ export default defineConfig([
     outDir: 'dist',
   },
   {
-    // CJS: @actions/* are CommonJS packages; the node20 runtime executes this directly.
+    // CJS: @actions/* are CommonJS packages; the node24 Actions runtime executes this
+    // directly (action.yml `using: node24` — node20 is EOL on Actions runners).
     entry: { 'action/index': 'src/action/index.ts' },
     format: ['cjs'],
     platform: 'node',
-    target: 'node20',
+    target: 'node24',
     sourcemap: false,
     clean: false,
     splitting: false,

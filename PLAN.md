@@ -340,8 +340,8 @@ outputs:
   failing-count: { description: 'Deterministically failing tests' }
   report-json: { description: 'Path to written JSON report' }
 runs:
-  using: node20
-  main: dist/action/index.js
+  using: node24
+  main: dist/action/index.cjs
 ```
 
 Flow in `src/action/index.ts`:
