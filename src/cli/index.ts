@@ -207,7 +207,10 @@ export async function main(argv: string[]): Promise<number> {
     .command('init')
     .description('detect your test runner and create flakefinder.config.json')
     .option('--force', 'overwrite an existing config')
-    .option('--runner <runner>', 'explicit runner: pytest|jest|mocha|go|generic')
+    .option(
+      '--runner <runner>',
+      'explicit runner: pytest|jest|mocha|go|generic (auto = detect, the default)',
+    )
     .action((opts: { force?: boolean; runner?: RunnerKind }) => {
       const g = globals();
       const RUNNERS: readonly string[] = ['auto', 'pytest', 'jest', 'mocha', 'go', 'generic'];
@@ -218,8 +221,11 @@ export async function main(argv: string[]): Promise<number> {
         exitCode = 2;
         return;
       }
-      const runner: RunnerKind | undefined = opts.runner ?? detectRunner(g.cwd);
-      if (!runner || (runner === 'generic' && !opts.runner)) {
+      // `--runner auto` means "detect", exactly like omitting the flag — it
+      // used to write runner "auto" with an empty reports list (QA CLI-28)
+      const explicit = opts.runner === 'auto' ? undefined : opts.runner;
+      const runner: RunnerKind = explicit ?? detectRunner(g.cwd);
+      if (runner === 'generic' && !explicit) {
         console.error(
           'flakefinder: could not detect a test runner — re-run with --runner <pytest|jest|mocha|go|generic>',
         );

@@ -100,7 +100,9 @@ pytest, `jest` in package.json → jest, `go.mod` → go, mocha configs → moch
 then writes `flakefinder.config.json` with default report globs.
 
 - `--force` — overwrite an existing config
-- `--runner <pytest|jest|mocha|go|generic>` — skip detection, force a runner
+- `--runner <pytest|jest|mocha|go|generic>` — skip detection, force a runner.
+  `--runner auto` is the same as omitting the flag: it detects, writes the
+  detected runner and its report globs, and exits `2` when nothing is detected
 
 Prints the exact reporter setup your runner still needs. Exits `2` if it
 can't detect a runner (pass `--runner` explicitly) or the config exists

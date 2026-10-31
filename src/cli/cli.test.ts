@@ -611,3 +611,22 @@ describe('help behaviour (QA CLI-20)', () => {
     expect(r.stderr).toContain('unknown command "nosuch"');
   });
 });
+
+describe('init --runner auto (QA CLI-28)', () => {
+  it('detects like the default and writes the detected runner with its report globs', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'go.mod'), 'module x\n', 'utf8');
+    const r = cli(['init', '--runner', 'auto'], d);
+    expect(r.status).toBe(0);
+    const cfg = JSON.parse(readFileSync(path.join(d, 'flakefinder.config.json'), 'utf8'));
+    expect(cfg).toEqual({ reports: ['test-output.jsonl'], runner: 'go' });
+  });
+
+  it('fails like the default when nothing can be detected (no reports: [] config)', () => {
+    const d = tmp();
+    const r = cli(['init', '--runner', 'auto'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('could not detect a test runner');
+    expect(existsSync(path.join(d, 'flakefinder.config.json'))).toBe(false);
+  });
+});
