@@ -301,7 +301,9 @@ Prints the flakefinder version.
 
 ## Configuration reference
 
-`flakefinder.config.json` (JSONC allowed). All keys optional.
+`flakefinder.config.json` (JSONC allowed). The file must hold a JSON
+**object**; `null`, an array, a number or a string is rejected with
+`config must be a JSON object` (exit `2`). All keys optional.
 
 **Validation (v0.2.0+):** every key is type- and range-checked on load —
 unknown keys and wrong-typed values (including wrong-case `runner` values,
@@ -322,6 +324,8 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 | `quarantineFile` | string | `"flakefinder.quarantine.json"` | Quarantine list location; relative to the config file's directory |
 | `runner` | enum | `"auto"` | `auto` (detect per run), `pytest`, `jest`, `mocha`, `go`, `generic`. Controls quarantine exclusion flags and `init` hints |
 | `failOnFlakes` | boolean | `false` | Flakes make `run` exit non-zero (same as `--fail-on-flake`) |
+| `retryMode` | enum | `"auto"` | How `run` retries: `auto` (re-run only the failed tests when the runner supports it, else the whole command), `failed` (always targeted), `full` (always re-run everything). Same as `run --retry-mode` |
+| `timeoutSeconds` | integer 1–2147483 \| null | `null` | Kill an attempt of `run` (and its process tree) after N seconds; `null` = no limit. Same range as `run --timeout`, which overrides it |
 
 ## Exit codes
 
