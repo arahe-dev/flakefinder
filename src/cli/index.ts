@@ -156,6 +156,24 @@ function printSetupHints(runner: RunnerKind): void {
 /** Untrusted text (test names, ids, reasons) made safe for a terminal line. */
 const esc = escapeControlChars;
 
+/**
+ * True unless argv holds nothing but the value-taking global options and
+ * --no-color. Anything else (a command, -h/-V, an unknown flag) is left to
+ * commander.
+ */
+function hasCommand(argv: string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--config' || a === '--cwd') {
+      i++;
+      continue;
+    }
+    if (a.startsWith('--config=') || a.startsWith('--cwd=') || a === '--no-color') continue;
+    return true;
+  }
+  return false;
+}
+
 function ghEscape(s: string): string {
   return s.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 }
@@ -732,12 +750,42 @@ export async function main(argv: string[]): Promise<number> {
       exitCode = ok ? 0 : 1;
     });
 
+  // explicit help command: commander's built-in one printed the general help
+  // and exited 0 for `help nosuch`, hiding the typo (QA CLI-20)
+  program.helpCommand(false);
+  program
+    .command('help')
+    .description('display help for a command (or for flakefinder)')
+    .argument('[command]', 'the command to describe')
+    .action((name?: string) => {
+      if (name == null) {
+        program.outputHelp();
+        return;
+      }
+      const sub = program.commands.find((c) => c.name() === name || c.aliases().includes(name));
+      if (!sub) {
+        console.error(
+          `flakefinder: unknown command "${escapeControlChars(name)}" — run "flakefinder help" for the list`,
+        );
+        exitCode = 2;
+        return;
+      }
+      sub.outputHelp();
+    });
+
   program
     .command('version')
     .description('print the flakefinder version')
     .action(() => {
       console.log(FLAKEFINDER_VERSION);
     });
+
+  // bare `flakefinder` (only global options): help on stdout, exit 0 — it is a
+  // request for help, not a usage error (commander would print to stderr)
+  if (!hasCommand(argv)) {
+    program.outputHelp();
+    return 0;
+  }
 
   try {
     await program.parseAsync(argv, { from: 'user' });

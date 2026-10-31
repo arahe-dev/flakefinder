@@ -78,6 +78,11 @@ Global options, valid before any command:
 | `--cwd <dir>` | Working directory for config, reports, and store (default: `.`). Must be an existing directory — otherwise every command exits `2` |
 | `--no-color` | Disable ANSI colors. Colors are also off when the `NO_COLOR` environment variable is set (non-empty) or when output is not a terminal — the same rule for every command |
 
+Help: `flakefinder` with no command, `flakefinder --help` and
+`flakefinder help` print the command list to stdout and exit `0`;
+`flakefinder help <command>` (or `<command> --help`) describes one command.
+`flakefinder help <unknown>` and an unknown command exit `2` with an error.
+
 Config discovery: `flakefinder.config.json` in `--cwd`, walking up to 3 parent
 levels. JSONC (comments) is allowed. Relative `storeDir` and `quarantineFile`
 values written in a config file resolve against **that file's directory**

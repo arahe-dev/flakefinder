@@ -581,3 +581,33 @@ describe('quarantine exit codes, output and side effects (QA CLI-11/CLI-22/CLI-3
     expect(r.stdout).not.toContain('\r');
   });
 });
+
+describe('help behaviour (QA CLI-20)', () => {
+  it('bare flakefinder prints help to stdout and exits 0', () => {
+    const d = tmp();
+    for (const args of [[], ['--no-color'], ['--cwd', '.']]) {
+      const r = cli(args, d);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('Usage: flakefinder');
+      expect(r.stderr).toBe('');
+    }
+  });
+
+  it('help <command> describes that command; help alone lists commands', () => {
+    const d = tmp();
+    const sub = cli(['help', 'ingest'], d);
+    expect(sub.status).toBe(0);
+    expect(sub.stdout).toContain('Usage: flakefinder ingest');
+    const all = cli(['help'], d);
+    expect(all.status).toBe(0);
+    expect(all.stdout).toContain('Commands:');
+  });
+
+  it('help <unknown> exits 2 with an error instead of the general help', () => {
+    const d = tmp();
+    const r = cli(['help', 'nosuch'], d);
+    expect(r.status).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('unknown command "nosuch"');
+  });
+});
