@@ -21,12 +21,26 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u20
  * The result is always a single line, so no line of ours can start with `::`.
  */
 export function escapeControlChars(s: string): string {
-  return s.replace(CONTROL, (c) => {
-    const code = c.charCodeAt(0);
-    return code < 0x100
-      ? `\\x${code.toString(16).padStart(2, '0')}`
-      : `\\u${code.toString(16).padStart(4, '0')}`;
-  });
+  return s.replace(CONTROL, visibleEscape);
+}
+
+/**
+ * Like escapeControlChars, but keeps TAB and line breaks (LF, CRLF): for
+ * multi-line text such as failure messages shown in a `<pre>`. Bidi
+ * overrides/isolates, lone CRs and every other control still become
+ * visible escapes.
+ */
+export function escapeControlCharsMultiline(s: string): string {
+  return s
+    .replace(/\r\n/g, '\n')
+    .replace(CONTROL, (c) => (c === '\n' || c === '\t' ? c : visibleEscape(c)));
+}
+
+function visibleEscape(c: string): string {
+  const code = c.charCodeAt(0);
+  return code < 0x100
+    ? `\\x${code.toString(16).padStart(2, '0')}`
+    : `\\u${code.toString(16).padStart(4, '0')}`;
 }
 
 /** First `max` code points (never splits a surrogate pair), with `…` when cut. */
