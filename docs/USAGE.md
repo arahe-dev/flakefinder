@@ -74,8 +74,8 @@ Global options, valid before any command:
 
 | Flag | Meaning |
 |---|---|
-| `--config <path>` | Use this config file instead of auto-discovery |
-| `--cwd <dir>` | Working directory for config, reports, and store (default: `.`) |
+| `--config <path>` | Use this config file instead of auto-discovery (a relative path resolves against `--cwd`) |
+| `--cwd <dir>` | Working directory for config, reports, and store (default: `.`). Must be an existing directory — otherwise every command exits `2` |
 | `--no-color` | Disable ANSI colors |
 
 Config discovery: `flakefinder.config.json` in `--cwd`, walking up to 3 parent

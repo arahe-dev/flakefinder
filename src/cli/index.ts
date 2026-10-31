@@ -1,16 +1,16 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Command } from 'commander';
 import { computeNewFlakes } from '../action/diff.js';
 import {
-  anchorConfigPaths,
   CONFIG_FILE_NAME,
   detectRunner,
   loadConfig,
+  readConfigFile,
   resolveConfig,
-  stripJsonComments,
+  TIMEOUT_MAX_SECONDS,
 } from '../config.js';
 import { runDoctor } from '../doctor.js';
 import { classifyAll } from '../engine/classify.js';
@@ -46,25 +46,25 @@ const PROBLEM_ALWAYS: string[] = ['flaky-confirmed', 'flaky-retry', 'failing', '
 
 function resolveCfg(g: Globals, overrides: Partial<FlakefinderConfig> = {}): ResolvedConfig {
   if (g.config) {
-    let raw: string;
-    try {
-      raw = readFileSync(g.config, 'utf8');
-    } catch (err) {
-      throw new Error(`cannot read config ${g.config}: ${(err as Error).message}`);
-    }
-    let parsed: FlakefinderConfig;
-    try {
-      parsed = JSON.parse(stripJsonComments(raw.replace(/^\uFEFF/, ''))) as FlakefinderConfig;
-    } catch (err) {
-      throw new Error(`invalid config ${g.config}: ${(err as Error).message}`);
-    }
-    return resolveConfig(
-      anchorConfigPaths(parsed, path.dirname(path.resolve(g.config))),
-      overrides,
-    );
+    // --config is relative to --cwd, like every other path argument (CLI-25)
+    return resolveConfig(readConfigFile(path.resolve(g.cwd, g.config)), overrides);
   }
   const { config } = loadConfig(g.cwd);
   return resolveConfig(config, overrides);
+}
+
+/**
+ * --cwd must name an existing directory: a typo used to make `report` print
+ * "no history yet" (exit 0) and `init`/`ingest` die with a raw ENOENT.
+ */
+function checkCwd(dir: string): void {
+  let isDir = false;
+  try {
+    isDir = statSync(dir).isDirectory();
+  } catch {
+    throw new Error(`--cwd ${dir} does not exist`);
+  }
+  if (!isDir) throw new Error(`--cwd ${dir} is not a directory`);
 }
 
 function gitSha(cwd: string): string | undefined {
@@ -99,8 +99,6 @@ function flagInt(flag: string, value: string, min: number, max: number, unit = '
 
 /** Engine/config bounds the flags share (config.ts validates the same ranges). */
 const RETRIES_MAX = 10;
-/** setTimeout's ceiling (2^31-1 ms) in whole seconds — larger values would fire at once. */
-const TIMEOUT_MAX_SECONDS = 2_147_483;
 
 function filterVerdicts(
   verdicts: TestVerdict[],
@@ -172,13 +170,17 @@ export async function main(argv: string[]): Promise<number> {
     .description('Detect, track, and quarantine flaky tests — locally and in CI.')
     .version(FLAKEFINDER_VERSION)
     .option('--config <path>', 'explicit path to flakefinder.config.json')
-    .option('--cwd <dir>', 'working directory (where config/reports live)', process.cwd())
+    .option('--cwd <dir>', 'working directory (where config/reports live; default: .)')
     .option('--no-color', 'disable ANSI colors')
-    .exitOverride();
+    .exitOverride()
+    // every command resolves paths against --cwd: validate it once, up front
+    .hook('preAction', () => {
+      checkCwd(globals().cwd);
+    });
 
   const globals = (): Globals => {
-    const o = program.opts<{ config?: string; cwd: string; color?: boolean }>();
-    return { config: o.config, cwd: o.cwd ?? process.cwd(), color: o.color !== false };
+    const o = program.opts<{ config?: string; cwd?: string; color?: boolean }>();
+    return { config: o.config, cwd: path.resolve(o.cwd ?? '.'), color: o.color !== false };
   };
 
   program

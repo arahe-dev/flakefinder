@@ -52,11 +52,12 @@ function tmp(): string {
 function cli(
   args: string[],
   cwd: string,
+  env: Record<string, string | undefined> = { NO_COLOR: '1' },
 ): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(process.execPath, [cliPath, ...args], {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, NO_COLOR: '1' },
+    env: { ...process.env, ...env },
   });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
@@ -341,5 +342,53 @@ describe('ci on a first run where nothing parses (QA ACT-5 / CLI-7)', () => {
     expect(r.stderr).not.toContain('ENOENT');
     expect(r.status).toBe(0);
     expect(existsSync(path.join(d, '.flakefinder', 'verdicts-snapshot.json'))).toBe(true);
+  });
+});
+
+describe('--cwd must be an existing directory (QA CLI-19)', () => {
+  it.each([
+    ['report'],
+    ['init'],
+    ['ingest'],
+    ['html'],
+    ['doctor'],
+    ['ci'],
+    ['quarantine', 'list'],
+  ])('%s with a missing --cwd exits 2 with a clear error', (...cmd) => {
+    const d = tmp();
+    const r = cli(['--cwd', path.join(d, 'nope'), ...cmd], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/--cwd .*nope does not exist/);
+    expect(r.stderr).not.toMatch(/ENOENT|\n\s+at /);
+  });
+
+  it('a --cwd that is a file is rejected', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'f'), '', 'utf8');
+    const r = cli(['--cwd', 'f', 'report'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/is not a directory/);
+  });
+});
+
+describe('--config resolves against --cwd (QA CLI-25)', () => {
+  it('a relative --config is looked up inside --cwd, not the process cwd', () => {
+    const outer = tmp();
+    const proj = path.join(outer, 'proj');
+    mkdirSync(proj);
+    writeFileSync(path.join(proj, 'ff.json'), '{ "storeDir": "hist" }', 'utf8');
+    writeFileSync(path.join(proj, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(['--cwd', 'proj', '--config', 'ff.json', 'ingest', 'r.xml'], outer);
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(proj, 'hist', 'history.jsonl'))).toBe(true);
+  });
+
+  it('a config that is not a JSON object is a clear exit-2 error (QA CLI-16)', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), 'null', 'utf8');
+    const r = cli(['report'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/config must be a JSON object, got null/);
+    expect(r.stderr).not.toMatch(/TypeError/);
   });
 });
