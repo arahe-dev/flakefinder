@@ -80,11 +80,43 @@ export function readInputs(get: (name: string) => string, baseDir: string): Acti
     uploadDashboard: bool('upload-dashboard', true),
     failOnNewFlakes: bool('fail-on-new-flakes', false),
     githubToken: get('github-token'),
-    historyKey: get('history-key').trim(),
+    historyKey: normalizeHistoryKey(get('history-key')),
     workingDirectoryRel: path.relative(baseDir, cwd).split(path.sep).join('/') || '.',
   };
   if (problems.length > 0) {
     throw new InputError(`invalid action input(s):\n  - ${problems.join('\n  - ')}`);
   }
   return inputs;
+}
+
+/**
+ * The `history-key` input defaults to `${{ toJSON(matrix) }}` (action.yml),
+ * so matrix legs get separate history streams without any configuration.
+ * Outside a matrix that evaluates to `null` — treated as no key, so
+ * non-matrix jobs keep the stream they always had. A JSON object is
+ * re-serialized with sorted keys and no whitespace, so the stream does not
+ * change if the runner's JSON formatting or key order does.
+ */
+export function normalizeHistoryKey(raw: string): string {
+  const v = raw.trim();
+  if (v === '' || v === 'null' || v === '{}') return '';
+  if (!v.startsWith('{')) return v;
+  try {
+    const parsed = JSON.parse(v) as unknown;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return v;
+    return canonicalJson(parsed);
+  } catch {
+    return v;
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }

@@ -494,7 +494,7 @@ jobs:
       - run: npm ci
       - run: npm test                      # must write report files
       - name: flakefinder
-        uses: DJJW26/flakefinder@main
+        uses: DJJW26/flakefinder@v1
         if: always()                       # analyze even when tests fail
 ```
 
@@ -503,7 +503,7 @@ moment they're recorded — that's the point):
 
 ```yaml
       - name: flakefinder
-        uses: DJJW26/flakefinder@main
+        uses: DJJW26/flakefinder@v1
         if: always()
         with:
           fail-on-new-flakes: true
@@ -518,14 +518,30 @@ moment they're recorded — that's the point):
 
 ```yaml
       - name: flakefinder (services/api)
-        uses: DJJW26/flakefinder@main
+        uses: DJJW26/flakefinder@v1
         if: always()
         with:
           working-directory: services/api
 ```
 
-History is cached per repository under `.flakefinder/` (immutable key per
-commit, prefix restore for warm starts on new branches).
+**Matrix builds** — each leg keeps its own history automatically
+(`history-key` defaults to `${{ toJSON(matrix) }}`). Pin it to the
+dimensions you care about if you want it stable when the matrix changes:
+
+```yaml
+      - name: flakefinder
+        uses: DJJW26/flakefinder@v1
+        if: always()
+        with:
+          history-key: ${{ matrix.os }}-node${{ matrix.node }}
+```
+
+History is cached under `.flakefinder/` in one stream per job, working
+directory and `history-key`: saved as
+`flakefinder-history-<stream>-<sha>-<run id>-<attempt>` (an immutable key
+per run attempt) and restored by the `flakefinder-history-<stream>-` prefix,
+falling back to any flakefinder cache as a warm start on a stream's first
+run. Details: [docs/github-action.md](github-action.md#how-the-history-cache-works).
 
 ## Other CI systems
 
