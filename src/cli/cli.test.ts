@@ -346,21 +346,16 @@ describe('ci on a first run where nothing parses (QA ACT-5 / CLI-7)', () => {
 });
 
 describe('--cwd must be an existing directory (QA CLI-19)', () => {
-  it.each([
-    ['report'],
-    ['init'],
-    ['ingest'],
-    ['html'],
-    ['doctor'],
-    ['ci'],
-    ['quarantine', 'list'],
-  ])('%s with a missing --cwd exits 2 with a clear error', (...cmd) => {
-    const d = tmp();
-    const r = cli(['--cwd', path.join(d, 'nope'), ...cmd], d);
-    expect(r.status).toBe(2);
-    expect(r.stderr).toMatch(/--cwd .*nope does not exist/);
-    expect(r.stderr).not.toMatch(/ENOENT|\n\s+at /);
-  });
+  it.each([['report'], ['init'], ['ingest'], ['html'], ['doctor'], ['ci'], ['quarantine', 'list']])(
+    '%s with a missing --cwd exits 2 with a clear error',
+    (...cmd) => {
+      const d = tmp();
+      const r = cli(['--cwd', path.join(d, 'nope'), ...cmd], d);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/--cwd .*nope does not exist/);
+      expect(r.stderr).not.toMatch(/ENOENT|\n\s+at /);
+    },
+  );
 
   it('a --cwd that is a file is rejected', () => {
     const d = tmp();
@@ -410,5 +405,28 @@ describe('doctor honours --config and color settings (QA CLI-9/CLI-13)', () => {
     expect(r.status).toBe(1);
     expect(r.stdout).toContain('[FAIL]');
     expect(r.stdout).not.toContain('\x1b[');
+  });
+});
+
+describe('UTF-16 report files (QA PAR-9)', () => {
+  const utf16 = (s: string): Buffer =>
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')]);
+
+  it('ingest reads a UTF-16LE (BOM) JUnit report', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), utf16(JUNIT));
+    const r = cli(['ingest', 'r.xml'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ingested 2 test result(s) from 1/1 file(s)');
+  });
+
+  it('ci reads a UTF-16LE (BOM) JUnit report', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), utf16(JUNIT));
+    const r = cli(['ci'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('unrecognized');
+    expect(historyRecords(d)[0]!.results).toHaveLength(2);
   });
 });

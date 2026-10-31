@@ -33,6 +33,7 @@ import type {
 } from '../types.js';
 import { FLAKEFINDER_VERSION } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
+import { readTextFile } from '../util/read-text.js';
 import { redact } from '../util/redact.js';
 import { parseStrictInt } from '../util/strict-int.js';
 import { shouldColor } from './color.js';
@@ -172,7 +173,10 @@ export async function main(argv: string[]): Promise<number> {
     .version(FLAKEFINDER_VERSION)
     .option('--config <path>', 'explicit path to flakefinder.config.json')
     .option('--cwd <dir>', 'working directory (where config/reports live; default: .)')
-    .option('--no-color', 'disable ANSI colors (also off with NO_COLOR or when output is not a terminal)')
+    .option(
+      '--no-color',
+      'disable ANSI colors (also off with NO_COLOR or when output is not a terminal)',
+    )
     .exitOverride()
     // every command resolves paths against --cwd: validate it once, up front
     .hook('preAction', () => {
@@ -359,7 +363,7 @@ export async function main(argv: string[]): Promise<number> {
       for (const file of targets) {
         let content: string;
         try {
-          content = readFileSync(file, 'utf8');
+          content = readTextFile(file); // UTF-8 or UTF-16 (PowerShell 5.1 `>`)
         } catch (err) {
           console.warn(`flakefinder: cannot read ${file}: ${(err as Error).message}`);
           warnings++;
@@ -604,7 +608,7 @@ export async function main(argv: string[]): Promise<number> {
       for (const file of targets) {
         let content: string;
         try {
-          content = readFileSync(file, 'utf8');
+          content = readTextFile(file); // UTF-8 or UTF-16 (PowerShell 5.1 `>`)
         } catch (err) {
           console.warn(`flakefinder: cannot read ${file}: ${(err as Error).message}`);
           continue;
