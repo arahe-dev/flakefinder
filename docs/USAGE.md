@@ -123,6 +123,17 @@ recorded again.
 Then it classifies and prints a terminal report restricted to the tests
 observed in this invocation.
 
+**Uncommitted changes.** Each run is tagged with the code state it ran:
+HEAD's commit sha, or — when tracked files have uncommitted changes —
+`<sha>-dirty-<hash>` (the hash covers the changed files' contents;
+flakefinder's own store, quarantine file, config and report files are
+ignored, and so are untracked files). `run` prints a one-line notice when
+that happens. So fixing a failing test locally and re-running is a change of
+code state (fail on HEAD → pass on the dirty state), not a same-commit flip:
+it is not called `flaky-confirmed`. Re-running the *same* uncommitted edits
+still compares like with like, so a real flake on your edits is caught.
+(`ingest`/`ci` record HEAD's sha as-is.)
+
 - `-R, --retries <n>` — extra attempts, an integer 0–10 (default: config
   `liveRetries`, itself default 2; the same 0–10 range applies to both the
   flag and the config key). `-R 0` runs once with no retries but still
@@ -391,7 +402,9 @@ matter most require *proof*:
   commit and the test both failed and passed on it. Nothing changed — same
   code, same environment claim — so the difference must come from the test
   itself (order, timing, network, port, leftover state). This is the
-  strongest signal available and outweighs everything else.
+  strongest signal available and outweighs everything else. (A `run` on a
+  working tree with uncommitted changes counts as its own code state, not
+  as HEAD — see [`run`](#run).)
 - **Retry rescue → `flaky-retry`, +40 points.** Within a single `run`
   invocation (attempts share a `runId`), attempt 1 failed and attempt 2
   passed. Proof the test can pass without any code change. In a git repo a

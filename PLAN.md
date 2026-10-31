@@ -194,6 +194,12 @@ ordered by their earliest timestamp, attempts ascending within a group):
   between branches whose commits differ in outcome.
 - The time of a direction change is when the new family was first seen in that visit; the
   **most recent flip** is the time of the latest direction change.
+- **Dirty working trees** (`run` only): a run with uncommitted changes to tracked files
+  (ignoring flakefinder's store, quarantine, config and report files) is recorded with
+  `commitSha = "<HEAD sha>-dirty-<hash>"` (hash over the changed tracked files' paths and
+  contents; untracked files ignored), a code state distinct from HEAD — so a local,
+  uncommitted fix of a real failure is a direction change, never a same-SHA flip, while
+  re-running identical edits is still the same state.
 
 Classification precedence (first match wins):
 

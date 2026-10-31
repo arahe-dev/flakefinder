@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
 import { failedNamesOf, failedOnlyArgs } from './adapters.js';
+import { detectCodeState } from './git-state.js';
 
 export interface LiveRunResult {
   attempts: RunRecord[];
@@ -329,9 +330,19 @@ export async function runLive(
   const cwd = path.resolve(opts.cwd);
   const runId = randomUUID();
 
-  let commitSha: string | undefined;
-  const git = spawnSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' });
-  if (git.status === 0) commitSha = git.stdout.trim();
+  // a dirty tree is NOT HEAD: uncommitted edits (say, a local fix) get their
+  // own code state, so they never look like a same-SHA flip (PLAN §5)
+  const { commitSha, dirtyFiles } = detectCodeState(cwd, [
+    cfg.storeDir,
+    cfg.quarantineFile,
+    'flakefinder.config.json',
+    ...matchGlobs(cwd, cfg.reports),
+  ]);
+  if (dirtyFiles.length > 0 && commitSha) {
+    console.log(
+      `flakefinder: working tree has uncommitted changes (${dirtyFiles.length} file(s)) — recording code state ${commitSha.replace(/^([0-9a-f]{7})[0-9a-f]*/, '$1')}, distinct from HEAD`,
+    );
+  }
 
   const runner = cfg.runner === 'auto' ? detectRunner(cwd) : cfg.runner;
   let quarantineFlags: string[] = [];
