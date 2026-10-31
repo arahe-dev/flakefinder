@@ -119,16 +119,28 @@ stopping early on exit 0. The command is spawned **directly** (no shell) —
 arguments pass through verbatim, including spaces and special characters.
 Commands containing shell operators (`>`, `|`, `&&`) automatically fall back
 to shell mode so redirects keep working. After each attempt it parses the
-report files that **changed** (attempt 1 ingests only files created/changed
-since the invocation started — stale reports from previous runs are ignored)
-and records them as attempts of one run. Retry attempts record every report
-the attempt **wrote** — a byte-identical rewrite still counts (its mtime
-moves), so a fail-fail-pass sequence with a deterministic report is detected
-as a rescue — while files nobody touched (stale reports from another job, or
-the previous attempt's report when a retry crashed before writing) are not
-recorded again.
+report files that **changed** and records them as attempts of one run. Every
+attempt records exactly the reports it **wrote** — new files, or files whose
+mtime, size or content changed since before the attempt. A byte-identical
+rewrite still counts (its mtime moves): a deterministic report generator is
+recorded on every run, and a fail-fail-pass sequence with identical failure
+reports is detected as a rescue. Files nobody touched — stale reports from a
+previous job, or the previous attempt's report when a retry crashed before
+writing — are ignored. Reports are decoded as UTF-8 or UTF-16 (with a BOM,
+as PowerShell 5.1's `>` writes them).
 Then it classifies and prints a terminal report restricted to the tests
 observed in this invocation.
+
+**Uncommitted changes.** Each run is tagged with the code state it ran:
+HEAD's commit sha, or — when tracked files have uncommitted changes —
+`<sha>-dirty-<hash>` (the hash covers the changed files' contents;
+flakefinder's own store, quarantine file, config and report files are
+ignored, and so are untracked files). `run` prints a one-line notice when
+that happens. So fixing a failing test locally and re-running is a change of
+code state (fail on HEAD → pass on the dirty state), not a same-commit flip:
+it is not called `flaky-confirmed`. Re-running the *same* uncommitted edits
+still compares like with like, so a real flake on your edits is caught.
+(`ingest`/`ci` record HEAD's sha as-is.)
 
 - `-R, --retries <n>` — extra attempts, an integer 0–10 (default: config
   `liveRetries`, itself default 2; the same 0–10 range applies to both the
@@ -146,9 +158,12 @@ observed in this invocation.
   and the retry loop proceeds. Default: config `timeoutSeconds`, itself
   unlimited. SIGINT/SIGTERM (Ctrl-C) are forwarded to the current tree, stop
   the loop, and exit 130 while keeping everything observed so far in history.
-  On POSIX each attempt runs in its own process group (that is how the whole
-  tree is reached), so when stdin is a terminal the test command gets an empty
-  stdin — interactive/watch modes are not supported under `run`.
+  When stdin is a terminal, the test command inherits it and shares the
+  terminal (watch modes, prompts and debuggers work); the whole tree is still
+  killed on timeout, and Ctrl-C reaches it directly — flakefinder only steps
+  in (SIGTERM, then SIGKILL) if it hasn't exited 2 s later. Otherwise (CI,
+  piped stdin) each attempt runs in its own process group so the tree can be
+  signalled as one.
 - `--retry-mode auto|failed|full` — retry strategy (default: config `retryMode`,
   itself default `auto`). `auto`: attempt 1 runs everything; each re-run
   executes **only the tests that failed on the previous attempt** (a test that
@@ -169,8 +184,10 @@ a rescue. Two implementation notes: targeted selectors match failed test
 names as space-delimited final segments of the full name (a failure named
 `update` does not drag in `math re-update`), and quarantined tests are
 excluded from re-runs even on name collisions (pytest `--lf` retries keep the
-`--deselect` flags; with `-p no:cacheprovider` on the command line `--lf` is
-unavailable, so pytest retries are full re-runs). pytest's `--lf` trusts pytest's
+`--deselect` flags; with `-p no:cacheprovider` — on the command line, in
+`PYTEST_ADDOPTS`, or in the `addopts` of your pytest.ini / pyproject.toml /
+tox.ini / setup.cfg — `--lf` is unavailable, so pytest retries are full
+re-runs). pytest's `--lf` trusts pytest's
 own last-failed cache — a stale cache from a *manual* pytest run outside
 flakefinder could re-run a quarantined test once; clear it with
 `pytest --cache-clear` if that ever bites. If your command already passes
@@ -186,6 +203,18 @@ flags are appended automatically (with a notice); see
 If **no** report files match, per-test detection is impossible; flakefinder
 falls back to a suite-level verdict from the attempt exit codes and warns
 accordingly.
+
+**Exit status through pipes.** flakefinder sees the exit status of your
+whole command line. In shell mode `npx jest 2>&1 | tee out.txt` reports
+`tee`'s status (0), so a failing attempt looks green and is never retried.
+Wrap it so the pipeline fails when the test command does, e.g.
+`run -- bash -o pipefail -c 'npx jest 2>&1 | tee out.txt'` (or set
+`set -o pipefail` in the CI step that runs it).
+
+**A command that cannot be found** — a misspelled binary, also inside a
+shell-mode command line such as `nosuch-tool > out.txt` — exits 2 after one
+attempt with `command not found: …`; nothing is retried or recorded. A test
+script that itself exits 127 is still an ordinary failure.
 
 ### `ingest`
 
@@ -458,25 +487,47 @@ matter most require *proof*:
   commit and the test both failed and passed on it. Nothing changed — same
   code, same environment claim — so the difference must come from the test
   itself (order, timing, network, port, leftover state). This is the
-  strongest signal available and outweighs everything else.
+  strongest signal available and outweighs everything else. (A `run` on a
+  working tree with uncommitted changes counts as its own code state, not
+  as HEAD — see [`run`](#run).)
 - **Retry rescue → `flaky-retry`, +40 points.** Within a single `run`
   invocation (attempts share a `runId`), attempt 1 failed and attempt 2
   passed. Proof the test can pass without any code change. In a git repo a
   retry rescue is usually *also* a same-commit flip, so it classifies as
-  `flaky-confirmed`; without git metadata you'll see `flaky-retry`.
-- **Direction changes → up to +24 points, gated by `minRuns`.** Across
-  *distinct code states* — commits when git metadata exists, otherwise
-  individual runs — how many times did the test's result family flip
-  (pass→fail or fail→pass)? Two or more flips over enough runs is statistical
-  suspicion, not proof — hence `flaky-suspected`, score-gated by
-  `flakeScoreThreshold`, and it never fails your build. (Projects outside a
-  git repo get run-level flip tracking automatically; same-run retry attempts
-  count as one state.)
+  `flaky-confirmed`; without git metadata you'll see `flaky-retry`. A
+  runner's **own** retries count the same way: when a report records that
+  a test failed and then passed on an in-report retry (jest `retryTimes`,
+  vitest `retry`, mocha retries, Surefire/pytest reruns, go `-count` — where
+  the parser records the attempts), that is a retry rescue too.
+- **Direction changes → up to +24 points, gated by `minRuns`.** Walking the
+  history in time order across *code states* — commits when git metadata
+  exists, otherwise individual runs — how many times did the test's result
+  family flip (pass→fail or fail→pass) from one state to the next? Two or
+  more flips over enough runs is statistical suspicion, not proof — hence
+  `flaky-suspected`, score-gated by `flakeScoreThreshold`, and it never
+  fails your build. (Projects outside a git repo get run-level flip tracking
+  automatically; same-run retry attempts count as one state.) Going *back*
+  to an earlier commit counts as a new state: pass on A, fail on B, pass on
+  A again (a revert, or alternating runs of two branches that share one
+  history) is two flips.
 - **Long track record → +10 points** at ≥ 10 observed runs.
 
-Recency dampens history: flips in the last 14 days count fully, ≤ 30 days at
-60%, older at 30%. A flake from six months ago that never recurred shouldn't
-outrank last night's. The sum is capped at 100.
+**What counts as a run.** One invocation — one `flakefinder run`, one
+`ingest`/Action run — is ONE run, however many retry attempts it made.
+Attempts are evidence for rescues and same-commit flips, but they never
+inflate `runsObserved`: a brand-new test that fails all 3 attempts of a
+`run -R 2` is 1 run, so it is a `new-failure`, not `failing` (that needs
+`minRuns` runs). The `failing` window ("last 5"), `recently-fixed`, the
+`minRuns` gate and the +10 bonus all count runs; a run's outcome is its
+final attempt. `passRate` is over individual executions, so a run that
+failed once and passed on retry reads 50%.
+
+Recency dampens history: if the **most recent flip** (the latest direction
+change, not the latest failure) was in the last 14 days, direction changes
+count fully; ≤ 30 days at 60%; older at 30%. A flake from six months ago
+that never recurred shouldn't outrank last night's — but a test that just
+flipped back is fresh evidence even if its failures are old. The sum is
+capped at 100.
 
 **Confidence** is a separate 0–100 number answering "how sure am I of this
 verdict?": 100 for the two proven flake classes; scaled by observation count
@@ -485,9 +536,10 @@ count for `new-failure`. A `new-failure` on its first appearance carries low
 confidence by design — one red run is not a diagnosis.
 
 Tags: `slow` flags duration outliers (absolute `slowThresholdMs`, or p95 far
-above the suite's own median via `slowMultiplier`). `recently-fixed` flags
-tests that failed in the first half of history and passed the last 5 —
-candidates to un-quarantine.
+above the suite's own median via `slowMultiplier` — the relative rule also
+needs a p95 of at least 100 ms, so a 1 ms test in a suite of 0 ms tests is
+not "slow"). `recently-fixed` flags tests with a failed run in the first
+half of their history and passing last 5 runs — candidates to un-quarantine.
 
 ## Quarantine deep-dive
 
@@ -512,9 +564,14 @@ Per runner:
   back to a rootdir-relative node id (`tests/test_x.py::TestCls::test_y`):
   the module is the longest dotted prefix that exists as a `.py` file,
   falling back to "trailing Capitalized components are classes". pytest
-  skips those node ids; the rest of the suite runs normally. Note that pytest
-  matches `--deselect` as a node-id *prefix*, so quarantining `test_mod` also
-  deselects a sibling named `test_mod2` in the same module/class.
+  skips those node ids; the rest of the suite runs normally. pytest itself
+  matches `--deselect` as a node-id *prefix* (quarantining `test_mod` would
+  also drop `test_mod2`), so `run` also loads a tiny temporary plugin (via
+  `PYTEST_PLUGINS`/`PYTHONPATH`) that deselects exactly the quarantined ids
+  and their parametrizations (`test_mod[...]`) — `test_mod2` keeps running,
+  and your own `--deselect` flags keep pytest's usual meaning. If a wrapper
+  strips the environment (e.g. tox without `pass_env`), the plain
+  `--deselect` prefix match still applies.
 - **Jest** — a single `-t "<pattern>"` where pattern is
   `^(?!(?:.* )?(?:name1|name2)\s*$)` (names regex-escaped, deduped): a negative
   lookahead that matches every test name *except* the quarantined ones, so
