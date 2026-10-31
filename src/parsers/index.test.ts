@@ -6,7 +6,7 @@ const load = (name: string): string =>
   readFileSync(new URL(`../../tests/parsers-fixtures/${name}`, import.meta.url), 'utf8');
 
 describe('parsers registry', () => {
-  it('exposes the six parsers in contract order', () => {
+  it('exposes the parsers in contract order', () => {
     expect(parsers.map((p) => p.name)).toEqual(['junit', 'jest', 'mocha', 'go', 'tap', 'trx']);
   });
 });
@@ -39,6 +39,7 @@ describe('detectParser', () => {
     ['junit-surefire-reruns.xml', 'junit'],
     ['mocha-same-title-hook.json', 'mocha'],
     ['mochawesome.json', 'mocha'],
+    ['vitest-retry.json', 'jest'],
   ];
 
   for (const [fixture, expected] of cases) {
@@ -74,5 +75,32 @@ describe('detectParser', () => {
   it('never throws on garbage input', () => {
     expect(() => detectParser('\u0000\u0001')).not.toThrow();
     expect(() => detectParser('{"broken": [')).not.toThrow();
+  });
+});
+
+describe('byte-order marks (QA PAR-9)', () => {
+  const fixtures: Array<[string, string]> = [
+    ['junit-pytest.xml', 'junit'],
+    ['jest.json', 'jest'],
+    ['mocha.json', 'mocha'],
+    ['go-test.jsonl', 'go'],
+    ['tap-node20-parents.tap', 'tap'],
+    ['tap-perl-no-header.tap', 'tap'],
+    ['trx-dotnet.trx', 'trx'],
+  ];
+  for (const [fixture, expected] of fixtures) {
+    it(`detects and parses ${fixture} with a leading U+FEFF exactly as without`, () => {
+      const plain = load(fixture);
+      const parser = detectParser(`\uFEFF${plain}`);
+      expect(parser?.name).toBe(expected);
+      const withBom = parser!.parse(`\uFEFF${plain}`, fixture);
+      expect(withBom).toEqual(detectParser(plain)!.parse(plain, fixture));
+      expect(withBom.results.length).toBeGreaterThan(0);
+    });
+  }
+
+  it('a UTF-16 file decoded with its BOM (what decodeText returns) is detected', () => {
+    const utf16 = Buffer.from(`\uFEFF${load('jest.json')}`, 'utf16le');
+    expect(detectParser(utf16.toString('utf16le'))?.name).toBe('jest');
   });
 });

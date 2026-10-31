@@ -12,14 +12,27 @@
  *            plan / numbered assertion and whose first 50 lines are all TAP-shaped
  * 6. trx   — trimmed content starts with '<' and contains a `<TestRun` element
  * 7. otherwise null. Never throws.
+ *
+ * A leading byte-order mark (U+FEFF — a UTF-8 BOM, or what remains of a UTF-16 one after
+ * decoding) is stripped here, centrally, before any parser sniffs or parses the content.
  */
 import type { ReportParser } from '../types.js';
 import { goTestParser } from './gotest.js';
+import { stripBom } from './internal.js';
 import { jestParser } from './jest.js';
 import { junitParser } from './junit.js';
 import { mochaParser } from './mocha.js';
 import { tapParser } from './tap.js';
 import { trxParser } from './trx.js';
+
+/** The parser with BOM stripping in front of sniff and parse. */
+function bomTolerant(parser: ReportParser): ReportParser {
+  return {
+    name: parser.name,
+    sniff: (content) => parser.sniff(stripBom(content)),
+    parse: (content, sourcePath) => parser.parse(stripBom(content), sourcePath),
+  };
+}
 
 export const parsers: ReportParser[] = [
   junitParser,
@@ -28,7 +41,7 @@ export const parsers: ReportParser[] = [
   goTestParser,
   tapParser,
   trxParser,
-];
+].map(bomTolerant);
 
 export function detectParser(content: string): ReportParser | null {
   for (const parser of parsers) {
