@@ -480,3 +480,30 @@ describe('--run-id validation (QA CLI-27)', () => {
     },
   );
 });
+
+describe('html output path and --open (QA CLI-10/CLI-31)', () => {
+  it('-o "" is a clear exit-2 error, not a raw EISDIR', () => {
+    const d = tmp();
+    const r = cli(['html', '-o', ''], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('needs a file path');
+    expect(r.stderr).not.toMatch(/EISDIR|\n\s+at /);
+  });
+
+  it('-o pointing at a directory says so', () => {
+    const d = tmp();
+    mkdirSync(path.join(d, 'out'));
+    const r = cli(['html', '-o', 'out'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/cannot write the dashboard to .*out — it is a directory/);
+  });
+
+  it.runIf(process.platform === 'linux')('--open without xdg-open warns and still exits 0', () => {
+    const d = tmp();
+    const r = cli(['html', '--open'], d, { NO_COLOR: '1', PATH: path.join(d, 'empty-bin') });
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(d, 'flakefinder-report.html'))).toBe(true);
+    expect(r.stderr).toMatch(/could not open a browser \(xdg-open: /);
+    expect(r.stderr).not.toMatch(/Unhandled|\n\s+at /);
+  });
+});

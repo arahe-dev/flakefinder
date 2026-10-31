@@ -247,8 +247,12 @@ drawer per test with its full observation timeline, failure message, duration
 sparkline, and a copyable `quarantine add` command.
 
 - `-o, --out <file>` — output path (default `flakefinder-report.html`);
-  missing parent directories are created automatically
-- `--open` — open it in your browser after writing
+  missing parent directories are created automatically. An empty path, a
+  directory, or an unwritable location exits `2` with the reason
+- `--open` — open it in your browser after writing (`xdg-open` on Linux,
+  `open` on macOS, `start` on Windows). When no opener is available (e.g. a
+  headless box without `xdg-open`) this is a one-line warning; the dashboard
+  is still written and the exit code stays `0`
 
 ### `doctor`
 

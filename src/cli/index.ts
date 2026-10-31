@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -37,6 +37,7 @@ import { readTextFile } from '../util/read-text.js';
 import { redact } from '../util/redact.js';
 import { parseStrictInt } from '../util/strict-int.js';
 import { shouldColor } from './color.js';
+import { openInBrowser } from './open.js';
 
 interface Globals {
   config?: string;
@@ -150,20 +151,6 @@ function printSetupHints(runner: RunnerKind): void {
   console.log(
     `\nnext step — make your runner emit machine-readable reports:\n${hint[runner] ?? hint.generic}`,
   );
-}
-
-function openInBrowser(file: string): void {
-  try {
-    if (process.platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '', file], { detached: true, stdio: 'ignore' });
-    } else if (process.platform === 'darwin') {
-      spawn('open', [file], { detached: true, stdio: 'ignore' });
-    } else {
-      spawn('xdg-open', [file], { detached: true, stdio: 'ignore' });
-    }
-  } catch {
-    // opening is best-effort
-  }
 }
 
 function ghEscape(s: string): string {
@@ -471,6 +458,11 @@ export async function main(argv: string[]): Promise<number> {
     .option('--open', 'open the dashboard in your browser')
     .action((opts: { out: string; open?: boolean }) => {
       const g = globals();
+      if (opts.out.trim() === '') {
+        console.error('flakefinder: html -o/--out needs a file path (got an empty string)');
+        exitCode = 2;
+        return;
+      }
       const cfg = resolveCfg(g);
       const store = storeFor(g, cfg);
       const verdicts = classifyAll(store.runs(), cfg);
@@ -492,8 +484,17 @@ export async function main(argv: string[]): Promise<number> {
         runs,
       });
       const out = path.resolve(g.cwd, opts.out);
-      mkdirSync(path.dirname(out), { recursive: true }); // -o into a fresh directory just works
-      writeFileSync(out, html, 'utf8');
+      try {
+        mkdirSync(path.dirname(out), { recursive: true }); // -o into a fresh directory just works
+        writeFileSync(out, html, 'utf8');
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        console.error(
+          `flakefinder: cannot write the dashboard to ${out}${e.code === 'EISDIR' ? ' — it is a directory' : ` (${e.code ?? e.message})`}`,
+        );
+        exitCode = 2;
+        return;
+      }
       console.log(`dashboard written → ${out} (${verdicts.length} tests, ${runs.length} runs)`);
       if (opts.open) openInBrowser(out);
     });
