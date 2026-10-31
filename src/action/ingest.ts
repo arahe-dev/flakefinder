@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { classifyAll } from '../engine/classify.js';
-import { detectParser } from '../parsers/index.js';
+import { detectParser, unrecognizedReason } from '../parsers/index.js';
 import { HistoryStore } from '../store/history-store.js';
 import type { ResolvedConfig, RunRecord, TestVerdict } from '../types.js';
 import { readTextFile } from '../util/read-text.js';
@@ -44,7 +44,7 @@ export function ingestReports(
     }
     const parser = detectParser(content);
     if (!parser) {
-      warnings.push(`unrecognized report format — skipped ${file}`);
+      warnings.push(`${unrecognizedReason(content)} — skipped ${file}`);
       continue;
     }
     let parsed: ReturnType<typeof parser.parse>;

@@ -788,7 +788,8 @@ lock alone didn't close (see prune, below).
 
 ### Prune — and the fresh-read lesson
 
-The store is capped at `maxRuns` records (default 300). Pruning rewrites the
+The store is capped at the last `maxRuns` runs — distinct runIds, so a run's retry
+attempts are kept or dropped together (default 300). Pruning rewrites the
 file atomically (write `.tmp`, rename over the original). The subtle bug QA
 found: prune originally rewrote from the **in-memory** records, which were
 loaded at process start — under concurrency, records another process had

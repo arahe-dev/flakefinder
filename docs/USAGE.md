@@ -433,7 +433,7 @@ first). A file no parser recognizes is skipped with a reason, e.g.
   columns: score, confidence, runs, pass-rate, median duration,
   `suite :: name`, tags. Footer: `ok:` line and next-step hints (worst
   offender's exact `quarantine add` command).
-- **json** — full verdict objects: classification, `flakeScore`,
+- **json** — `schemaVersion: 1` plus full verdict objects: classification, `flakeScore`,
   `confidence`, `passRate`, `runsObserved`, `lastStatus`, `lastMessage`,
   `medianDurationMs`, `p95DurationMs`, `sameShaFlips`, `retryRescues`,
   `directionChanges`, `tags`, plus identity (`testId`, `suite`, `name`).

@@ -14,7 +14,7 @@ import {
 } from '../config.js';
 import { runDoctor } from '../doctor.js';
 import { classifyAll } from '../engine/classify.js';
-import { detectParser } from '../parsers/index.js';
+import { detectParser, unrecognizedReason } from '../parsers/index.js';
 import { exclusionArgs, QuarantineManager } from '../quarantine/manager.js';
 import { gitlabEnvFromProcess, upsertMrNote } from '../report/gitlab.js';
 import { renderDashboard } from '../report/html.js';
@@ -458,7 +458,7 @@ export async function main(argv: string[]): Promise<number> {
         }
         const parser = detectParser(content);
         if (!parser) {
-          console.warn(`flakefinder: unrecognized report format — skipped ${file}`);
+          console.warn(`flakefinder: ${unrecognizedReason(content)} — skipped ${file}`);
           warnings++;
           continue;
         }
@@ -731,7 +731,7 @@ export async function main(argv: string[]): Promise<number> {
         }
         const parser = detectParser(content);
         if (!parser) {
-          console.warn(`flakefinder: unrecognized report format — skipped ${file}`);
+          console.warn(`flakefinder: ${unrecognizedReason(content)} — skipped ${file}`);
           continue;
         }
         const parsed = parser.parse(content, file);

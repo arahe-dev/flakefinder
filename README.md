@@ -119,6 +119,10 @@ design and `always-fail` never passes.
 | go test -json | Go | `go test -json ./... > test-output.jsonl` (add `-count=1` to defeat Go's result cache) |
 | TAP | node:test (`--test-reporter=tap`), TAP14 producers | `node --test --test-reporter=tap > tap.txt` |
 | TRX | .NET (`dotnet test`), VSTest | `dotnet test --logger "trx;LogFileName=results.trx"` |
+| Playwright JSON | Playwright (per-attempt retries) | `PLAYWRIGHT_JSON_OUTPUT_NAME=pw.json npx playwright test --reporter=json` |
+| pytest-json-report | pytest with the `pytest-json-report` plugin | `pytest --json-report --json-report-file=report.json` |
+
+Reports may be UTF-8 or UTF-16 (e.g. PowerShell `>` output) and may be gzip-compressed.
 
 The parser is auto-detected per file from its content, so mixed reports in one
 repo are fine. Point `flakefinder.config.json` → `reports` globs at them.
@@ -206,7 +210,8 @@ Nothing is uploaded anywhere unless you use the GitHub Action, in which case
 history lives in your repository's actions cache.
 
 **Does it work with runner X?**
-If X can emit JUnit XML, Jest JSON, Mocha JSON, `go test -json`, TAP, or TRX,
+If X can emit JUnit XML, Jest JSON, Mocha JSON, `go test -json`, TAP, TRX,
+Playwright JSON, or pytest-json-report,
 yes — that covers most of the ecosystem.
 
 ## Development
