@@ -16,9 +16,14 @@
  * durationMs = round(elapsed * 1000) from the reported run's terminal event when present,
  * else null (older Go versions only put elapsed on package-level events).
  *
- * Messages are built from the reported run's 'output' events: ANSI SGR codes are stripped,
- * blank lines dropped, and the LAST 2000 characters of the joined text are kept (failure
- * details come at the end, after t.Log noise).
+ * `attempts` (when a test ran more than once) lists every run's status; because the reported
+ * status is 'fail' if any run failed, the failing runs are listed last when the final run
+ * passed (see runAttempts), so the last attempt always equals the status.
+ *
+ * Messages are built from the reported run's 'output' events: ANSI SGR codes, blank lines and
+ * go's framing lines (`=== RUN`, `=== PAUSE`/`CONT`/`NAME`, `--- PASS:`/`FAIL:`/`SKIP:`)
+ * are dropped, and the LAST 2000 characters of the joined text are kept (failure details
+ * come at the end, after t.Log noise). A passing test gets no message.
  *
  * Subtests: `TestA/sub` is emitted with its full name. A parent (`TestA`) that has subtests is
  * NOT emitted — its status only mirrors its children and would double-count their failures —
@@ -91,6 +96,19 @@ function hasBenchResult(outputs: string[]): boolean {
   return /^Benchmark\S*\s+\d+\s+[\d.]+ \S+\/op\b/m.test(outputs.join(''));
 }
 
+/**
+ * `attempts` for a test run several times (`-count=N`): every run's status in
+ * order. The runs are independent repeats, not retries, and the reported
+ * status is 'fail' when ANY run failed — so when the last run did not fail,
+ * the failing runs are moved to the end (otherwise in order) to keep the
+ * contract that the last attempt equals the result's status.
+ */
+function runAttempts(runs: RunState[], status: TestStatus): TestStatus[] {
+  const statuses = runs.map((r) => r.status!);
+  if (statuses[statuses.length - 1] === status) return statuses;
+  return [...statuses.filter((s) => s !== status), ...statuses.filter((s) => s === status)];
+}
+
 function isFailFamily(status: TestStatus): boolean {
   return status === 'fail' || status === 'error';
 }
@@ -106,14 +124,21 @@ function elapsedToMs(ev: Record<string, unknown>): number | null {
   return Math.round(raw * 1000);
 }
 
+/**
+ * go test's own framing lines (`=== RUN   TestX`, `=== PAUSE`, `=== CONT`,
+ * `=== NAME`, `--- PASS: TestX (0.00s)`, `--- FAIL: …`, `--- SKIP: …`,
+ * `--- BENCH: …`) — they restate the status and name, never the reason.
+ */
+const FRAMING_LINE = /^\s*(?:=== (?:RUN|PAUSE|CONT|NAME)\b|--- (?:PASS|FAIL|SKIP|BENCH): )/;
+
 /** Last meaningful chunk of a test's output events, trimmed to MESSAGE_MAX_CHARS. */
 function messageFromOutputs(outputs: string[]): string | undefined {
   if (outputs.length === 0) return undefined;
-  // Blank lines are dropped but per-line indentation is kept — a line like
-  // "    file.go:12: detail" carries its t.Log prefix meaningfully.
+  // Blank and framing lines are dropped but per-line indentation is kept — a
+  // line like "    file.go:12: detail" carries its t.Log prefix meaningfully.
   const text = stripAnsi(outputs.join(''))
     .split(/\r?\n/)
-    .filter((line) => line.trim() !== '')
+    .filter((line) => line.trim() !== '' && !FRAMING_LINE.test(line))
     .join('\n');
   if (text === '') return undefined;
   return text.length > MESSAGE_MAX_CHARS ? text.slice(-MESSAGE_MAX_CHARS) : text;
@@ -283,6 +308,10 @@ export const goTestParser: ReportParser = {
         // the synthetic explanation.
         const output = messageFromOutputs(last.outputs);
         if (output !== undefined) result.message = `${result.message}\n${output}`;
+        if (acc.runs.length > 1) {
+          // earlier -count runs finished; the crashed one is the last attempt
+          result.attempts = [...acc.runs.slice(0, -1).map((r) => r.status!), 'error'];
+        }
         rows.push({ acc, result, dangling: true, flaky: false });
         continue;
       }
@@ -295,13 +324,15 @@ export const goTestParser: ReportParser = {
         status: reported.status!,
         durationMs: reported.durationMs,
       };
-      let message = messageFromOutputs(reported.outputs);
+      // a pass carries no message: its output is t.Log noise, not a reason
+      let message = reported.status === 'pass' ? undefined : messageFromOutputs(reported.outputs);
       const isFlaky = failed.length > 0 && failed.length < acc.runs.length;
       if (isFlaky) {
         const note = `flaky: failed ${failed.length} of ${acc.runs.length} runs in this report`;
         message = message !== undefined ? `${note}\n${message}` : note;
       }
       if (message !== undefined) result.message = message;
+      if (acc.runs.length > 1) result.attempts = runAttempts(acc.runs, result.status);
       rows.push({ acc, result, dangling: false, flaky: isFlaky });
     }
 
