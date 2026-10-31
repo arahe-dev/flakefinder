@@ -58,7 +58,7 @@ export async function upsertMrNote(
     'Content-Type': 'application/json',
   };
   const mrUrl = `${gl.apiV4}/projects/${encodeURIComponent(gl.projectId)}/merge_requests/${encodeURIComponent(gl.mrIid)}`;
-  const notesUrl = `${mrUrl}/notes?per_page=100`;
+  const notesUrl = `${mrUrl}/notes`;
 
   try {
     // the token's own user: only notes it authored are candidates for update
@@ -70,17 +70,10 @@ export async function upsertMrNote(
     const me = (await userRes.json()) as { id?: unknown };
     if (typeof me.id !== 'number') return 'unavailable';
 
-    // find an existing flakefinder note (first page of 100 is plenty in practice)
-    const listRes = await call(notesUrl, { headers });
-    if (!listRes.ok) {
-      warn(`GitLab: listing MR notes failed: HTTP ${listRes.status}`);
-      return 'unavailable';
-    }
-    const notes = (await listRes.json()) as MrNote[];
-    if (!Array.isArray(notes)) return 'unavailable';
-    const existing = notes.find(
-      (n) => n.author?.id === me.id && (n.body ?? '').includes(PR_COMMENT_MARKER),
-    );
+    // find an existing flakefinder note — across ALL pages (an MR with
+    // >100 notes hid ours on a later page, so a duplicate was posted)
+    const existing = await findOwnNote(call, headers, notesUrl, me.id, warn);
+    if (existing === 'unavailable') return 'unavailable';
     if (existing) {
       const res = await call(`${mrUrl}/notes/${existing.id}`, {
         method: 'PUT',
@@ -105,4 +98,52 @@ export async function upsertMrNote(
     warn(`GitLab: MR note request failed (${e.name}: ${e.message})`);
     return 'unavailable';
   }
+}
+
+/** Notes fetched per page (GitLab's maximum). */
+const NOTES_PER_PAGE = 100;
+/** Pagination cap: 50 pages = 5000 notes; past that we stop looking. */
+export const MAX_NOTE_PAGES = 50;
+
+/**
+ * Walk the MR's notes, oldest first, until our marker note is found.
+ * Pages are requested by number on OUR OWN notes URL (never by following a
+ * server-supplied `Link`), so the token can't be steered to another origin.
+ * `X-Next-Page` ends the walk; without it, a short page does.
+ */
+async function findOwnNote(
+  call: (url: string, init?: RequestInit) => Promise<Response>,
+  headers: Record<string, string>,
+  notesUrl: string,
+  myId: number,
+  warn: (message: string) => void,
+): Promise<MrNote | undefined | 'unavailable'> {
+  for (let page = 1; page <= MAX_NOTE_PAGES; ) {
+    const url = `${notesUrl}?order_by=created_at&sort=asc&per_page=${NOTES_PER_PAGE}&page=${page}`;
+    const res = await call(url, { headers });
+    if (!res.ok) {
+      warn(`GitLab: listing MR notes failed: HTTP ${res.status}`);
+      return 'unavailable';
+    }
+    const notes = (await res.json()) as unknown;
+    if (!Array.isArray(notes)) return 'unavailable';
+    const hit = (notes as MrNote[]).find(
+      (n) => n?.author?.id === myId && (n.body ?? '').includes(PR_COMMENT_MARKER),
+    );
+    if (hit) return hit;
+    const nextHeader = res.headers.get('x-next-page');
+    let next: number | null;
+    if (nextHeader === null) {
+      next = notes.length >= NOTES_PER_PAGE ? page + 1 : null;
+    } else {
+      const n = Number.parseInt(nextHeader, 10);
+      next = Number.isInteger(n) && n > page ? n : null;
+    }
+    if (next === null) return undefined;
+    page = next;
+  }
+  warn(
+    `GitLab: no flakefinder note in the first ${MAX_NOTE_PAGES * NOTES_PER_PAGE} MR notes — posting a new one`,
+  );
+  return undefined;
 }
