@@ -164,17 +164,36 @@ renderDashboard(data: DashboardData): string   // single self-contained HTML fil
 
 ## 5. Detection algorithm (Agent E implements EXACTLY this)
 
-Given chronological `Observation[]` per test (from `RunRecord`s sorted by timestamp then attempt):
+Given chronological `Observation[]` per test (from `RunRecord`s grouped by `runId`, groups
+ordered by their earliest timestamp, attempts ascending within a group):
 
 - **fail family** = status `fail` or `error`. Skips are excluded from flake math.
-- `sameShaFlips`: count of distinct `commitSha` values that observed BOTH families.
-- `retryRescues`: count of consecutive pairs `(attempt k → k+1)` with the SAME `runId` where
-  k is fail-family and k+1 is pass-family.
-- `directionChanges`: over the sequence of distinct code-state observations, the number of
-  times family changes between consecutive distinct states. A state is a `commitSha` bucket;
-  observations WITHOUT a commitSha (no git repo) bucket by `runId` instead, so SHA-less
-  histories still get statistical flip-flop detection (same-runId retry attempts collapse to
-  one state). Family per state = latest family seen in that state.
+- **Executions vs runs.** An *execution* is one (`runId`, `attempt`, in-report attempt) — a
+  live retry attempt, or one entry of a result's in-report `attempts` (the reporter retried
+  the test itself: jest/vitest/mocha retries, Surefire reruns, go `-count`, …). A result
+  with `attempts` expands into one execution per entry, oldest first; its final entry is
+  always the result's `status`. Results without `attempts` are one execution, as before.
+  A *run* is one invocation = one `runId`; its outcome is its final non-skip execution.
+  Retry attempts are evidence for `sameShaFlips` / `retryRescues`, but are NOT extra runs:
+  `runsObserved`, `cfg.minRuns`, the 5-run `failing` / `recently-fixed` windows and the
+  `+10` data bonus all count **runs** (one `-R 2` invocation that fails 3 times is 1 run →
+  `new-failure`, never `failing`). `passRate` = pass-family executions / all non-skip
+  executions (a rescued F,P run reads 50%).
+- `sameShaFlips`: count of distinct `commitSha` values whose executions include BOTH families.
+- `retryRescues`: count of consecutive execution pairs with the SAME `runId` where the first
+  is fail-family and the next is pass-family. Consecutive = live attempt k → k+1 (last
+  in-report attempt of k → first of k+1), or in-report attempt i → i+1 within one result.
+  An in-report retry-then-pass therefore scores exactly like a live retry rescue.
+- `directionChanges`: walk executions chronologically. A code state is the `commitSha`;
+  executions WITHOUT a commitSha (no git repo) use their `runId`, so SHA-less histories
+  still get statistical flip-flop detection while a run's own retries stay one state.
+  Consecutive executions of the same state form one **visit** whose family is the latest
+  family seen in it. `directionChanges` = number of family changes between consecutive
+  visits. Returning to an earlier commit is a NEW visit: a revert A(pass) → B(fail) →
+  A(pass) counts 2 changes (→ `flaky-suspected` at `minRuns` 3), as does alternating
+  between branches whose commits differ in outcome.
+- The time of a direction change is when the new family was first seen in that visit; the
+  **most recent flip** is the time of the latest direction change.
 
 Classification precedence (first match wins):
 
@@ -185,8 +204,8 @@ Classification precedence (first match wins):
 | 3 | `flaky-confirmed` | `sameShaFlips > 0` |
 | 4 | `flaky-retry` | `retryRescues > 0` |
 | 5 | `flaky-suspected` | `directionChanges >= 2` AND `runsObserved >= cfg.minRuns` AND both families seen |
-| 6 | `failing` | last 5 observations all fail-family AND `runsObserved >= cfg.minRuns` |
-| 7 | `new-failure` | last observation is fail-family (insufficient data for the above) |
+| 6 | `failing` | last 5 runs all ended fail-family AND `runsObserved >= cfg.minRuns` |
+| 7 | `new-failure` | last run ended fail-family (insufficient data for the above) |
 | 8 | `passing` | everything else (pass-family + skips) |
 
 `flakeScore` 0–100 (only computed when both families have been seen; else 0):
@@ -194,12 +213,14 @@ Classification precedence (first match wins):
 ```
 + 50 per sameShaFlips                          (cap 50)
 + 40 per retryRescue                           (cap 40)
-+ 8  per directionChange  × recencyMultiplier  (cap 24)
-+ 10 if runsObserved >= 10
-recencyMultiplier = 1.0 if most recent flip ≤ 14 days ago
++ min(24, 8 × directionChanges × recencyMultiplier)   (cap applied AFTER the multiplier)
++ 10 if runsObserved >= 10                             (runs, not attempts)
+recencyMultiplier = 1.0 if the most recent flip (latest direction change) ≤ 14 days ago
                   | 0.6 if ≤ 30 days
                   | 0.3 otherwise
-final = min(100, sum)
+                  (keyed on the flip, NOT the last failure: F,P,F 60 days ago then a
+                   P yesterday on a new commit → 3 × 8 × 1.0 = 24)
+final = min(100, round(sum))
 ```
 
 `confidence` 0–100:
@@ -207,16 +228,20 @@ final = min(100, sum)
 ```
 flaky-confirmed | flaky-retry → 100
 flaky-suspected            → min(70, round(35 × runsObserved / cfg.minRuns))
-failing                    → min(95, 25 + 5 × consecutive trailing fails)
-new-failure                → min(50, 10 + 5 × total fail-family count)
+failing                    → min(95, 25 + 5 × consecutive trailing failed RUNS)
+new-failure                → min(50, 10 + 5 × total fail-family EXECUTIONS)
 passing | skipped | gone   → 100
 ```
 
 Tags:
 
-- `slow`: `medianMs > cfg.slowThresholdMs` OR (`p95Ms > cfg.slowMultiplier × suiteMedianMs`,
-  where suiteMedianMs = median of all per-test medians in the same suite).
-- `recently-fixed`: any fail-family observation in the first half of history AND last 5 all pass.
+- `slow`: `medianMs > cfg.slowThresholdMs` OR (`p95Ms > cfg.slowMultiplier × suiteMedianMs`
+  AND `p95Ms >= 100`, where suiteMedianMs = median of all per-test medians in the same
+  suite; the 100 ms floor keeps 1 ms tests in a 0 ms-median suite from being "slow").
+  Durations are per execution; an expanded in-report attempt carries no duration except
+  the final one.
+- `recently-fixed`: any run in the first half of the test's runs ended fail-family AND the
+  last 5 runs all ended pass-family.
 - `long-unseen`: not observed in the last 30 runs (co-occurs with `gone`).
 
 ## 6. Config spec

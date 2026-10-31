@@ -396,20 +396,40 @@ matter most require *proof*:
   invocation (attempts share a `runId`), attempt 1 failed and attempt 2
   passed. Proof the test can pass without any code change. In a git repo a
   retry rescue is usually *also* a same-commit flip, so it classifies as
-  `flaky-confirmed`; without git metadata you'll see `flaky-retry`.
-- **Direction changes → up to +24 points, gated by `minRuns`.** Across
-  *distinct code states* — commits when git metadata exists, otherwise
-  individual runs — how many times did the test's result family flip
-  (pass→fail or fail→pass)? Two or more flips over enough runs is statistical
-  suspicion, not proof — hence `flaky-suspected`, score-gated by
-  `flakeScoreThreshold`, and it never fails your build. (Projects outside a
-  git repo get run-level flip tracking automatically; same-run retry attempts
-  count as one state.)
+  `flaky-confirmed`; without git metadata you'll see `flaky-retry`. A
+  runner's **own** retries count the same way: when a report records that
+  a test failed and then passed on an in-report retry (jest `retryTimes`,
+  vitest `retry`, mocha retries, Surefire/pytest reruns, go `-count` — where
+  the parser records the attempts), that is a retry rescue too.
+- **Direction changes → up to +24 points, gated by `minRuns`.** Walking the
+  history in time order across *code states* — commits when git metadata
+  exists, otherwise individual runs — how many times did the test's result
+  family flip (pass→fail or fail→pass) from one state to the next? Two or
+  more flips over enough runs is statistical suspicion, not proof — hence
+  `flaky-suspected`, score-gated by `flakeScoreThreshold`, and it never
+  fails your build. (Projects outside a git repo get run-level flip tracking
+  automatically; same-run retry attempts count as one state.) Going *back*
+  to an earlier commit counts as a new state: pass on A, fail on B, pass on
+  A again (a revert, or alternating runs of two branches that share one
+  history) is two flips.
 - **Long track record → +10 points** at ≥ 10 observed runs.
 
-Recency dampens history: flips in the last 14 days count fully, ≤ 30 days at
-60%, older at 30%. A flake from six months ago that never recurred shouldn't
-outrank last night's. The sum is capped at 100.
+**What counts as a run.** One invocation — one `flakefinder run`, one
+`ingest`/Action run — is ONE run, however many retry attempts it made.
+Attempts are evidence for rescues and same-commit flips, but they never
+inflate `runsObserved`: a brand-new test that fails all 3 attempts of a
+`run -R 2` is 1 run, so it is a `new-failure`, not `failing` (that needs
+`minRuns` runs). The `failing` window ("last 5"), `recently-fixed`, the
+`minRuns` gate and the +10 bonus all count runs; a run's outcome is its
+final attempt. `passRate` is over individual executions, so a run that
+failed once and passed on retry reads 50%.
+
+Recency dampens history: if the **most recent flip** (the latest direction
+change, not the latest failure) was in the last 14 days, direction changes
+count fully; ≤ 30 days at 60%; older at 30%. A flake from six months ago
+that never recurred shouldn't outrank last night's — but a test that just
+flipped back is fresh evidence even if its failures are old. The sum is
+capped at 100.
 
 **Confidence** is a separate 0–100 number answering "how sure am I of this
 verdict?": 100 for the two proven flake classes; scaled by observation count
@@ -418,9 +438,10 @@ count for `new-failure`. A `new-failure` on its first appearance carries low
 confidence by design — one red run is not a diagnosis.
 
 Tags: `slow` flags duration outliers (absolute `slowThresholdMs`, or p95 far
-above the suite's own median via `slowMultiplier`). `recently-fixed` flags
-tests that failed in the first half of history and passed the last 5 —
-candidates to un-quarantine.
+above the suite's own median via `slowMultiplier` — the relative rule also
+needs a p95 of at least 100 ms, so a 1 ms test in a suite of 0 ms tests is
+not "slow"). `recently-fixed` flags tests with a failed run in the first
+half of their history and passing last 5 runs — candidates to un-quarantine.
 
 ## Quarantine deep-dive
 
