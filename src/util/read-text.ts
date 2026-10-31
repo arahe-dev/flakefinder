@@ -1,13 +1,22 @@
 import { readFileSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 
 /**
  * Decode a report file's bytes into a string.
  *
  * Handles UTF-8 (with or without BOM) and UTF-16 LE/BE with a BOM, which is
  * what PowerShell 5.1's `>` redirection writes. BOM-less UTF-16 is detected
- * heuristically from NUL bytes in the first 512 bytes.
+ * heuristically from NUL bytes in the first 512 bytes. Gzip-compressed
+ * reports (`report.xml.gz`) are decompressed first.
  */
 export function decodeText(buf: Buffer): string {
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    try {
+      return decodeText(gunzipSync(buf, { maxOutputLength: 512 * 1024 * 1024 }));
+    } catch {
+      // Corrupt/truncated gzip: fall through so the parser layer reports it.
+    }
+  }
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
     return buf.subarray(3).toString('utf8');
   }

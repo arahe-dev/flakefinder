@@ -1,3 +1,4 @@
+import { gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { decodeText } from './read-text.js';
 
@@ -22,5 +23,11 @@ describe('decodeText', () => {
   it('decodes BOM-less UTF-16LE and BE', () => {
     expect(decodeText(Buffer.from(s, 'utf16le'))).toBe(s);
     expect(decodeText(Buffer.from(s, 'utf16le').swap16())).toBe(s);
+  });
+  it('decompresses gzip (incl. UTF-16 inside)', () => {
+    expect(decodeText(gzipSync(Buffer.from(s)))).toBe(s);
+    expect(
+      decodeText(gzipSync(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')]))),
+    ).toBe(s);
   });
 });

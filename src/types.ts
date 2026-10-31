@@ -41,7 +41,7 @@ export interface RunRecord {
   /** ISO 8601. */
   timestamp: string;
   source: RunSource;
-  /** Parser name: 'junit' | 'jest' | 'mocha' | 'go' | 'suite' | 'unknown'. */
+  /** Parser name: 'junit' | 'jest' | 'mocha' | 'go' | 'tap' | 'trx' | 'playwright' | 'pytest-json' | 'suite' | 'unknown'. */
   parsedFrom: string;
   /** 1-based retry attempt; >1 means a retry of the same code state. */
   attempt: number;
