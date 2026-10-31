@@ -1,7 +1,80 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
+QA rounds 5 and 6. Round 5 fixed every High finding. Round 6 closes the
+remaining QA items except the deferred test-identity decision (PAR-4/5/15).
+
+### Round 6 behavior changes
+
+**Scoring (PLAN §5 now states these rules explicitly)**
+
+- One invocation (runId) counts as **one run** for `runsObserved`,
+  `minRuns`, the failing/recently-fixed windows and the +10 bonus. A single
+  failing `run -R 2` is `new-failure`, not `failing`. Attempts still count
+  as same-SHA / retry evidence, and `passRate` is still over executions.
+- Recency keys on the most recent flip, not the last failure.
+- Flips are counted between chronological visits to a code state, so a
+  revert A→B→A counts 2.
+- **In-report retries are scored.** Results now carry `attempts` (jest/vitest
+  `invocations`, mocha `currentRetry`, Surefire reruns, pytest-rerunfailures,
+  go `-count`, Playwright retries); fail-then-pass scores as a retry rescue.
+- `slow` additionally needs p95 ≥ 100 ms.
+
+**Runner (`run`)**
+
+- A tree with uncommitted tracked changes records `<HEAD>-dirty-<hash>`, so
+  an uncommitted fix is never a same-SHA flip.
+- A missing binary in a shell-mode command exits 2 after one attempt.
+- Byte-identical rewritten reports are recorded.
+- With a TTY, stdin is inherited (watch modes work); the process tree is
+  still killed on timeout/Ctrl-C.
+- pytest quarantine deselects exact node ids (via a temporary plugin);
+  `no:cacheprovider` in ini/pyproject/tox/setup.cfg addopts is honoured.
+- Store warnings are printed after `run`.
+
+**Parsers**
+
+- New formats: Playwright JSON (`playwright`) and pytest-json-report
+  (`pytest-json`).
+- UTF-16 (e.g. PowerShell `>`), BOM-prefixed and gzip-compressed reports are
+  read everywhere.
+- Unparseable files say why (truncated JSON, gzip, binary, empty…).
+- Go messages drop `=== RUN`/`--- PASS` framing; passing tests carry no
+  message. jest/vitest/mocha durations are whole milliseconds.
+
+**CLI**
+
+- Exit codes: `ingest` with nothing parsed → 2; `quarantine add/remove` of
+  an unknown id → 1; `help <unknown>` → 2; a missing or non-directory `--cwd`
+  → 2 everywhere; `doctor --config bad.json` → 1.
+- `--config` resolves against `--cwd`; doctor honours `--config` and the
+  configured `quarantineFile`.
+- Config must be a JSON object; `timeoutSeconds` must be an integer
+  (1–2147483); `timeoutSeconds` and `retryMode` are documented.
+- `maxRuns` keeps the last N distinct runs (retry attempts stay together).
+- `--run-id` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (long numeric
+  CI ids accepted).
+- `NO_COLOR`/`--no-color`/non-TTY are honoured by every command.
+- `ci` records `GITHUB_SHA` / `CI_COMMIT_SHA` and treats a corrupt snapshot
+  as no baseline, with a warning.
+- JSON report gains `schemaVersion: 1`.
+- `html --open` without an opener only warns; quarantine output escapes
+  control characters; `init --runner auto` detects like the default.
+
+**GitHub Action / reports**
+
+- The action runs on **node24**, and the bundle now includes all
+  dependencies (it previously required `fast-xml-parser` at runtime).
+- Matrix legs get separate histories by default (`history-key` defaults to
+  `toJSON(matrix)`).
+- PR comments and GitLab MR notes are found across all pages (cap 5000).
+- The dashboard follows the OS light/dark preference and escapes bidi and
+  control characters.
+- `THIRD_PARTY_NOTICES.md` is added; CI actions are pinned to commit SHAs;
+  docs use `@v1`.
+
+### Round 5
 QA round 5: about 80 fixes across the runner, quarantine, engine, store,
 config, parsers, reports, GitHub Action and release tooling. The per-fix
 detail is in the commit history (`fix(runner|quarantine|engine|store|config|parsers|report|action|gitlab|release)`).

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 // src/cli/index.ts
-import { spawn as spawn2, spawnSync as spawnSync3 } from "child_process";
+import { spawnSync as spawnSync4 } from "child_process";
 import { randomUUID as randomUUID2 } from "crypto";
-import { existsSync as existsSync6, mkdirSync as mkdirSync2, readFileSync as readFileSync5, writeFileSync as writeFileSync3 } from "fs";
-import path7 from "path";
+import { existsSync as existsSync6, mkdirSync as mkdirSync2, readFileSync as readFileSync7, statSync as statSync7, writeFileSync as writeFileSync4 } from "fs";
+import path8 from "path";
 import { Command } from "commander";
 
 // src/action/diff.ts
@@ -20,14 +20,14 @@ function computeNewFlakes(current, previous) {
 import { existsSync, readFileSync, statSync } from "fs";
 import path from "path";
 var CONFIG_FILE_NAME = "flakefinder.config.json";
-function stripJsonComments(text) {
+function stripJsonComments(text2) {
   let out = "";
   let i = 0;
   let inString = false;
   let quote = "";
-  while (i < text.length) {
-    const c = text[i];
-    const next = text[i + 1];
+  while (i < text2.length) {
+    const c = text2[i];
+    const next = text2[i + 1];
     if (inString) {
       if (c === "\\") {
         out += c + (next ?? "");
@@ -47,12 +47,12 @@ function stripJsonComments(text) {
       continue;
     }
     if (c === "/" && next === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
+      while (i < text2.length && text2[i] !== "\n") i++;
       continue;
     }
     if (c === "/" && next === "*") {
       i += 2;
-      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      while (i < text2.length && !(text2[i] === "*" && text2[i + 1] === "/")) i++;
       i += 2;
       continue;
     }
@@ -61,16 +61,16 @@ function stripJsonComments(text) {
   }
   return stripTrailingCommas(out);
 }
-function stripTrailingCommas(text) {
+function stripTrailingCommas(text2) {
   let out = "";
   let inString = false;
   let quote = "";
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
+  for (let i = 0; i < text2.length; i++) {
+    const c = text2[i];
     if (inString) {
       out += c;
       if (c === "\\") {
-        out += text[i + 1] ?? "";
+        out += text2[i + 1] ?? "";
         i++;
       } else if (c === quote) {
         inString = false;
@@ -82,8 +82,8 @@ function stripTrailingCommas(text) {
       quote = c;
     } else if (c === ",") {
       let j = i + 1;
-      while (j < text.length && /\s/.test(text[j])) j++;
-      if (text[j] === "}" || text[j] === "]") continue;
+      while (j < text2.length && /\s/.test(text2[j])) j++;
+      if (text2[j] === "}" || text2[j] === "]") continue;
     }
     out += c;
   }
@@ -113,6 +113,7 @@ function describe(v) {
   if (Array.isArray(v)) return "array";
   return `${String(v)} (${typeof v})`;
 }
+var TIMEOUT_MAX_SECONDS = 2147483;
 function checkInt(problems, key, v, min, max) {
   if (v === void 0) return;
   if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
@@ -120,6 +121,11 @@ function checkInt(problems, key, v, min, max) {
   }
 }
 function validateConfig(config) {
+  if (config === null || typeof config !== "object" || Array.isArray(config)) {
+    throw new ConfigValidationError(
+      `invalid flakefinder config: config must be a JSON object, got ${describe(config)}`
+    );
+  }
   const problems = [];
   for (const key of Object.keys(config)) {
     if (!KNOWN_KEYS.has(key)) {
@@ -171,10 +177,8 @@ function validateConfig(config) {
       problems.push(`retryMode: expected one of ${modes.join("|")}, got ${describe(c.retryMode)}`);
     }
   }
-  if (c.timeoutSeconds !== void 0 && c.timeoutSeconds !== null && (typeof c.timeoutSeconds !== "number" || !Number.isFinite(c.timeoutSeconds) || c.timeoutSeconds <= 0)) {
-    problems.push(
-      `timeoutSeconds: expected positive number or null, got ${describe(c.timeoutSeconds)}`
-    );
+  if (c.timeoutSeconds !== null) {
+    checkInt(problems, "timeoutSeconds", c.timeoutSeconds, 1, TIMEOUT_MAX_SECONDS);
   }
   if (problems.length > 0) {
     throw new ConfigValidationError(`invalid flakefinder config:
@@ -213,25 +217,33 @@ function anchorConfigPaths(config, configDir) {
   }
   return out;
 }
+function readConfigFile(file) {
+  const abs = path.resolve(file);
+  let raw;
+  try {
+    raw = readFileSync(abs, "utf8");
+  } catch (err) {
+    throw new Error(`cannot read config ${abs}: ${err.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(stripJsonComments(raw.replace(/^\uFEFF/, "")));
+  } catch (err) {
+    throw new Error(`invalid config in ${abs}: ${err.message}`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `invalid config in ${abs}: config must be a JSON object, got ${describe(parsed)}`
+    );
+  }
+  return anchorConfigPaths(parsed, path.dirname(abs));
+}
 function loadConfig(cwd) {
   let dir = path.resolve(cwd);
   for (let depth = 0; depth <= 3; depth++) {
     const candidate = path.join(dir, CONFIG_FILE_NAME);
     if (existsSync(candidate)) {
-      let raw;
-      try {
-        raw = readFileSync(candidate, "utf8");
-      } catch (err) {
-        throw new Error(`cannot read ${candidate}: ${err.message}`);
-      }
-      try {
-        const parsed = JSON.parse(
-          stripJsonComments(raw.replace(/^\uFEFF/, ""))
-        );
-        return { config: anchorConfigPaths(parsed, dir), path: candidate };
-      } catch (err) {
-        throw new Error(`invalid config in ${candidate}: ${err.message}`);
-      }
+      return { config: readConfigFile(candidate), path: candidate };
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -538,6 +550,53 @@ function exclusionArgs(runner, entries, cwd) {
       return [];
   }
 }
+var PYTEST_EXACT_PLUGIN_MODULE = "flakefinder_exact_deselect";
+var PYTEST_EXACT_ENV = "FLAKEFINDER_EXACT_DESELECT";
+var PYTEST_EXACT_PLUGIN_SOURCE = `# Generated by flakefinder: exact quarantine deselection (temporary file).
+import json
+import os
+
+import pytest
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    try:
+        ours = json.loads(os.environ.get("${PYTEST_EXACT_ENV}", "[]"))
+    except ValueError:
+        return
+    if not isinstance(ours, list) or not ours:
+        return
+    remaining = list(config.getoption("deselect") or [])
+    for node_id in ours:
+        if node_id in remaining:
+            remaining.remove(node_id)
+    config.option.deselect = remaining
+    exact = set(ours)
+    keep, drop = [], []
+    for item in items:
+        nid = item.nodeid
+        base = nid.split("[", 1)[0]
+        (drop if nid in exact or base in exact else keep).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+        items[:] = keep
+`;
+function pytestExactDeselectEnv(nodeIds, pluginDir, env = process.env) {
+  const plugins = (env.PYTEST_PLUGINS ?? "").split(",").map((p) => p.trim()).filter((p) => p !== "" && p !== PYTEST_EXACT_PLUGIN_MODULE);
+  const pythonPath = env.PYTHONPATH ? `${pluginDir}${path2.delimiter}${env.PYTHONPATH}` : pluginDir;
+  return {
+    ...env,
+    PYTEST_PLUGINS: [...plugins, PYTEST_EXACT_PLUGIN_MODULE].join(","),
+    PYTHONPATH: pythonPath,
+    [PYTEST_EXACT_ENV]: JSON.stringify(nodeIds)
+  };
+}
+function deselectedNodeIds(args) {
+  const ids = [];
+  for (let i = 0; i < args.length - 1; i++) if (args[i] === "--deselect") ids.push(args[i + 1]);
+  return ids;
+}
 
 // src/store/history-store.ts
 import { randomBytes } from "crypto";
@@ -606,6 +665,22 @@ function breakStaleLock(lockPath, observed) {
   rmSync2(aside, { force: true });
   return false;
 }
+var warningListeners = /* @__PURE__ */ new Set();
+function subscribeStoreWarnings(listener) {
+  warningListeners.add(listener);
+  return () => {
+    warningListeners.delete(listener);
+  };
+}
+function lastRuns(records, maxRuns) {
+  if (records.length <= maxRuns) return records;
+  const kept = /* @__PURE__ */ new Set();
+  for (let i = records.length - 1; i >= 0 && kept.size < maxRuns; i--) {
+    kept.add(records[i].runId);
+  }
+  if (kept.size === new Set(records.map((r) => r.runId)).size) return records;
+  return records.filter((r) => kept.has(r.runId));
+}
 var HistoryStore = class _HistoryStore {
   path;
   warnings = [];
@@ -625,6 +700,16 @@ var HistoryStore = class _HistoryStore {
   constructor(storeDir) {
     this.path = path3.join(storeDir, "history.jsonl");
   }
+  /**
+   * Record a warning on this instance and tell any subscribers. Callers that
+   * never see the instance — `run` goes through runLive, which keeps its
+   * store private — subscribe instead of losing e.g. "prune skipped".
+   */
+  warn(message, first = false) {
+    if (first) this.warnings.unshift(message);
+    else this.warnings.push(message);
+    for (const listener of warningListeners) listener(message);
+  }
   ensureStoreDir() {
     mkdirSync(path3.dirname(this.path), { recursive: true });
   }
@@ -639,7 +724,7 @@ var HistoryStore = class _HistoryStore {
       const e = err;
       const code = e.code ?? "error";
       this.unreadable = e.message.startsWith(code) ? e.message : `${code}: ${e.message}`;
-      this.warnings.push(`history store unreadable (${code}): ${this.path}`);
+      this.warn(`history store unreadable (${code}): ${this.path}`);
       return;
     }
     let start = 0;
@@ -653,8 +738,9 @@ var HistoryStore = class _HistoryStore {
       start = end + 1;
     }
     if (this.formatVersion !== null && this.formatVersion > STORE_FORMAT_VERSION) {
-      this.warnings.unshift(
-        `store format v${this.formatVersion} is newer than this flakefinder (v${STORE_FORMAT_VERSION}) \u2014 unknown fields will be preserved`
+      this.warn(
+        `store format v${this.formatVersion} is newer than this flakefinder (v${STORE_FORMAT_VERSION}) \u2014 unknown fields will be preserved`,
+        true
       );
     }
   }
@@ -665,7 +751,7 @@ var HistoryStore = class _HistoryStore {
       parsed = JSON.parse(line);
     } catch {
       if (this.warnings.length < 10) {
-        this.warnings.push(`skipping corrupt line ${i} in ${this.path}`);
+        this.warn(`skipping corrupt line ${i} in ${this.path}`);
       }
       return;
     }
@@ -673,18 +759,18 @@ var HistoryStore = class _HistoryStore {
       if (typeof parsed.version === "number") {
         if (i === 1) this.formatVersion = parsed.version;
         else if (this.warnings.length < 10) {
-          this.warnings.push(`unexpected schema marker at line ${i} \u2014 skipped`);
+          this.warn(`unexpected schema marker at line ${i} \u2014 skipped`);
         }
         return;
       }
       if (this.warnings.length < 10) {
-        this.warnings.push(`skipping record-shaped garbage at line ${i} in ${this.path}`);
+        this.warn(`skipping record-shaped garbage at line ${i} in ${this.path}`);
       }
       return;
     }
     if (typeof parsed.runId !== "string" || !Array.isArray(parsed.results)) {
       if (this.warnings.length < 10) {
-        this.warnings.push(`skipping invalid record at line ${i} in ${this.path}`);
+        this.warn(`skipping invalid record at line ${i} in ${this.path}`);
       }
       return;
     }
@@ -832,7 +918,9 @@ var HistoryStore = class _HistoryStore {
     }
   }
   /**
-   * Keep only the last `maxRuns` records; rewrite the file atomically.
+   * Keep only the last `maxRuns` RUNS (distinct runIds — one `run` with
+   * retries writes one record per attempt, all sharing a runId, and they are
+   * kept or dropped together); rewrite the file atomically.
    * Re-reads the file FRESH inside the lock: a stale in-memory snapshot
    * would silently delete records another process appended between our load
    * and this prune (verified 10/10 with two concurrent ingests before the
@@ -848,7 +936,7 @@ var HistoryStore = class _HistoryStore {
       this.acquireLock();
     } catch (err) {
       if (!(err instanceof StoreBusyError)) throw err;
-      this.warnings.push(`history store busy \u2014 prune skipped this time: ${this.path}`);
+      this.warn(`history store busy \u2014 prune skipped this time: ${this.path}`);
       return;
     }
     try {
@@ -856,17 +944,17 @@ var HistoryStore = class _HistoryStore {
       const source = fresh.runs();
       if (fresh.unreadable !== null) {
         if (this.loaded) {
-          this.warnings.push(`history store unreadable during prune \u2014 not pruned: ${this.path}`);
+          this.warn(`history store unreadable during prune \u2014 not pruned: ${this.path}`);
         } else {
           this.adopt(fresh);
         }
         return;
       }
-      if (source.length <= maxRuns) {
+      const keep = lastRuns(source, maxRuns);
+      if (keep.length === source.length) {
         this.adopt(fresh);
         return;
       }
-      const keep = source.slice(-maxRuns);
       const version = Math.max(fresh.formatVersion ?? STORE_FORMAT_VERSION, STORE_FORMAT_VERSION);
       const tmp = `${this.path}.tmp`;
       const fd = openSync2(tmp, "w");
@@ -931,7 +1019,7 @@ function matchGlobs(cwd, patterns) {
   });
   const regexps = normalized.map((p) => globToRegExp(p, caseInsensitive));
   const matches = /* @__PURE__ */ new Set();
-  const walk2 = (dir, rel) => {
+  const walk3 = (dir, rel) => {
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -942,42 +1030,51 @@ function matchGlobs(cwd, patterns) {
       const relPath = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
-        walk2(path4.join(dir, entry.name), relPath);
+        walk3(path4.join(dir, entry.name), relPath);
       } else if (entry.isFile()) {
         if (regexps.some((re) => re.test(relPath))) matches.add(path4.join(dir, entry.name));
       }
     }
   };
-  walk2(cwd, "");
+  walk3(cwd, "");
   return [...matches].sort();
 }
 
 // src/doctor.ts
 var DAY_MS = 864e5;
-function runDoctor(cwd) {
+function runDoctor(cwd, opts = {}) {
   const lines = [];
   let ok = true;
   let config;
+  const explicit = opts.configPath ? path5.resolve(cwd, opts.configPath) : null;
   try {
-    const { config: cfg, path: configPath } = loadConfig(cwd);
-    config = resolveConfig(cfg);
+    let configPath;
+    if (explicit) {
+      config = resolveConfig(readConfigFile(explicit));
+      configPath = explicit;
+    } else {
+      const found = loadConfig(cwd);
+      config = resolveConfig(found.config);
+      configPath = found.path;
+    }
     lines.push({
       status: configPath ? "ok" : "info",
-      message: configPath ? `config: ${configPath}` : `config: none found (defaults in effect) \u2014 create one with flakefinder init`
+      message: configPath ? `config: ${configPath}${explicit ? " (--config)" : ""}` : `config: none found (defaults in effect) \u2014 create one with flakefinder init`
     });
   } catch (err) {
     ok = false;
     lines.push({
       status: "fail",
       message: `config: invalid \u2014 ${err.message}`,
-      hint: "fix flakefinder.config.json (doctor lists each problem above/below)"
+      hint: `fix ${explicit ?? "flakefinder.config.json"} (every problem is listed above)`
     });
     return { lines, ok };
   }
-  const runner = detectRunner(cwd);
+  const detected = detectRunner(cwd);
+  const runner = config.runner === "auto" ? detected : config.runner;
   lines.push({
     status: "info",
-    message: `runner: detected "${runner}"${config.runner !== "auto" ? ` (config pins "${config.runner}")` : ""}`
+    message: `runner: detected "${detected}"${config.runner !== "auto" ? ` (config pins "${config.runner}")` : ""}`
   });
   const reportFiles = matchGlobs(cwd, config.reports);
   if (reportFiles.length === 0) {
@@ -1070,7 +1167,7 @@ function runDoctor(cwd) {
       lines.push({
         status: "fail",
         message: `quarantine: unreadable \u2014 ${err.message}`,
-        hint: "fix or delete flakefinder.quarantine.json (a `run` would also fail on it)"
+        hint: `fix or delete ${qPath} \u2014 until then \`run\` only warns and excludes nothing, and \`quarantine add/remove\` refuse to touch it`
       });
       return { lines, ok };
     }
@@ -1082,7 +1179,7 @@ function runDoctor(cwd) {
   } else {
     lines.push({
       status: "info",
-      message: "quarantine: none (flakefinder.quarantine.json absent)"
+      message: `quarantine: none (${qPath} absent)`
     });
   }
   return { lines, ok };
@@ -1140,9 +1237,16 @@ function sortRuns(runs) {
   }
   return ordered;
 }
-function buildHistories(runs) {
+var STATUSES = /* @__PURE__ */ new Set(["pass", "fail", "skip", "error"]);
+function executionStatuses(r) {
+  if (!Array.isArray(r.attempts)) return [r.status];
+  const statuses = r.attempts.filter((s) => STATUSES.has(s));
+  if (statuses[statuses.length - 1] !== r.status) statuses.push(r.status);
+  return statuses.length < 2 ? [r.status] : statuses;
+}
+function collectHistories(sortedRuns) {
   const byId = /* @__PURE__ */ new Map();
-  for (const run of sortRuns(runs)) {
+  for (const run of sortedRuns) {
     for (const r of run.results) {
       let h = byId.get(r.testId);
       if (!h) {
@@ -1151,14 +1255,19 @@ function buildHistories(runs) {
       }
       h.suite = r.suite;
       h.name = r.name;
-      h.observations.push({
-        runId: run.runId,
-        timestamp: run.timestamp,
-        status: r.status,
-        attempt: run.attempt,
-        commitSha: run.commitSha,
-        message: r.message,
-        durationMs: r.durationMs ?? void 0
+      const statuses = executionStatuses(r);
+      statuses.forEach((status, sub) => {
+        h.observations.push({
+          runId: run.runId,
+          timestamp: run.timestamp,
+          status,
+          attempt: run.attempt,
+          sub,
+          commitSha: run.commitSha,
+          message: r.message,
+          // the reported duration belongs to the final execution only
+          durationMs: sub === statuses.length - 1 ? r.durationMs ?? void 0 : void 0
+        });
       });
     }
   }
@@ -1167,9 +1276,14 @@ function buildHistories(runs) {
 function collapsePerAttempt(nonSkip) {
   const perAttempt = /* @__PURE__ */ new Map();
   for (const o of nonSkip) {
-    perAttempt.set(`${o.runId}\0${o.attempt}`, o);
+    perAttempt.set(`${o.runId}\0${o.attempt}\0${o.sub}`, o);
   }
   return [...perAttempt.values()];
+}
+function collapsePerRun(collapsed) {
+  const perRun = /* @__PURE__ */ new Map();
+  for (const o of collapsed) perRun.set(o.runId, o);
+  return [...perRun.values()];
 }
 function countSameShaFlips(collapsed) {
   const perSha = /* @__PURE__ */ new Map();
@@ -1191,35 +1305,46 @@ function countRetryRescues(collapsed) {
   for (let i = 1; i < collapsed.length; i++) {
     const prev = collapsed[i - 1];
     const cur = collapsed[i];
-    if (prev.runId === cur.runId && cur.attempt === prev.attempt + 1 && isFail(prev.status) && !isFail(cur.status)) {
+    const consecutive = cur.attempt === prev.attempt && cur.sub === prev.sub + 1 || cur.attempt === prev.attempt + 1 && cur.sub === 0;
+    if (prev.runId === cur.runId && consecutive && isFail(prev.status) && !isFail(cur.status)) {
       rescues++;
     }
   }
   return rescues;
 }
-function countDirectionChanges(collapsed) {
-  const bucketFamily = /* @__PURE__ */ new Map();
+function directionChanges(collapsed) {
+  const visits = [];
   for (const o of collapsed) {
-    bucketFamily.set(o.commitSha ?? o.runId, isFail(o.status));
+    const state = o.commitSha !== void 0 ? `sha:${o.commitSha}` : `run:${o.runId}`;
+    const fail = isFail(o.status);
+    const last = visits[visits.length - 1];
+    if (!last || last.state !== state) visits.push({ state, fail, since: o.timestamp });
+    else if (last.fail !== fail) {
+      last.fail = fail;
+      last.since = o.timestamp;
+    }
   }
-  const families = [...bucketFamily.values()];
   let changes = 0;
-  for (let i = 1; i < families.length; i++) {
-    if (families[i] !== families[i - 1]) changes++;
+  let lastChangeAt;
+  for (let i = 1; i < visits.length; i++) {
+    if (visits[i].fail !== visits[i - 1].fail) {
+      changes++;
+      lastChangeAt = visits[i].since;
+    }
   }
-  return changes;
+  return { changes, lastChangeAt };
 }
-function trailingConsecutiveFails(nonSkip) {
+function trailingConsecutiveFails(perRun) {
   let n = 0;
-  for (let i = nonSkip.length - 1; i >= 0; i--) {
-    if (isFail(nonSkip[i].status)) n++;
+  for (let i = perRun.length - 1; i >= 0; i--) {
+    if (isFail(perRun[i].status)) n++;
     else break;
   }
   return n;
 }
-function recencyMultiplier(lastFail) {
-  if (!lastFail) return 0.3;
-  const ts = Date.parse(lastFail.timestamp);
+function recencyMultiplier(lastChangeAt) {
+  if (lastChangeAt === void 0) return 0.3;
+  const ts = Date.parse(lastChangeAt);
   if (Number.isNaN(ts)) return 1;
   const ageDays = (Date.now() - ts) / 864e5;
   if (ageDays <= 14) return 1;
@@ -1229,82 +1354,80 @@ function recencyMultiplier(lastFail) {
 function flakeScore(opts) {
   let score = Math.min(50, opts.sameShaFlips * 50);
   score += Math.min(40, opts.retryRescues * 40);
-  score += Math.min(24, opts.directionChanges * 8 * recencyMultiplier(opts.lastFail));
+  score += Math.min(24, opts.directionChanges * 8 * recencyMultiplier(opts.lastChangeAt));
   if (opts.runsObserved >= 10) score += 10;
   return Math.min(100, Math.round(score));
 }
 function classify(opts) {
-  const { nonSkip, collapsed, cfg } = opts;
+  const { perRun, cfg } = opts;
   if (!opts.seenRecently) return "gone";
-  if (nonSkip.length === 0) return "skipped";
-  const observed = collapsed;
-  const bothFamilies = collapsed.some((o) => isFail(o.status)) && collapsed.some((o) => !isFail(o.status));
+  if (perRun.length === 0) return "skipped";
   if (opts.sameShaFlips > 0) return "flaky-confirmed";
   if (opts.retryRescues > 0) return "flaky-retry";
-  if (opts.directionChanges >= 2 && observed.length >= cfg.minRuns && bothFamilies)
+  if (opts.directionChanges >= 2 && perRun.length >= cfg.minRuns && opts.bothFamilies)
     return "flaky-suspected";
-  const lastWindow = observed.slice(-RECENT_WINDOW);
-  if (lastWindow.every((o) => isFail(o.status)) && observed.length >= cfg.minRuns) return "failing";
-  const last = observed[observed.length - 1];
+  const lastWindow = perRun.slice(-RECENT_WINDOW);
+  if (lastWindow.every((o) => isFail(o.status)) && perRun.length >= cfg.minRuns) return "failing";
+  const last = perRun[perRun.length - 1];
   if (isFail(last.status)) return "new-failure";
   return "passing";
 }
-function confidenceFor(classification, observed, cfg) {
-  const totalFails = observed.filter((o) => isFail(o.status)).length;
+function confidenceFor(classification, perRun, executions, cfg) {
   switch (classification) {
     case "flaky-confirmed":
     case "flaky-retry":
       return 100;
     case "flaky-suspected":
-      return Math.min(70, Math.round(35 * observed.length / Math.max(1, cfg.minRuns)));
+      return Math.min(70, Math.round(35 * perRun.length / Math.max(1, cfg.minRuns)));
     case "failing":
-      return Math.min(95, 25 + 5 * trailingConsecutiveFails(observed));
+      return Math.min(95, 25 + 5 * trailingConsecutiveFails(perRun));
     case "new-failure":
-      return Math.min(50, 10 + 5 * totalFails);
+      return Math.min(50, 10 + 5 * executions.filter((o) => isFail(o.status)).length);
     default:
       return 100;
   }
 }
+var SLOW_RELATIVE_FLOOR_MS = 100;
 function classifyAll(runs, cfg) {
   if (runs.length === 0) return [];
   const sorted = sortRuns(runs);
   const runOrder = [];
   for (const r of sorted) if (runOrder[runOrder.length - 1] !== r.runId) runOrder.push(r.runId);
   const recentRunIds = new Set(runOrder.slice(-GONE_AFTER_RUNS));
-  const histories = buildHistories(sorted);
+  const histories = collectHistories(sorted);
   const verdicts = histories.map((h) => {
     const nonSkip = h.observations.filter((o) => o.status !== "skip");
     const collapsed = collapsePerAttempt(nonSkip);
+    const perRun = collapsePerRun(collapsed);
     const lastObs = h.observations[h.observations.length - 1];
-    const observed = collapsed;
     const sameShaFlips = countSameShaFlips(collapsed);
     const retryRescues = countRetryRescues(collapsed);
-    const directionChanges = countDirectionChanges(collapsed);
+    const dc = directionChanges(collapsed);
     const seenRecently = h.observations.some((o) => recentRunIds.has(o.runId));
     const bothFamilies = collapsed.some((o) => isFail(o.status)) && collapsed.some((o) => !isFail(o.status));
     const classification = classify({
       seenRecently,
-      nonSkip,
-      collapsed,
+      perRun,
+      bothFamilies,
       sameShaFlips,
       retryRescues,
-      directionChanges,
+      directionChanges: dc.changes,
       cfg
     });
-    const lastFail = [...observed].reverse().find((o) => isFail(o.status));
+    const lastFail = [...collapsed].reverse().find((o) => isFail(o.status));
     const score = bothFamilies ? flakeScore({
       sameShaFlips,
       retryRescues,
-      directionChanges,
-      runsObserved: observed.length,
-      lastFail
+      directionChanges: dc.changes,
+      runsObserved: perRun.length,
+      lastChangeAt: dc.lastChangeAt
     }) : 0;
-    const { medianMs, p95Ms } = durationStats(observed);
-    const passes = observed.filter((o) => !isFail(o.status)).length;
+    const { medianMs, p95Ms } = durationStats(collapsed);
+    const passes = collapsed.filter((o) => !isFail(o.status)).length;
     const tags = [];
     if (!seenRecently) tags.push("long-unseen");
-    const firstHalf = observed.slice(0, Math.floor(observed.length / 2));
-    const lastWindow = observed.slice(-RECENT_WINDOW);
+    const firstHalf = perRun.slice(0, Math.floor(perRun.length / 2));
+    const lastWindow = perRun.slice(-RECENT_WINDOW);
     if (firstHalf.some((o) => isFail(o.status)) && lastWindow.length > 0 && lastWindow.every((o) => !isFail(o.status))) {
       tags.push("recently-fixed");
     }
@@ -1315,9 +1438,10 @@ function classifyAll(runs, cfg) {
       classification,
       tags,
       flakeScore: score,
-      confidence: confidenceFor(classification, observed, cfg),
-      passRate: observed.length === 0 ? 0 : passes / observed.length,
-      runsObserved: observed.length,
+      confidence: confidenceFor(classification, perRun, collapsed, cfg),
+      // over executions (retry attempts included), so a rescued run reads 50%
+      passRate: collapsed.length === 0 ? 0 : passes / collapsed.length,
+      runsObserved: perRun.length,
       lastStatus: lastObs.status,
       lastSeen: lastObs.timestamp,
       lastMessage: lastFail?.message,
@@ -1325,7 +1449,7 @@ function classifyAll(runs, cfg) {
       p95DurationMs: p95Ms,
       sameShaFlips,
       retryRescues,
-      directionChanges
+      directionChanges: dc.changes
     };
   });
   const perSuite = /* @__PURE__ */ new Map();
@@ -1344,7 +1468,7 @@ function classifyAll(runs, cfg) {
   for (const v of verdicts) {
     const suiteMedianMs = suiteMedians.get(v.suite);
     const slowAbsolute = v.medianDurationMs != null && cfg.slowThresholdMs != null && v.medianDurationMs > cfg.slowThresholdMs;
-    const slowRelative = v.p95DurationMs != null && suiteMedianMs != null && v.p95DurationMs > cfg.slowMultiplier * suiteMedianMs;
+    const slowRelative = v.p95DurationMs != null && suiteMedianMs != null && v.p95DurationMs >= SLOW_RELATIVE_FLOOR_MS && v.p95DurationMs > cfg.slowMultiplier * suiteMedianMs;
     if (slowAbsolute || slowRelative) v.tags.push("slow");
   }
   return verdicts;
@@ -1378,11 +1502,30 @@ function trimTo(value, max) {
   if (t === "") return void 0;
   return t.length > max ? t.slice(0, max) : t;
 }
-function stripAnsi(text) {
-  return text.replace(/\u001b\[[0-9;]*m/g, "");
+function stripAnsi(text2) {
+  return text2.replace(/\u001b\[[0-9;]*m/g, "");
 }
 function stripBom(content) {
-  return content.startsWith("\uFEFF") ? content.slice(1) : content;
+  return content.charCodeAt(0) === 65279 ? content.slice(1) : content;
+}
+function msOf(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+}
+function retryAttempts(failed, final, failStatus = "fail") {
+  if (!Number.isInteger(failed) || failed <= 0) return void 0;
+  return [...Array(failed).fill(failStatus), final];
+}
+var jsonCache;
+function parseJson(content) {
+  if (jsonCache !== void 0 && jsonCache.content === content) return jsonCache.parsed;
+  let parsed;
+  try {
+    parsed = { doc: JSON.parse(stripBom(content)) };
+  } catch (err) {
+    parsed = { error: errorMessage(err) };
+  }
+  jsonCache = { content, parsed };
+  return parsed;
 }
 function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
@@ -1416,6 +1559,11 @@ function isBenchmark(test) {
 function hasBenchResult(outputs) {
   return /^Benchmark\S*\s+\d+\s+[\d.]+ \S+\/op\b/m.test(outputs.join(""));
 }
+function runAttempts(runs, status) {
+  const statuses = runs.map((r) => r.status);
+  if (statuses[statuses.length - 1] === status) return statuses;
+  return [...statuses.filter((s) => s !== status), ...statuses.filter((s) => s === status)];
+}
 function isFailFamily(status) {
   return status === "fail" || status === "error";
 }
@@ -1427,11 +1575,12 @@ function elapsedToMs(ev) {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return null;
   return Math.round(raw * 1e3);
 }
+var FRAMING_LINE = /^\s*(?:=== (?:RUN|PAUSE|CONT|NAME)\b|--- (?:PASS|FAIL|SKIP|BENCH): )/;
 function messageFromOutputs(outputs) {
   if (outputs.length === 0) return void 0;
-  const text = stripAnsi(outputs.join("")).split(/\r?\n/).filter((line) => line.trim() !== "").join("\n");
-  if (text === "") return void 0;
-  return text.length > MESSAGE_MAX_CHARS ? text.slice(-MESSAGE_MAX_CHARS) : text;
+  const text2 = stripAnsi(outputs.join("")).split(/\r?\n/).filter((line) => line.trim() !== "" && !FRAMING_LINE.test(line)).join("\n");
+  if (text2 === "") return void 0;
+  return text2.length > MESSAGE_MAX_CHARS ? text2.slice(-MESSAGE_MAX_CHARS) : text2;
 }
 var goTestParser = {
   name: "go",
@@ -1549,6 +1698,9 @@ var goTestParser = {
         const output = messageFromOutputs(last.outputs);
         if (output !== void 0) result2.message = `${result2.message}
 ${output}`;
+        if (acc.runs.length > 1) {
+          result2.attempts = [...acc.runs.slice(0, -1).map((r) => r.status), "error"];
+        }
         rows.push({ acc, result: result2, dangling: true, flaky: false });
         continue;
       }
@@ -1561,7 +1713,7 @@ ${output}`;
         status: reported.status,
         durationMs: reported.durationMs
       };
-      let message = messageFromOutputs(reported.outputs);
+      let message = reported.status === "pass" ? void 0 : messageFromOutputs(reported.outputs);
       const isFlaky2 = failed.length > 0 && failed.length < acc.runs.length;
       if (isFlaky2) {
         const note = `flaky: failed ${failed.length} of ${acc.runs.length} runs in this report`;
@@ -1569,6 +1721,7 @@ ${output}`;
 ${message}` : note;
       }
       if (message !== void 0) result.message = message;
+      if (acc.runs.length > 1) result.attempts = runAttempts(acc.runs, result.status);
       rows.push({ acc, result, dangling: false, flaky: isFlaky2 });
     }
     const hasChildren = /* @__PURE__ */ new Set();
@@ -1663,17 +1816,10 @@ function statusOf(status, failureMessages) {
       return null;
   }
 }
-function tryParseJson(content) {
-  try {
-    return { doc: JSON.parse(stripBom(content)) };
-  } catch (err) {
-    return { error: errorMessage(err) };
-  }
-}
 var jestParser = {
   name: "jest",
   sniff(content) {
-    const parsed = tryParseJson(content);
+    const parsed = parseJson(content);
     if (!("doc" in parsed)) return false;
     const doc = parsed.doc;
     if (!isObj(doc) || !Array.isArray(doc.testResults)) return false;
@@ -1683,7 +1829,7 @@ var jestParser = {
   parse(content, sourcePath) {
     const results = [];
     const warnings = [];
-    const parsed = tryParseJson(content);
+    const parsed = parseJson(content);
     if (!("doc" in parsed)) {
       return { results, warnings: [`jest: ${sourcePath}: invalid JSON: ${parsed.error}`] };
     }
@@ -1719,10 +1865,11 @@ var jestParser = {
         ) : [];
         const suite = ancestors.length > 0 ? ancestors.join(" > ") : filePath;
         const name = typeof assertion.title === "string" && assertion.title.trim() !== "" ? assertion.title : typeof assertion.fullName === "string" && assertion.fullName.trim() !== "" ? assertion.fullName : status === "error" ? SUITE_PLACEHOLDER : "(unnamed)";
-        const durationMs2 = typeof assertion.duration === "number" && Number.isFinite(assertion.duration) ? assertion.duration : null;
+        const durationMs2 = msOf(assertion.duration);
         let message = trimTo(failureMessages[0], 2e3);
         if (status === "fail" || status === "error") anyAssertionFailed = true;
-        const invocations = typeof assertion.invocations === "number" && assertion.invocations > 1 ? assertion.invocations : void 0;
+        const invocations = typeof assertion.invocations === "number" && Number.isInteger(assertion.invocations) && assertion.invocations > 1 ? assertion.invocations : void 0;
+        let attempts;
         if (status === "pass" && (invocations !== void 0 || failureMessages.length > 0)) {
           const reasons = [
             ...toArray(assertion.retryReasons),
@@ -1737,11 +1884,14 @@ var jestParser = {
             reasons.find((r) => typeof r === "string"),
             2e3
           );
+          attempts = retryAttempts(failedAttempts, "pass");
           flaky.push(`${suite} > ${name}`);
           flakyHow.add(how);
-        } else if (status === "fail" && invocations !== void 0 && message !== void 0) {
-          message = trimTo(`${message}
-(failed all ${invocations} attempts)`, 2e3);
+        } else if (status === "fail" && invocations !== void 0) {
+          attempts = retryAttempts(invocations - 1, "fail");
+          const note = `(failed all ${invocations} attempts)`;
+          message = trimTo(message !== void 0 ? `${message}
+${note}` : note, 2e3);
         }
         const result = {
           testId: makeTestId(suite, name),
@@ -1751,6 +1901,7 @@ var jestParser = {
           durationMs: durationMs2
         };
         if (message !== void 0) result.message = message;
+        if (attempts !== void 0) result.attempts = attempts;
         results.push(result);
       }
       const execError = isObj(file.testExecError) ? file.testExecError : void 0;
@@ -1809,8 +1960,8 @@ function detailMessage(detail) {
   (isObj(detail) ? trimTo(attr(detail, "@_type"), MESSAGE_MAX_CHARS2) : void 0);
 }
 function detailStack(detail) {
-  const text = textOf(detail);
-  if (text !== void 0 && text.trim() !== "") return text;
+  const text2 = textOf(detail);
+  if (text2 !== void 0 && text2.trim() !== "") return text2;
   if (isObj(detail)) {
     const nested = children(detail, "stackTrace")[0];
     return textOf(nested);
@@ -1870,6 +2021,7 @@ ${more}` : more, MESSAGE_MAX_CHARS2);
 ${note}` : note,
       MESSAGE_MAX_CHARS2
     );
+    result.attempts = retryAttempts(reruns.length, status, status);
   } else if (status === "pass" && flakes.length > 0) {
     const first = flakes[0];
     result.message = flakyRetryMessage(
@@ -1880,6 +2032,11 @@ ${note}` : note,
     );
     const stack = trimTo(detailStack(first), STACK_MAX_CHARS);
     if (stack !== void 0) result.stack = stack;
+    const failedKinds = [
+      ...children(tc, "flakyFailure").map(() => "fail"),
+      ...children(tc, "flakyError").map(() => "error")
+    ];
+    result.attempts = [...failedKinds, "pass"];
     ctx.flaky.push(`${suite}.${name}`);
   }
   ctx.results.push(result);
@@ -1903,6 +2060,7 @@ function collapsePytestReruns(ctx) {
     const how = "pytest-rerunfailures rerun";
     if (final.status === "pass") {
       final.message = flakyRetryMessage(earlier.length, how, void 0, MESSAGE_MAX_CHARS2);
+      final.attempts = retryAttempts(earlier.length, "pass");
       ctx.flaky.push(`${final.suite}.${final.name}`);
     } else if (final.status === "fail" || final.status === "error") {
       const note = `(failed all ${group.length} attempts)`;
@@ -1911,6 +2069,7 @@ function collapsePytestReruns(ctx) {
 ${note}` : note,
         MESSAGE_MAX_CHARS2
       );
+      final.attempts = retryAttempts(earlier.length, final.status, final.status);
     }
     out.push(final);
   }
@@ -2028,7 +2187,7 @@ function mochawesomeEntries(roots) {
   for (const root of roots) collectFiles(root);
   const onlyFile = files.size === 1 ? [...files][0] : void 0;
   const out = [];
-  const walk2 = (suite) => {
+  const walk3 = (suite) => {
     if (!isObj(suite)) return;
     const file = typeof suite.fullFile === "string" && suite.fullFile !== "" ? suite.fullFile : onlyFile;
     const toEntry = (t) => {
@@ -2047,9 +2206,9 @@ function mochawesomeEntries(roots) {
     for (const h of hooks) {
       if (isObj(h) && h.state === "failed") out.push([toEntry(h), "fail"]);
     }
-    for (const child2 of Array.isArray(suite.suites) ? suite.suites : []) walk2(child2);
+    for (const child2 of Array.isArray(suite.suites) ? suite.suites : []) walk3(child2);
   };
-  for (const root of roots) walk2(root);
+  for (const root of roots) walk3(root);
   return out;
 }
 function hasErr(err) {
@@ -2069,17 +2228,10 @@ function deriveSuite(entry, title, fullTitle) {
   }
   return fullTitle !== "" ? fullTitle : "unknown";
 }
-function tryParseJson2(content) {
-  try {
-    return { doc: JSON.parse(stripBom(content)) };
-  } catch (err) {
-    return { error: errorMessage(err) };
-  }
-}
 var mochaParser = {
   name: "mocha",
   sniff(content) {
-    const parsed = tryParseJson2(content);
+    const parsed = parseJson(content);
     if (!("doc" in parsed)) return false;
     const doc = parsed.doc;
     if (!isObj(doc)) return false;
@@ -2090,7 +2242,7 @@ var mochaParser = {
   parse(content, sourcePath) {
     const results = [];
     const warnings = [];
-    const parsed = tryParseJson2(content);
+    const parsed = parseJson(content);
     if (!("doc" in parsed)) {
       return { results, warnings: [`mocha: ${sourcePath}: invalid JSON: ${parsed.error}`] };
     }
@@ -2165,7 +2317,7 @@ var mochaParser = {
       const isHook = HOOK_TITLE.test(title);
       const name = isHook ? hookName(title) : title;
       if (isHook && finalStatus === "fail") hooks.push(`${suite} ${name}`);
-      const durationMs2 = typeof entry.duration === "number" && Number.isFinite(entry.duration) ? entry.duration : null;
+      const durationMs2 = msOf(entry.duration);
       const result = {
         testId: makeTestId(suite, name),
         suite,
@@ -2183,10 +2335,19 @@ var mochaParser = {
         if (message !== void 0) result.message = message;
         if (stack !== void 0) result.stack = stack;
       }
-      const retries = typeof entry.currentRetry === "number" && entry.currentRetry > 0 ? entry.currentRetry : 0;
+      const retries = typeof entry.currentRetry === "number" && Number.isInteger(entry.currentRetry) && entry.currentRetry > 0 ? entry.currentRetry : 0;
       if (retries > 0 && finalStatus === "pass") {
         result.message = flakyRetryMessage(retries, "mocha retry", result.message, 2e3);
+        result.attempts = retryAttempts(retries, "pass");
         flaky.push(`${suite} ${name}`);
+      } else if (retries > 0 && finalStatus === "fail" && !isHook) {
+        const note = `(failed all ${retries + 1} attempts)`;
+        result.message = trimTo(
+          result.message !== void 0 ? `${result.message}
+${note}` : note,
+          2e3
+        );
+        result.attempts = retryAttempts(retries, "fail");
       }
       results.push(result);
     }
@@ -2201,11 +2362,338 @@ var mochaParser = {
   }
 };
 
+// src/parsers/playwright.ts
+var MESSAGE_MAX_CHARS3 = 2e3;
+var STACK_MAX_CHARS2 = 1e3;
+var TITLE_SEPARATOR = " \u203A ";
+function attemptStatus(status, expected) {
+  switch (status) {
+    case "skipped":
+      return "skip";
+    case "passed":
+    case "failed":
+    case "timedOut":
+      return status === (typeof expected === "string" ? expected : "passed") ? "pass" : "fail";
+    default:
+      return null;
+  }
+}
+function errorOf(result) {
+  if (isObj(result.error)) return result.error;
+  if (Array.isArray(result.errors)) return result.errors.find(isObj);
+  return void 0;
+}
+function textOf2(value, max) {
+  return typeof value === "string" ? trimTo(stripAnsi(value), max) : void 0;
+}
+function isFailFamily2(status) {
+  return status === "fail" || status === "error";
+}
+function severity(row) {
+  if (isFailFamily2(row.status)) return 0;
+  if (row.status === "pass" && row.attempts.some((a) => isFailFamily2(a.status))) return 1;
+  if (row.status === "pass") return 2;
+  return 3;
+}
+function projectRow(project, tests) {
+  const attempts = [];
+  let failedFinal = false;
+  let lastFinal = "skip";
+  let skipReason2;
+  for (const test of tests) {
+    const own = [];
+    for (const result of Array.isArray(test.results) ? test.results : []) {
+      if (!isObj(result)) continue;
+      const status2 = attemptStatus(result.status, test.expectedStatus);
+      if (status2 === null) continue;
+      const attempt = { status: status2, durationMs: msOf(result.duration) };
+      const error = errorOf(result);
+      if (error !== void 0) attempt.error = error;
+      own.push(attempt);
+    }
+    const final = own[own.length - 1]?.status ?? "skip";
+    if (isFailFamily2(final)) failedFinal = true;
+    lastFinal = final;
+    if (final === "skip" && skipReason2 === void 0 && Array.isArray(test.annotations)) {
+      const note = test.annotations.find((a) => isObj(a) && a.type === "skip");
+      if (isObj(note)) skipReason2 = textOf2(note.description, MESSAGE_MAX_CHARS3);
+    }
+    attempts.push(...own);
+  }
+  const status = failedFinal ? "fail" : lastFinal;
+  if (attempts.length > 0 && attempts[attempts.length - 1].status !== status) {
+    const fails = attempts.filter((a) => a.status === status);
+    const rest = attempts.filter((a) => a.status !== status);
+    attempts.splice(0, attempts.length, ...rest, ...fails);
+  }
+  const row = { project, status, attempts };
+  if (skipReason2 !== void 0) row.skipReason = skipReason2;
+  return row;
+}
+function mapSpec(spec, file, titles, ctx) {
+  const title = typeof spec.title === "string" ? spec.title : "";
+  const name = [...titles, title].join(TITLE_SEPARATOR);
+  if (name.trim() === "") {
+    ctx.warnings.push(`playwright: ${ctx.sourcePath}: skipping a spec without a title in ${file}`);
+    return;
+  }
+  const byProject = /* @__PURE__ */ new Map();
+  for (const test of Array.isArray(spec.tests) ? spec.tests : []) {
+    if (!isObj(test)) continue;
+    const project = typeof test.projectName === "string" ? test.projectName : "";
+    const list = byProject.get(project);
+    if (list) list.push(test);
+    else byProject.set(project, [test]);
+  }
+  if (byProject.size === 0) return;
+  const rows = [...byProject].map(([project, tests]) => projectRow(project, tests));
+  const row = rows.reduce((best, r) => severity(r) < severity(best) ? r : best);
+  const result = {
+    testId: makeTestId(file, name),
+    suite: file,
+    name,
+    status: row.status,
+    durationMs: row.attempts[row.attempts.length - 1]?.durationMs ?? null
+  };
+  const failures = row.attempts.filter((a) => isFailFamily2(a.status));
+  const firstError = failures.find((a) => a.error !== void 0)?.error;
+  let message;
+  if (row.status === "pass" && failures.length > 0) {
+    message = flakyRetryMessage(
+      failures.length,
+      "Playwright retry",
+      textOf2(firstError?.message, MESSAGE_MAX_CHARS3),
+      MESSAGE_MAX_CHARS3
+    );
+    ctx.flaky.push(`${file} > ${name}`);
+  } else if (isFailFamily2(row.status)) {
+    const error = [...failures].reverse().find((a) => a.error !== void 0)?.error;
+    message = textOf2(error?.message, MESSAGE_MAX_CHARS3) ?? textOf2(error?.value, MESSAGE_MAX_CHARS3);
+    if (row.attempts.length > 1 && failures.length === row.attempts.length) {
+      const note = `(failed all ${row.attempts.length} attempts)`;
+      message = trimTo(message !== void 0 ? `${message}
+${note}` : note, MESSAGE_MAX_CHARS3);
+    }
+    const stack = textOf2(error?.stack, STACK_MAX_CHARS2);
+    if (stack !== void 0) result.stack = stack;
+  } else if (row.status === "skip") {
+    message = row.skipReason;
+  }
+  if (message !== void 0 && rows.length > 1 && row.status !== "skip" && row.project !== "") {
+    message = trimTo(`[${row.project}] ${message}`, MESSAGE_MAX_CHARS3);
+  }
+  if (message !== void 0) result.message = message;
+  if (row.attempts.length > 1) result.attempts = row.attempts.map((a) => a.status);
+  ctx.results.push(result);
+}
+function walk2(suite, file, titles, ctx) {
+  for (const spec of Array.isArray(suite.specs) ? suite.specs : []) {
+    if (isObj(spec)) mapSpec(spec, file, titles, ctx);
+  }
+  for (const child2 of Array.isArray(suite.suites) ? suite.suites : []) {
+    if (!isObj(child2)) continue;
+    const title = typeof child2.title === "string" ? child2.title : "";
+    walk2(child2, file, [...titles, title], ctx);
+  }
+}
+var playwrightParser = {
+  name: "playwright",
+  sniff(content) {
+    const parsed = parseJson(content);
+    if (!("doc" in parsed)) return false;
+    const doc = parsed.doc;
+    return isObj(doc) && Array.isArray(doc.suites) && isObj(doc.config);
+  },
+  parse(content, sourcePath) {
+    const ctx = { sourcePath, results: [], warnings: [], flaky: [] };
+    const parsed = parseJson(content);
+    if (!("doc" in parsed)) {
+      return {
+        results: [],
+        warnings: [`playwright: ${sourcePath}: invalid JSON: ${parsed.error}`]
+      };
+    }
+    const doc = parsed.doc;
+    if (!isObj(doc) || !Array.isArray(doc.suites)) {
+      return { results: [], warnings: [`playwright: ${sourcePath}: missing suites[] array`] };
+    }
+    for (const fileSuite of doc.suites) {
+      if (!isObj(fileSuite)) continue;
+      const file = typeof fileSuite.title === "string" && fileSuite.title.trim() !== "" ? fileSuite.title : typeof fileSuite.file === "string" && fileSuite.file.trim() !== "" ? fileSuite.file : "(unknown file)";
+      walk2(fileSuite, file, [], ctx);
+    }
+    const globalErrors = (Array.isArray(doc.errors) ? doc.errors : []).filter(isObj);
+    if (globalErrors.length > 0) {
+      const first = globalErrors[0];
+      const firstMessage = textOf2(first.message, MESSAGE_MAX_CHARS3) ?? textOf2(first.value, MESSAGE_MAX_CHARS3) ?? "error outside any test";
+      const more = globalErrors.length > 1 ? `
+(+${globalErrors.length - 1} more)` : "";
+      const result = {
+        testId: makeTestId("playwright", "(global)"),
+        suite: "playwright",
+        name: "(global)",
+        status: "error",
+        durationMs: null,
+        message: trimTo(`${firstMessage}${more}`, MESSAGE_MAX_CHARS3) ?? firstMessage
+      };
+      const stack = textOf2(first.stack, STACK_MAX_CHARS2);
+      if (stack !== void 0) result.stack = stack;
+      ctx.results.push(result);
+      ctx.warnings.push(
+        `playwright: ${sourcePath}: ${globalErrors.length} error(s) outside any test (config, global setup or a spec file that failed to load) \u2014 recorded as playwright :: (global): ${firstMessage.split("\n")[0]}`
+      );
+    }
+    if (ctx.flaky.length > 0) {
+      ctx.warnings.push(flakyRetryWarning("playwright", sourcePath, "Playwright retry", ctx.flaky));
+    }
+    return { results: ctx.results, warnings: ctx.warnings };
+  }
+};
+
+// src/parsers/pytest-json.ts
+var MESSAGE_MAX_CHARS4 = 2e3;
+var STACK_MAX_CHARS3 = 1e3;
+var STAGES = ["setup", "call", "teardown"];
+var OUTCOMES = {
+  passed: "pass",
+  xpassed: "pass",
+  failed: "fail",
+  error: "error",
+  skipped: "skip",
+  xfailed: "skip",
+  rerun: "pass"
+};
+function junitAddress(nodeid) {
+  const bracket = nodeid.indexOf("[");
+  const path9 = bracket === -1 ? nodeid : nodeid.slice(0, bracket);
+  const params = bracket === -1 ? "" : nodeid.slice(bracket);
+  const names = path9.split("::");
+  names[0] = names[0].replace(/\//g, ".").replace(/\.py$/, "");
+  names[names.length - 1] += params;
+  return { classname: names.slice(0, -1).join("."), name: names[names.length - 1] };
+}
+function text(value, max) {
+  return typeof value === "string" ? trimTo(stripAnsi(value), max) : void 0;
+}
+function firstLine(value) {
+  if (typeof value !== "string") return void 0;
+  const line = value.split(/\r?\n/).find((l) => l.trim() !== "");
+  return text(line, MESSAGE_MAX_CHARS4);
+}
+function skipReason(longrepr) {
+  if (typeof longrepr !== "string") return void 0;
+  const m = /,\s*['"](?:Skipped: )?(.*)['"]\)\s*$/s.exec(longrepr);
+  return text(m ? m[1] : longrepr, MESSAGE_MAX_CHARS4);
+}
+var pytestJsonParser = {
+  name: "pytest-json",
+  sniff(content) {
+    const parsed = parseJson(content);
+    if (!("doc" in parsed)) return false;
+    const doc = parsed.doc;
+    return isObj(doc) && isObj(doc.summary) && typeof doc.exitcode === "number" && (Array.isArray(doc.tests) || Array.isArray(doc.collectors));
+  },
+  parse(content, sourcePath) {
+    const results = [];
+    const warnings = [];
+    const parsed = parseJson(content);
+    if (!("doc" in parsed)) {
+      return { results, warnings: [`pytest-json: ${sourcePath}: invalid JSON: ${parsed.error}`] };
+    }
+    const doc = parsed.doc;
+    if (!isObj(doc)) {
+      return { results, warnings: [`pytest-json: ${sourcePath}: not a JSON object`] };
+    }
+    const flaky = [];
+    for (const test of Array.isArray(doc.tests) ? doc.tests : []) {
+      if (!isObj(test)) continue;
+      const nodeid = typeof test.nodeid === "string" ? test.nodeid.trim() : "";
+      if (nodeid === "") {
+        warnings.push(`pytest-json: ${sourcePath}: skipping a test without a nodeid`);
+        continue;
+      }
+      const outcome = typeof test.outcome === "string" ? test.outcome : "";
+      const status = OUTCOMES[outcome];
+      if (status === void 0) {
+        warnings.push(
+          `pytest-json: ${sourcePath}: unknown outcome ${JSON.stringify(test.outcome)} for ${nodeid}`
+        );
+        continue;
+      }
+      const { classname, name } = junitAddress(nodeid);
+      const suite = classname !== "" ? classname : "pytest";
+      let seconds = 0;
+      let timed = false;
+      for (const stage of STAGES) {
+        const s = test[stage];
+        if (isObj(s) && typeof s.duration === "number" && Number.isFinite(s.duration)) {
+          seconds += s.duration;
+          timed = true;
+        }
+      }
+      const result = {
+        testId: makeTestId(suite, name),
+        suite,
+        name,
+        status,
+        durationMs: timed && seconds >= 0 ? Math.round(seconds * 1e3) : null
+      };
+      if (status === "fail" || status === "error") {
+        const failed = STAGES.map((st) => test[st]).find(
+          (s) => isObj(s) && s.outcome === "failed"
+        );
+        const crash = isObj(failed?.crash) ? failed.crash : void 0;
+        const message = text(crash?.message, MESSAGE_MAX_CHARS4) ?? firstLine(failed?.longrepr);
+        const stack = text(failed?.longrepr, STACK_MAX_CHARS3);
+        if (message !== void 0) result.message = message;
+        if (stack !== void 0) result.stack = stack;
+      } else if (status === "skip") {
+        const skipped = STAGES.map((st) => test[st]).find(
+          (s) => isObj(s) && s.outcome === "skipped"
+        );
+        const reason = skipReason(skipped?.longrepr);
+        if (reason !== void 0) result.message = reason;
+      } else if (outcome === "rerun") {
+        result.message = "flaky: failed, then passed on pytest-rerunfailures rerun";
+        result.attempts = ["fail", "pass"];
+        flaky.push(nodeid);
+      }
+      results.push(result);
+    }
+    for (const collector of Array.isArray(doc.collectors) ? doc.collectors : []) {
+      if (!isObj(collector) || collector.outcome !== "failed") continue;
+      const nodeid = typeof collector.nodeid === "string" ? collector.nodeid.trim() : "";
+      const address = nodeid !== "" ? junitAddress(nodeid) : { classname: "", name: "(session)" };
+      const suite = address.classname !== "" ? address.classname : "pytest";
+      const result = {
+        testId: makeTestId(suite, address.name),
+        suite,
+        name: address.name,
+        status: "error",
+        durationMs: null,
+        message: firstLine(collector.longrepr) ?? "collection failure"
+      };
+      const stack = text(collector.longrepr, STACK_MAX_CHARS3);
+      if (stack !== void 0) result.stack = stack;
+      results.push(result);
+      warnings.push(
+        `pytest-json: ${sourcePath}: ${nodeid || "session"} failed to collect \u2014 recorded as an error`
+      );
+    }
+    if (flaky.length > 0) {
+      warnings.push(
+        flakyRetryWarning("pytest-json", sourcePath, "pytest-rerunfailures rerun", flaky)
+      );
+    }
+    return { results, warnings };
+  }
+};
+
 // src/parsers/tap.ts
 var ROOT_SUITE = "node:test";
 var SNIFF_MAX_LINES2 = 50;
 var TAP_LINE = /^(?:(?:not )?ok(?:\s|$)|1\.\.\d+(?:\s+#.*)?\s*$|#|Bail out!|pragma [+-]|TAP version \d+|\s)/;
-var MESSAGE_MAX_CHARS3 = 2e3;
+var MESSAGE_MAX_CHARS5 = 2e3;
 var tapParser = {
   name: "tap",
   sniff(content) {
@@ -2282,7 +2770,7 @@ var tapParser = {
         name,
         status,
         durationMs: yaml.durationMs ?? null,
-        message: message !== void 0 && message !== "" ? trimTo(message, MESSAGE_MAX_CHARS3) : void 0,
+        message: message !== void 0 && message !== "" ? trimTo(message, MESSAGE_MAX_CHARS5) : void 0,
         stack: status === "fail" && yaml.stack !== void 0 ? trimTo(yaml.stack, 1e3) : void 0
       };
       const children2 = [];
@@ -2376,20 +2864,20 @@ function readBlockScalar(lines, folded) {
   const body = lines.map((l) => l.trim() === "" ? "" : l.slice(Math.min(base, indentOf(l))));
   while (body.length > 0 && body[body.length - 1] === "") body.pop();
   if (!folded) return body.join("\n");
-  let text = "";
+  let text2 = "";
   for (let n = 0; n < body.length; n++) {
     const cur = body[n];
-    if (n > 0) text += cur === "" || body[n - 1] === "" ? "\n" : " ";
-    text += cur;
+    if (n > 0) text2 += cur === "" || body[n - 1] === "" ? "\n" : " ";
+    text2 += cur;
   }
-  return text.replace(/\n\n/g, "\n");
+  return text2.replace(/\n\n/g, "\n");
 }
 function unquote(s) {
   const m = s.match(/^(['"`])(.*)\1$/);
   if (m === null) return s;
   const [, quote, inner] = m;
-  const text = quote === "'" ? inner.replace(/''/g, "'") : inner;
-  return text.replace(/\\(['"`\\])/g, "$1");
+  const text2 = quote === "'" ? inner.replace(/''/g, "'") : inner;
+  return text2.replace(/\\(['"`\\])/g, "$1");
 }
 
 // src/parsers/trx.ts
@@ -2399,7 +2887,7 @@ function attr2(node, name) {
   const v = node[name];
   return typeof v === "string" && v.trim() !== "" ? v : void 0;
 }
-function textOf2(node) {
+function textOf3(node) {
   if (typeof node === "string") return node;
   if (isObj(node)) {
     const t = node["#text"];
@@ -2419,7 +2907,7 @@ function durationMs(raw) {
   if (!Number.isFinite(h) || !Number.isFinite(min) || !Number.isFinite(sec) || sec < 0) return null;
   return Math.round((((days * 24 + h) * 60 + min) * 60 + sec) * 1e3);
 }
-var OUTCOMES = {
+var OUTCOMES2 = {
   passed: "pass",
   passedbutrunaborted: "pass",
   completed: "pass",
@@ -2436,7 +2924,7 @@ var OUTCOMES = {
   pending: "skip"
 };
 function outcomeStatus(outcome) {
-  return outcome !== void 0 ? OUTCOMES[outcome.trim().toLowerCase()] ?? null : null;
+  return outcome !== void 0 ? OUTCOMES2[outcome.trim().toLowerCase()] ?? null : null;
 }
 function childList(el, localName) {
   const key = Object.keys(el).find((k) => k === localName || k.endsWith(`:${localName}`));
@@ -2475,8 +2963,8 @@ function mapResult(r, suites, ctx) {
   let message;
   let stack;
   if (errorInfo !== void 0) {
-    message = textOf2(childList(errorInfo, "Message")[0]);
-    stack = textOf2(childList(errorInfo, "StackTrace")[0]);
+    message = textOf3(childList(errorInfo, "Message")[0]);
+    stack = textOf3(childList(errorInfo, "StackTrace")[0]);
   }
   const testId = attr2(r, "@_testId");
   const known = (testId !== void 0 ? suites.byId.get(testId.toLowerCase()) : void 0) ?? suites.byName.get(testName);
@@ -2565,14 +3053,23 @@ var trxParser = {
 };
 
 // src/parsers/index.ts
+function bomTolerant(parser) {
+  return {
+    name: parser.name,
+    sniff: (content) => parser.sniff(stripBom(content)),
+    parse: (content, sourcePath) => parser.parse(stripBom(content), sourcePath)
+  };
+}
 var parsers = [
   junitParser,
   jestParser,
   mochaParser,
   goTestParser,
   tapParser,
-  trxParser
-];
+  trxParser,
+  playwrightParser,
+  pytestJsonParser
+].map(bomTolerant);
 function detectParser(content) {
   for (const parser of parsers) {
     try {
@@ -2581,6 +3078,31 @@ function detectParser(content) {
     }
   }
   return null;
+}
+function unrecognizedReason(content) {
+  const body = stripBom(content);
+  if (body.trim() === "") return "empty report file";
+  if (body.charCodeAt(0) === 31 && (body.charCodeAt(1) === 65533 || body.charCodeAt(1) === 139)) {
+    return "gzip-compressed report \u2014 decompress it first (e.g. gunzip)";
+  }
+  if (body.slice(0, 512).includes("\0")) {
+    return "binary or undecoded UTF-16 content (NUL characters) \u2014 save the report as UTF-8";
+  }
+  const trimmed = body.trimStart();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    const parsed = parseJson(trimmed);
+    if ("error" in parsed) {
+      const lines = trimmed.split(/\r?\n/).filter((l) => l.trim() !== "");
+      const jsonLines = lines.length > 1 && lines.every((l) => l.trimStart().startsWith("{")) && "doc" in parseJson(lines[0]);
+      if (!jsonLines) return `truncated/invalid JSON (${parsed.error})`;
+      return "unrecognized report format (JSON lines, but not go test -json or node:test events)";
+    }
+    return "unrecognized report format (valid JSON, but no supported report shape)";
+  }
+  if (trimmed.startsWith("<")) {
+    return "unrecognized report format (XML without <testsuite>/<testsuites> or <TestRun>)";
+  }
+  return "unrecognized report format";
 }
 
 // src/util/redact.ts
@@ -2673,8 +3195,8 @@ var PATTERNS = [
     replacement: "$1[REDACTED]"
   }
 ];
-function redact(text) {
-  let out = text;
+function redact(text2) {
+  let out = text2;
   for (const p of PATTERNS) {
     out = out.replace(p.re, p.replacement);
   }
@@ -2684,10 +3206,14 @@ function redact(text) {
 // src/report/text.ts
 var CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 function escapeControlChars(s) {
-  return s.replace(CONTROL, (c) => {
-    const code = c.charCodeAt(0);
-    return code < 256 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
-  });
+  return s.replace(CONTROL, visibleEscape);
+}
+function escapeControlCharsMultiline(s) {
+  return s.replace(/\r\n/g, "\n").replace(CONTROL, (c) => c === "\n" || c === "	" ? c : visibleEscape(c));
+}
+function visibleEscape(c) {
+  const code = c.charCodeAt(0);
+  return code < 256 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
 }
 function truncateCodePoints(s, max) {
   if (s.length <= max) return s;
@@ -2881,7 +3407,7 @@ async function upsertMrNote(gl, body, fetchImpl = fetch, warn = (m) => console.w
     "Content-Type": "application/json"
   };
   const mrUrl = `${gl.apiV4}/projects/${encodeURIComponent(gl.projectId)}/merge_requests/${encodeURIComponent(gl.mrIid)}`;
-  const notesUrl = `${mrUrl}/notes?per_page=100`;
+  const notesUrl = `${mrUrl}/notes`;
   try {
     const userRes = await call(`${gl.apiV4}/user`, { headers });
     if (!userRes.ok) {
@@ -2890,16 +3416,8 @@ async function upsertMrNote(gl, body, fetchImpl = fetch, warn = (m) => console.w
     }
     const me = await userRes.json();
     if (typeof me.id !== "number") return "unavailable";
-    const listRes = await call(notesUrl, { headers });
-    if (!listRes.ok) {
-      warn(`GitLab: listing MR notes failed: HTTP ${listRes.status}`);
-      return "unavailable";
-    }
-    const notes = await listRes.json();
-    if (!Array.isArray(notes)) return "unavailable";
-    const existing = notes.find(
-      (n) => n.author?.id === me.id && (n.body ?? "").includes(PR_COMMENT_MARKER)
-    );
+    const existing = await findOwnNote(call, headers, notesUrl, me.id, warn);
+    if (existing === "unavailable") return "unavailable";
     if (existing) {
       const res2 = await call(`${mrUrl}/notes/${existing.id}`, {
         method: "PUT",
@@ -2924,28 +3442,91 @@ async function upsertMrNote(gl, body, fetchImpl = fetch, warn = (m) => console.w
     return "unavailable";
   }
 }
+var NOTES_PER_PAGE = 100;
+var MAX_NOTE_PAGES = 50;
+async function findOwnNote(call, headers, notesUrl, myId, warn) {
+  for (let page = 1; page <= MAX_NOTE_PAGES; ) {
+    const url = `${notesUrl}?order_by=created_at&sort=asc&per_page=${NOTES_PER_PAGE}&page=${page}`;
+    const res = await call(url, { headers });
+    if (!res.ok) {
+      warn(`GitLab: listing MR notes failed: HTTP ${res.status}`);
+      return "unavailable";
+    }
+    const notes = await res.json();
+    if (!Array.isArray(notes)) return "unavailable";
+    const hit = notes.find(
+      (n) => n?.author?.id === myId && (n.body ?? "").includes(PR_COMMENT_MARKER)
+    );
+    if (hit) return hit;
+    const nextHeader = res.headers.get("x-next-page");
+    let next;
+    if (nextHeader === null) {
+      next = notes.length >= NOTES_PER_PAGE ? page + 1 : null;
+    } else {
+      const n = Number.parseInt(nextHeader, 10);
+      next = Number.isInteger(n) && n > page ? n : null;
+    }
+    if (next === null) return void 0;
+    page = next;
+  }
+  warn(
+    `GitLab: no flakefinder note in the first ${MAX_NOTE_PAGES * NOTES_PER_PAGE} MR notes \u2014 posting a new one`
+  );
+  return void 0;
+}
 
 // src/report/html.ts
 function redactData(data) {
   return {
     ...data,
     verdicts: data.verdicts.map((v) => {
-      const name = redact(v.name);
-      const suite = redact(v.suite);
-      const lastMessage = v.lastMessage ? redact(v.lastMessage) : v.lastMessage;
+      const name = escapeControlChars(redact(v.name));
+      const suite = escapeControlChars(redact(v.suite));
+      const lastMessage = v.lastMessage ? escapeControlCharsMultiline(redact(v.lastMessage)) : v.lastMessage;
       if (name === v.name && suite === v.suite && lastMessage === v.lastMessage) return v;
       return { ...v, name, suite, lastMessage };
-    })
+    }),
+    runs: data.runs.map(
+      (r) => r.commitSha === void 0 ? r : { ...r, commitSha: escapeControlChars(r.commitSha) }
+    )
   };
 }
 function embedJson(data) {
-  return JSON.stringify(data).replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
+  return JSON.stringify(data).replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--").replace(
+    /[\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16)}`
+  );
 }
 function renderDashboard(data) {
   const safeData = redactData(data);
   const json = embedJson(safeData);
   const hasVerdicts = safeData.verdicts.length > 0;
   const hasRuns = safeData.runs.length > 0;
+  const lightTokens = String.raw`
+    color-scheme: light;
+    --bg: #f6f8fa;
+    --bg-elev: #ffffff;
+    --bg-inset: #f6f8fa;
+    --border: #d0d7de;
+    --border-soft: #eaeef2;
+    --text: #1f2328;
+    --text-dim: #59636e;
+    --text-faint: #818b98;
+    --brand: #cf4b36;
+    --accent: #0969da;
+    --pass: #1a7f37;
+    --fail: #cf222e;
+    --fail-deep: #a40e26;
+    --error: #82071e;
+    --skip: #57606a;
+    --warn: #9a6700;
+    --suspect: #bf8700;
+    --info: #1b7c83;
+    --fixed: #0f766e;
+    --violet: #8250df;
+    --pink: #bf3989;
+    --shadow: 0 1px 3px rgba(31,35,40,.1), 0 8px 24px rgba(31,35,40,.07);
+`;
   const css = String.raw`
   *, *::before, *::after { box-sizing: border-box; }
   :root, [data-theme='dark'] {
@@ -2975,29 +3556,11 @@ function renderDashboard(data) {
     --shadow: 0 1px 3px rgba(1,4,9,.45), 0 8px 24px rgba(1,4,9,.35);
   }
   [data-theme='light'] {
-    color-scheme: light;
-    --bg: #f6f8fa;
-    --bg-elev: #ffffff;
-    --bg-inset: #f6f8fa;
-    --border: #d0d7de;
-    --border-soft: #eaeef2;
-    --text: #1f2328;
-    --text-dim: #59636e;
-    --text-faint: #818b98;
-    --brand: #cf4b36;
-    --accent: #0969da;
-    --pass: #1a7f37;
-    --fail: #cf222e;
-    --fail-deep: #a40e26;
-    --error: #82071e;
-    --skip: #57606a;
-    --warn: #9a6700;
-    --suspect: #bf8700;
-    --info: #1b7c83;
-    --fixed: #0f766e;
-    --violet: #8250df;
-    --pink: #bf3989;
-    --shadow: 0 1px 3px rgba(31,35,40,.1), 0 8px 24px rgba(31,35,40,.07);
+${lightTokens}  }
+  /* no explicit choice: follow the OS (dark stays the default otherwise) */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme='dark']) {
+${lightTokens}    }
   }
   html { -webkit-text-size-adjust: 100%; }
   body {
@@ -3698,6 +4261,14 @@ function renderDashboard(data) {
 
   // ---------- helpers ----------
   function $(id) { return document.getElementById(id); }
+  // control/bidi characters made visible, as in src/report/text.ts — for
+  // testIds, which stay raw in the data so the copy buttons yield the real id
+  function visible(s) {
+    return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, function (c) {
+      var code = c.charCodeAt(0);
+      return code < 256 ? '\\x' + ('0' + code.toString(16)).slice(-2) : '\\u' + ('000' + code.toString(16)).slice(-4);
+    });
+  }
   function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -3741,15 +4312,27 @@ function renderDashboard(data) {
     var tail = keep - head;
     return cps.slice(0, head).join('') + '\u2026' + cps.slice(cps.length - tail).join('');
   }
-  function shortSha(s) { return s ? String(s).slice(0, 7) : ''; }
+  function shortSha(s) { if (!s) return ''; s = String(s); var d = s.indexOf('-dirty'); return d >= 0 ? s.slice(0, 7) + ' (dirty)' : s.slice(0, 7); }
 
   // ---------- theme toggle ----------
   var themeBtn = $('ff-toggle');
-  var theme = 'dark';
+  // an explicit choice (stored) wins; otherwise follow prefers-color-scheme,
+  // dark when the OS has no preference
+  var lightQuery = null;
+  try { lightQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null; } catch (err) { lightQuery = null; }
+  var stored = null;
   try {
-    var stored = window.localStorage && window.localStorage.getItem('ff-theme');
-    if (stored === 'light' || stored === 'dark') theme = stored;
+    stored = window.localStorage && window.localStorage.getItem('ff-theme');
   } catch (err) { /* storage unavailable (private mode / file origin) */ }
+  var explicitTheme = stored === 'light' || stored === 'dark';
+  var theme = explicitTheme ? stored : (lightQuery && lightQuery.matches ? 'light' : 'dark');
+  if (lightQuery && lightQuery.addEventListener) {
+    lightQuery.addEventListener('change', function (e) {
+      if (explicitTheme) return;
+      theme = e.matches ? 'light' : 'dark';
+      applyTheme();
+    });
+  }
   function applyTheme() {
     document.documentElement.setAttribute('data-theme', theme);
     if (!themeBtn) return;
@@ -3763,6 +4346,7 @@ function renderDashboard(data) {
   if (themeBtn) {
     themeBtn.addEventListener('click', function () {
       theme = theme === 'dark' ? 'light' : 'dark';
+      explicitTheme = true;
       try { window.localStorage.setItem('ff-theme', theme); } catch (err) { /* ignore */ }
       applyTheme();
     });
@@ -4113,7 +4697,7 @@ function renderDashboard(data) {
     var nameEl = $('ff-dr-name');
     if (nameEl) { nameEl.textContent = v.name; nameEl.title = v.name; }
     var idEl = $('ff-dr-id');
-    if (idEl) idEl.textContent = v.testId;
+    if (idEl) idEl.textContent = visible(v.testId);
 
     var clsEl = $('ff-dr-cls');
     if (clsEl) { clsEl.textContent = meta.label; clsEl.className = 'badge c-' + meta.color; }
@@ -4158,7 +4742,7 @@ function renderDashboard(data) {
       }
     }
     var cmd = $('ff-dr-cmd');
-    if (cmd) cmd.textContent = 'flakefinder quarantine add ' + v.testId;
+    if (cmd) cmd.textContent = 'flakefinder quarantine add ' + visible(v.testId);
   }
 
   function highlightDrawerRow() {
@@ -4263,9 +4847,10 @@ function renderDashboard(data) {
 })();
 `;
   return String.raw`<!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="color-scheme" content="dark light">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="flakefinder">
 <title>flakefinder dashboard</title>
@@ -4300,11 +4885,13 @@ ${hasVerdicts ? drawerMarkup : ""}
 }
 
 // src/types.ts
-var FLAKEFINDER_VERSION = "1.1.1";
+var FLAKEFINDER_VERSION = "1.2.0";
 
 // src/report/json.ts
+var JSON_SCHEMA_VERSION = 1;
 function renderJson(verdicts, cfg) {
   const payload = {
+    schemaVersion: JSON_SCHEMA_VERSION,
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     flakefinderVersion: FLAKEFINDER_VERSION,
     config: cfg,
@@ -4385,13 +4972,15 @@ function renderTerminal(allVerdicts, opts) {
     return lines.join("\n");
   }
   lines.push(
-    bold(`flakefinder \u2014 ${verdicts.length} tracked test(s), ${problemCount} need attention`),
+    // "tracked" is the whole history — it must not change with --threshold;
+    // only the "need attention" rows are filtered (and the hidden ones counted)
+    bold(`flakefinder \u2014 ${allVerdicts.length} tracked test(s), ${problemCount} need attention`),
     ""
   );
   if (hiddenBelowThreshold > 0) {
     lines.push(
       dim2(
-        `${hiddenBelowThreshold} flaky-suspected test(s) hidden below score ${opts.threshold} \u2014 raise --threshold visibility with --all or a lower --threshold`
+        `${hiddenBelowThreshold} flaky-suspected test(s) hidden below score ${opts.threshold} \u2014 show them with --all or a lower --threshold`
       ),
       ""
     );
@@ -4455,13 +5044,122 @@ function renderTerminal(allVerdicts, opts) {
 }
 
 // src/runner/wrap.ts
-import { spawn, spawnSync as spawnSync2 } from "child_process";
-import { createHash as createHash2, randomUUID } from "crypto";
-import { existsSync as existsSync5, readFileSync as readFileSync4, statSync as statSync5 } from "fs";
+import { spawn, spawnSync as spawnSync3 } from "child_process";
+import { createHash as createHash3, randomUUID } from "crypto";
+import { existsSync as existsSync5, mkdtempSync, readFileSync as readFileSync6, rmSync as rmSync3, statSync as statSync6, writeFileSync as writeFileSync3 } from "fs";
+import { tmpdir } from "os";
+import path7 from "path";
+
+// src/util/read-text.ts
+import { readFileSync as readFileSync4 } from "fs";
+import { gunzipSync } from "zlib";
+function decodeText(buf) {
+  if (buf.length >= 2 && buf[0] === 31 && buf[1] === 139) {
+    try {
+      return decodeText(gunzipSync(buf, { maxOutputLength: 512 * 1024 * 1024 }));
+    } catch {
+    }
+  }
+  if (buf.length >= 3 && buf[0] === 239 && buf[1] === 187 && buf[2] === 191) {
+    return buf.subarray(3).toString("utf8");
+  }
+  if (buf.length >= 2 && buf[0] === 255 && buf[1] === 254) {
+    return buf.subarray(2).toString("utf16le");
+  }
+  if (buf.length >= 2 && buf[0] === 254 && buf[1] === 255) {
+    return swap16(buf.subarray(2)).toString("utf16le");
+  }
+  const probe = Math.min(buf.length, 512) & ~1;
+  if (probe >= 4) {
+    let evenNul = 0;
+    let oddNul = 0;
+    for (let i = 0; i < probe; i += 2) {
+      if (buf[i] === 0) evenNul++;
+      if (buf[i + 1] === 0) oddNul++;
+    }
+    const pairs = probe / 2;
+    if (oddNul > pairs * 0.4 && evenNul === 0) return buf.toString("utf16le");
+    if (evenNul > pairs * 0.4 && oddNul === 0) return swap16(buf).toString("utf16le");
+  }
+  return buf.toString("utf8");
+}
+function swap16(buf) {
+  const out = Buffer.from(buf.subarray(0, buf.length & ~1));
+  out.swap16();
+  return out;
+}
+function readTextFile(file) {
+  return decodeText(readFileSync4(file));
+}
+
+// src/runner/git-state.ts
+import { spawnSync as spawnSync2 } from "child_process";
+import { createHash as createHash2 } from "crypto";
+import { readFileSync as readFileSync5, realpathSync, statSync as statSync5 } from "fs";
 import path6 from "path";
+var MAX_HASHED_BYTES = 8 * 1024 * 1024;
+var GIT_TIMEOUT_MS = 15e3;
+function git(cwd, args) {
+  const r = spawnSync2("git", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024 * 1024
+  });
+  return r.status === 0 && typeof r.stdout === "string" ? r.stdout : null;
+}
+function real(p) {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    const parent = path6.dirname(p);
+    return parent === p ? p : path6.join(real(parent), path6.basename(p));
+  }
+}
+function parsePorcelainZ(out) {
+  const files = [];
+  const tokens = out.split("\0");
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.length < 4) continue;
+    const xy = t.slice(0, 2);
+    files.push(t.slice(3));
+    if (xy[0] === "R" || xy[0] === "C") i++;
+  }
+  return files;
+}
+function detectCodeState(cwd, exclude = []) {
+  const head = git(cwd, ["rev-parse", "HEAD"])?.trim();
+  if (!head) return { commitSha: void 0, dirtyFiles: [] };
+  const status = git(cwd, ["status", "--porcelain", "-z", "--untracked-files=no"]);
+  const top = git(cwd, ["rev-parse", "--show-toplevel"])?.trim();
+  if (status === null || !top) return { commitSha: head, dirtyFiles: [] };
+  const root = real(top);
+  const excluded = exclude.map((p) => real(path6.resolve(cwd, p)));
+  const isExcluded = (abs) => excluded.some((e) => abs === e || abs.startsWith(e + path6.sep));
+  const dirtyFiles = parsePorcelainZ(status).filter((rel) => !isExcluded(path6.join(root, rel))).sort();
+  if (dirtyFiles.length === 0) return { commitSha: head, dirtyFiles };
+  const h = createHash2("sha256");
+  for (const rel of dirtyFiles) {
+    const abs = path6.join(root, rel);
+    h.update(rel).update("\0");
+    try {
+      const st = statSync5(abs);
+      if (!st.isFile()) h.update(`[${st.isDirectory() ? "dir" : "other"}]`);
+      else if (st.size > MAX_HASHED_BYTES) h.update(`[${st.size}:${st.mtimeMs}]`);
+      else h.update(readFileSync5(abs));
+    } catch {
+      h.update("[deleted]");
+    }
+    h.update("\0");
+  }
+  return { commitSha: `${head}-dirty-${h.digest("hex").slice(0, 12)}`, dirtyFiles };
+}
+
+// src/runner/wrap.ts
 function statOf(file) {
   try {
-    const s = statSync5(file);
+    const s = statSync6(file);
     return { size: s.size, mtimeMs: s.mtimeMs };
   } catch {
     return null;
@@ -4469,7 +5167,7 @@ function statOf(file) {
 }
 function shaOf(file) {
   try {
-    return createHash2("sha256").update(readFileSync4(file)).digest("hex");
+    return createHash3("sha256").update(readFileSync6(file)).digest("hex");
   } catch {
     return null;
   }
@@ -4500,7 +5198,7 @@ var SCRIPT_HOSTS = /^(?:node|python3?|deno)$/;
 function commandBase(token) {
   return token.replace(/^.*[\\/]/, "").toLowerCase().replace(/\.(?:cmd|exe|bat)$/, "");
 }
-function runnerSegment(command) {
+function shellSegments(command) {
   const segments = [];
   let start = 0;
   for (let i = 0; i <= command.length; i++) {
@@ -4512,6 +5210,41 @@ function runnerSegment(command) {
     if (cmd < end) segments.push({ cmd, end });
     start = i + 1;
   }
+  return segments;
+}
+var SHELL_BUILTINS = /* @__PURE__ */ new Set([
+  ...[".", ":", "[", "alias", "break", "cd", "command", "continue", "eval", "exec", "exit"],
+  ...["export", "false", "getopts", "hash", "pwd", "read", "readonly", "return", "set"],
+  ...["shift", "source", "test", "times", "trap", "true", "type", "ulimit", "umask"],
+  ...["unalias", "unset", "wait", "echo", "printf", "if", "then", "else", "fi", "for"],
+  ...["while", "do", "done", "case", "esac", "!", "{", "}", "(", ")", "call", "copy"],
+  ...["del", "dir", "md", "mkdir", "move", "rd", "ren", "rmdir", "setlocal", "type", "ver"]
+]);
+function commandResolvable(word, cwd, env = process.env, platform = process.platform) {
+  if (SHELL_BUILTINS.has(platform === "win32" ? word.toLowerCase() : word)) return true;
+  if (/[$`*?~{(]/.test(word)) return true;
+  const exts = platform === "win32" ? ["", ...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)] : [""];
+  const isFile = (p) => {
+    try {
+      return statSync6(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (/[\\/]/.test(word)) return exts.some((e) => isFile(path7.resolve(cwd, word + e)));
+  const dirs = (env.PATH ?? env.Path ?? "").split(platform === "win32" ? ";" : ":");
+  if (platform === "win32") dirs.unshift(cwd);
+  return dirs.some((d) => d !== "" && exts.some((e) => isFile(path7.join(d, word + e))));
+}
+function missingCommandWord(command, cwd) {
+  for (const seg of shellSegments(command)) {
+    const word = command[seg.cmd];
+    if (!commandResolvable(word, cwd)) return word;
+  }
+  return void 0;
+}
+function runnerSegment(command) {
+  const segments = shellSegments(command);
   const words = (seg) => command.slice(seg.cmd, seg.end).map(commandBase);
   return segments.find((seg) => {
     const w = words(seg);
@@ -4527,12 +5260,48 @@ function insertRunnerArgs(command, args) {
   return [...command.slice(0, seg.end), ...separator, ...args, ...command.slice(seg.end)];
 }
 var USE_PROCESS_GROUP = process.platform !== "win32";
-function signalTree(child2, signal) {
-  if (child2.pid === void 0) return;
-  if (USE_PROCESS_GROUP) {
+var groupLeaders = /* @__PURE__ */ new WeakSet();
+function interactiveStdin() {
+  return USE_PROCESS_GROUP && process.stdin.isTTY === true;
+}
+function processTree(pid) {
+  const r = spawnSync3("ps", ["-A", "-o", "pid=", "-o", "ppid="], {
+    encoding: "utf8",
+    timeout: 5e3
+  });
+  if (r.status !== 0 || typeof r.stdout !== "string") return [pid];
+  const children2 = /* @__PURE__ */ new Map();
+  for (const line of r.stdout.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!m) continue;
+    const [c, p] = [Number(m[1]), Number(m[2])];
+    const list = children2.get(p);
+    if (list) list.push(c);
+    else children2.set(p, [c]);
+  }
+  const out = [pid];
+  for (let i = 0; i < out.length; i++) {
+    for (const c of children2.get(out[i]) ?? []) if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+function signalTree(child2, signal, known = []) {
+  if (child2.pid === void 0) return known;
+  if (groupLeaders.has(child2)) {
     try {
       process.kill(-child2.pid, signal);
-      return;
+      return known;
+    } catch {
+    }
+  }
+  const alive = child2.exitCode === null && child2.signalCode === null;
+  const pids = [
+    .../* @__PURE__ */ new Set([...alive && USE_PROCESS_GROUP ? processTree(child2.pid) : [], ...known])
+  ];
+  for (const pid of pids) {
+    if (pid === child2.pid) continue;
+    try {
+      process.kill(pid, signal);
     } catch {
     }
   }
@@ -4540,21 +5309,33 @@ function signalTree(child2, signal) {
     child2.kill(signal);
   } catch {
   }
+  return pids;
 }
 function killTree(child2, signal = "SIGTERM") {
   if (child2.pid === void 0) return;
   if (process.platform === "win32") {
-    const r = spawnSync2("taskkill", ["/pid", String(child2.pid), "/T", "/F"], { stdio: "ignore" });
+    const r = spawnSync3("taskkill", ["/pid", String(child2.pid), "/T", "/F"], { stdio: "ignore" });
     if (r.error || r.status !== 0) child2.kill();
     return;
   }
-  signalTree(child2, signal);
-  const escalated = setTimeout(() => signalTree(child2, "SIGKILL"), 3e3);
+  const pids = signalTree(child2, signal);
+  const escalated = setTimeout(() => signalTree(child2, "SIGKILL", pids), 3e3);
   escalated.unref();
 }
+function interruptTree(child2, signal) {
+  if (signal !== "SIGINT" || groupLeaders.has(child2) || process.platform === "win32") {
+    killTree(child2, signal);
+    return;
+  }
+  const grace = setTimeout(() => {
+    if (child2.exitCode === null && child2.signalCode === null) killTree(child2, "SIGTERM");
+  }, INTERRUPT_GRACE_MS);
+  grace.unref();
+}
+var INTERRUPT_GRACE_MS = 2e3;
 var SPAWN_FAILED = -2;
 var SHELL_NOT_FOUND = process.platform === "win32" ? 9009 : 127;
-function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
+function spawnCommand(command, cwd, timeoutSeconds, currentChild, env = process.env) {
   const shellArgv = shellArgvFor(command, cwd);
   return new Promise((resolve) => {
     const done = (code) => {
@@ -4567,18 +5348,15 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
       let timedOut = false;
       let child2;
       try {
+        const ownGroup = USE_PROCESS_GROUP && !interactiveStdin();
         child2 = spawn(argv[0], argv.slice(1), {
           shell: useShell2,
           cwd,
-          detached: USE_PROCESS_GROUP,
-          // a background process group that reads the terminal is stopped
-          // (SIGTTIN) — test runs get EOF on stdin instead of hanging
-          stdio: [
-            USE_PROCESS_GROUP && process.stdin.isTTY ? "ignore" : "inherit",
-            "inherit",
-            "inherit"
-          ]
+          env,
+          detached: ownGroup,
+          stdio: "inherit"
         });
+        if (ownGroup) groupLeaders.add(child2);
       } catch (err) {
         if (!useShell2) {
           start(shellArgv, true);
@@ -4620,10 +5398,11 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
       });
       child2.on("close", (code) => {
         if (abandoned) return;
-        if (useShell2 && directNotFound && code === SHELL_NOT_FOUND && !timedOut) {
+        const missing = useShell2 && code === SHELL_NOT_FOUND && !timedOut ? directNotFound ? command[0] : missingCommandWord(command, cwd) : void 0;
+        if (missing !== void 0) {
           if (timer) clearTimeout(timer);
           console.error(
-            `flakefinder: command not found: ${command[0]} \u2014 is it installed and on PATH?`
+            `flakefinder: command not found: ${missing} \u2014 is it installed and on PATH?`
           );
           done(SPAWN_FAILED);
           return;
@@ -4636,21 +5415,31 @@ function spawnCommand(command, cwd, timeoutSeconds, currentChild) {
   });
 }
 async function runLive(command, cfg, opts) {
-  const cwd = path6.resolve(opts.cwd);
+  const cwd = path7.resolve(opts.cwd);
   const runId = randomUUID();
-  let commitSha;
-  const git = spawnSync2("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
-  if (git.status === 0) commitSha = git.stdout.trim();
+  const { commitSha, dirtyFiles } = detectCodeState(cwd, [
+    cfg.storeDir,
+    cfg.quarantineFile,
+    "flakefinder.config.json",
+    ...matchGlobs(cwd, cfg.reports)
+  ]);
+  if (dirtyFiles.length > 0 && commitSha) {
+    console.log(
+      `flakefinder: working tree has uncommitted changes (${dirtyFiles.length} file(s)) \u2014 recording code state ${commitSha.replace(/^([0-9a-f]{7})[0-9a-f]*/, "$1")}, distinct from HEAD`
+    );
+  }
   const runner = cfg.runner === "auto" ? detectRunner(cwd) : cfg.runner;
   let quarantineFlags = [];
   let quarantinedNames = [];
   let quarantinedIds = /* @__PURE__ */ new Set();
+  let exactDeselect = null;
   if (opts.applyQuarantine) {
-    const entries = loadQuarantine(path6.resolve(cwd, cfg.quarantineFile));
+    const entries = loadQuarantine(path7.resolve(cwd, cfg.quarantineFile));
     quarantinedIds = new Set(entries.map((e) => e.testId));
     if (runner === "pytest" || runner === "jest" || runner === "mocha") {
       if (entries.length > 0) {
         quarantineFlags = exclusionArgs(runner, entries, cwd);
+        if (runner === "pytest") exactDeselect = setUpExactDeselect(quarantineFlags);
         quarantinedNames = entries.map((e) => e.name);
         console.log(
           `flakefinder: quarantine active \u2014 excluding ${entries.length} quarantined test(s) via runner flags`
@@ -4680,7 +5469,7 @@ async function runLive(command, cfg, opts) {
   let notedSelectorMerge = false;
   const onInterrupt = (signal) => {
     interrupted = true;
-    if (currentChild.ref) killTree(currentChild.ref, signal);
+    if (currentChild.ref) interruptTree(currentChild.ref, signal);
   };
   process.on("SIGINT", onInterrupt);
   process.on("SIGTERM", onInterrupt);
@@ -4693,7 +5482,7 @@ async function runLive(command, cfg, opts) {
         const failed = failedNamesOf(previous).filter((n) => !quarantinedNames.includes(n));
         let targeted = failedOnlyArgs(runner, failed, quarantinedNames);
         if (runner === "pytest" && targeted) {
-          if (pytestCacheDisabled(command)) targeted = null;
+          if (pytestCacheDisabled(command, cwd)) targeted = null;
           else targeted = [...quarantineFlags, ...targeted];
         }
         const targetedChars = targeted ? targeted.reduce((n, a) => n + a.length + 1, 0) : 0;
@@ -4704,7 +5493,7 @@ async function runLive(command, cfg, opts) {
           note = `targeted: re-running ${failed.length} failed test(s)`;
         } else if (failed.length === 0) {
           note = "full re-run (no failures recorded)";
-        } else if (runner === "pytest" && pytestCacheDisabled(command)) {
+        } else if (runner === "pytest" && pytestCacheDisabled(command, cwd)) {
           note = "full re-run (-p no:cacheprovider disables pytest --lf)";
         } else {
           if (cfg.retryMode === "failed") {
@@ -4736,7 +5525,13 @@ async function runLive(command, cfg, opts) {
           `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ""} \u2192 ${truncateForLog(built.join(" "))}`
         )
       );
-      let code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
+      let code = await spawnCommand(
+        built,
+        cwd,
+        cfg.timeoutSeconds,
+        currentChild,
+        exactDeselect?.env
+      );
       if (code === SPAWN_FAILED) {
         if (attempt === 1) {
           return {
@@ -4760,20 +5555,19 @@ async function runLive(command, cfg, opts) {
       const after = snapshotReports(cwd, cfg, snapshot);
       for (const [file, stamp] of after) {
         const prev = snapshot.get(file);
-        if (attempt === 1 && prev?.sha === stamp.sha) continue;
-        if (attempt > 1 && prev !== void 0 && prev.mtimeMs === stamp.mtimeMs && prev.size === stamp.size && prev.sha === stamp.sha) {
+        if (prev !== void 0 && prev.mtimeMs === stamp.mtimeMs && prev.size === stamp.size && prev.sha === stamp.sha) {
           continue;
         }
         let content;
         try {
-          content = readFileSync4(file, "utf8");
+          content = readTextFile(file);
         } catch (err) {
           console.warn(`flakefinder: cannot read report ${file}: ${err.message}`);
           continue;
         }
         const parser = detectParser(content);
         if (!parser) {
-          console.warn(`flakefinder: unrecognized report format \u2014 skipped ${file}`);
+          console.warn(`flakefinder: ${unrecognizedReason(content)} \u2014 skipped ${file}`);
           continue;
         }
         const { results, warnings } = parser.parse(content, file);
@@ -4794,10 +5588,11 @@ async function runLive(command, cfg, opts) {
       if (code === 0) break;
     }
   } finally {
+    if (exactDeselect) rmSync3(exactDeselect.dir, { recursive: true, force: true });
     process.off("SIGINT", onInterrupt);
     process.off("SIGTERM", onInterrupt);
   }
-  const store = new HistoryStore(path6.resolve(cwd, cfg.storeDir));
+  const store = new HistoryStore(path7.resolve(cwd, cfg.storeDir));
   for (const record of attempts) store.append(record);
   store.prune(cfg.maxRuns);
   const all = classifyAll(store.runs(), cfg);
@@ -4901,10 +5696,80 @@ function loadQuarantine(file) {
     return [];
   }
 }
-function pytestCacheDisabled(command) {
-  return command.some(
-    (t, i) => t === "-pno:cacheprovider" || t === "-p=no:cacheprovider" || t === "no:cacheprovider" && command[i - 1] === "-p"
+function setUpExactDeselect(flags) {
+  const ids = deselectedNodeIds(flags);
+  if (ids.length === 0) return null;
+  try {
+    const dir = mkdtempSync(path7.join(tmpdir(), "flakefinder-pytest-"));
+    writeFileSync3(path7.join(dir, `${PYTEST_EXACT_PLUGIN_MODULE}.py`), PYTEST_EXACT_PLUGIN_SOURCE);
+    return { env: pytestExactDeselectEnv(ids, dir), dir };
+  } catch {
+    return null;
+  }
+}
+function argvDisablesCache(tokens) {
+  return tokens.some(
+    (t, i) => t === "-pno:cacheprovider" || t === "-p=no:cacheprovider" || t === "no:cacheprovider" && tokens[i - 1] === "-p"
   );
+}
+var PYTEST_CONFIGS = [
+  { file: "pytest.ini", section: /^\[pytest\]\s*$/ },
+  { file: ".pytest.ini", section: /^\[pytest\]\s*$/ },
+  { file: "pyproject.toml", section: /^\[tool\.pytest(?:\.ini_options)?\]\s*$/ },
+  { file: "tox.ini", section: /^\[pytest\]\s*$/ },
+  { file: "setup.cfg", section: /^\[tool:pytest\]\s*$/ }
+];
+function pytestSection(text2, header) {
+  const lines = text2.split(/\r?\n/);
+  const start = lines.findIndex((l) => header.test(l.trim()));
+  if (start < 0) return null;
+  const body = [];
+  for (const l of lines.slice(start + 1)) {
+    if (/^\[[^\]]+\]\s*$/.test(l)) break;
+    if (/^\s*[#;]/.test(l)) continue;
+    body.push(l);
+  }
+  return body.join("\n");
+}
+function readIfFile(file) {
+  try {
+    return statSync6(file).isFile() ? readTextFile(file) : null;
+  } catch {
+    return null;
+  }
+}
+function sectionDisablesCache(section) {
+  return /-p\s*["',\s]*=?\s*["']?no:cacheprovider/.test(section);
+}
+function pytestCacheDisabled(command, cwd, env = process.env) {
+  if (argvDisablesCache(command)) return true;
+  if (argvDisablesCache((env.PYTEST_ADDOPTS ?? "").split(/\s+/).filter(Boolean))) return true;
+  if (cwd === void 0) return false;
+  let explicit;
+  command.forEach((t, i) => {
+    if ((t === "-c" || t === "--config-file") && command[i + 1]) explicit = command[i + 1];
+    else if (t.startsWith("--config-file=")) explicit = t.slice("--config-file=".length);
+  });
+  if (explicit !== void 0) {
+    const text2 = readIfFile(path7.resolve(cwd, explicit));
+    if (text2 === null) return false;
+    const header = PYTEST_CONFIGS.find((c) => explicit.endsWith(c.file))?.section;
+    const section = header ? pytestSection(text2, header) : null;
+    return sectionDisablesCache(section ?? text2);
+  }
+  let dir = path7.resolve(cwd);
+  for (; ; ) {
+    for (const { file, section: header } of PYTEST_CONFIGS) {
+      const text2 = readIfFile(path7.join(dir, file));
+      if (text2 === null) continue;
+      const section = pytestSection(text2, header);
+      if (section !== null) return sectionDisablesCache(section);
+      if (file === "pytest.ini" || file === ".pytest.ini") return false;
+    }
+    const parent = path7.dirname(dir);
+    if (parent === dir || existsSync5(path7.join(dir, ".git"))) return false;
+    dir = parent;
+  }
 }
 var SELECTOR_BUDGET_CHARS = process.platform === "win32" ? 6e3 : 32768;
 function truncateForLog(line, max = 400) {
@@ -4940,13 +5805,13 @@ function takesRedirectTarget(token) {
 }
 function isBatchCommand(cmd, cwd, env = process.env) {
   if (/\.(?:cmd|bat)$/i.test(cmd)) return true;
-  if (path6.extname(cmd) !== "") return false;
+  if (path7.extname(cmd) !== "") return false;
   const exts = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
   const hasDir = /[\\/]/.test(cmd);
   const dirs = hasDir ? [""] : [cwd, ...(env.PATH ?? env.Path ?? "").split(";").filter(Boolean)];
   for (const dir of dirs) {
     for (const ext of exts) {
-      const candidate = dir ? path6.join(dir, cmd + ext) : path6.resolve(cwd, cmd + ext);
+      const candidate = dir ? path7.join(dir, cmd + ext) : path7.resolve(cwd, cmd + ext);
       if (existsSync5(candidate)) return /^\.(?:cmd|bat)$/i.test(ext);
     }
   }
@@ -4989,36 +5854,101 @@ function parseStrictInt(value, min, max) {
   return n;
 }
 
+// src/cli/color.ts
+function shouldColor(flag, stream, env = process.env) {
+  if (!flag) return false;
+  const noColor = env.NO_COLOR;
+  if (noColor !== void 0 && noColor !== "") return false;
+  return stream.isTTY === true;
+}
+
+// src/cli/open.ts
+import { spawn as spawn2 } from "child_process";
+var OPEN_PATH_ENV = "FLAKEFINDER_OPEN_PATH";
+function browserCommand(file, platform) {
+  const base = { detached: true, stdio: "ignore" };
+  if (platform === "win32") {
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/v:off", "/c", `start "" "%${OPEN_PATH_ENV}%"`],
+      options: {
+        ...base,
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+        env: { ...process.env, [OPEN_PATH_ENV]: file }
+      }
+    };
+  }
+  if (platform === "darwin") return { command: "open", args: [file], options: base };
+  return { command: "xdg-open", args: [file], options: base };
+}
+function openInBrowser(file, warn = (m) => console.warn(m), platform = process.platform) {
+  const { command, args, options } = browserCommand(file, platform);
+  const hint = `open ${file} manually`;
+  try {
+    const child2 = spawn2(command, args, options);
+    child2.on("error", (err) => {
+      warn(`flakefinder: could not open a browser (${command}: ${err.message}) \u2014 ${hint}`);
+    });
+    child2.unref();
+  } catch (err) {
+    warn(`flakefinder: could not open a browser (${err.message}) \u2014 ${hint}`);
+  }
+}
+
 // src/cli/index.ts
 var PROBLEM_ALWAYS = ["flaky-confirmed", "flaky-retry", "failing", "new-failure"];
 function resolveCfg(g, overrides = {}) {
   if (g.config) {
-    let raw;
-    try {
-      raw = readFileSync5(g.config, "utf8");
-    } catch (err) {
-      throw new Error(`cannot read config ${g.config}: ${err.message}`);
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(stripJsonComments(raw.replace(/^\uFEFF/, "")));
-    } catch (err) {
-      throw new Error(`invalid config ${g.config}: ${err.message}`);
-    }
-    return resolveConfig(
-      anchorConfigPaths(parsed, path7.dirname(path7.resolve(g.config))),
-      overrides
-    );
+    return resolveConfig(readConfigFile(path8.resolve(g.cwd, g.config)), overrides);
   }
   const { config } = loadConfig(g.cwd);
   return resolveConfig(config, overrides);
 }
+function checkCwd(dir) {
+  let isDir = false;
+  try {
+    isDir = statSync7(dir).isDirectory();
+  } catch {
+    throw new Error(`--cwd ${dir} does not exist`);
+  }
+  if (!isDir) throw new Error(`--cwd ${dir} is not a directory`);
+}
 function gitSha(cwd) {
-  const r = spawnSync3("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  const r = spawnSync4("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
   return r.status === 0 ? r.stdout.trim() : void 0;
 }
+var SHA_RE = /^[0-9a-f]{7,64}$/i;
+function ciCommitSha(cwd, env = process.env) {
+  for (const key of ["GITHUB_SHA", "CI_COMMIT_SHA"]) {
+    const v = env[key]?.trim();
+    if (v && SHA_RE.test(v)) return v.toLowerCase();
+  }
+  return gitSha(cwd);
+}
+function readSnapshot(file) {
+  if (!existsSync6(file)) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync7(file, "utf8"));
+  } catch (err) {
+    console.warn(
+      `flakefinder: ignoring unreadable verdict snapshot ${file} (${err.message}) \u2014 no baseline this run, every current flake counts as new; it is rewritten below`
+    );
+    return null;
+  }
+  if (!Array.isArray(parsed)) {
+    console.warn(
+      `flakefinder: ignoring verdict snapshot ${file}: expected an array \u2014 no baseline this run, every current flake counts as new; it is rewritten below`
+    );
+    return null;
+  }
+  return parsed.filter(
+    (v) => typeof v === "object" && v !== null && typeof v.testId === "string" && typeof v.classification === "string"
+  );
+}
 function storeFor(g, cfg) {
-  return new HistoryStore(path7.resolve(g.cwd, cfg.storeDir));
+  return new HistoryStore(path8.resolve(g.cwd, cfg.storeDir));
 }
 function printStoreWarnings(store) {
   for (const w of store.warnings) console.warn(`flakefinder: ${w}`);
@@ -5030,8 +5960,8 @@ function flagInt(flag, value, min, max, unit = "") {
   }
   return n;
 }
+var RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 var RETRIES_MAX = 10;
-var TIMEOUT_MAX_SECONDS = 2147483;
 function filterVerdicts(verdicts, opts, cfg) {
   if (opts.all) return verdicts;
   const threshold = opts.threshold ?? cfg.flakeScoreThreshold;
@@ -5075,17 +6005,18 @@ next step \u2014 make your runner emit machine-readable reports:
 ${hint[runner] ?? hint.generic}`
   );
 }
-function openInBrowser(file) {
-  try {
-    if (process.platform === "win32") {
-      spawn2("cmd", ["/c", "start", "", file], { detached: true, stdio: "ignore" });
-    } else if (process.platform === "darwin") {
-      spawn2("open", [file], { detached: true, stdio: "ignore" });
-    } else {
-      spawn2("xdg-open", [file], { detached: true, stdio: "ignore" });
+var esc = escapeControlChars;
+function hasCommand(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--config" || a === "--cwd") {
+      i++;
+      continue;
     }
-  } catch {
+    if (a.startsWith("--config=") || a.startsWith("--cwd=") || a === "--no-color") continue;
+    return true;
   }
+  return false;
 }
 function ghEscape(s) {
   return s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
@@ -5093,12 +6024,20 @@ function ghEscape(s) {
 async function main(argv) {
   let exitCode = 0;
   const program = new Command();
-  program.name("flakefinder").description("Detect, track, and quarantine flaky tests \u2014 locally and in CI.").version(FLAKEFINDER_VERSION).option("--config <path>", "explicit path to flakefinder.config.json").option("--cwd <dir>", "working directory (where config/reports live)", process.cwd()).option("--no-color", "disable ANSI colors").exitOverride();
+  program.name("flakefinder").description("Detect, track, and quarantine flaky tests \u2014 locally and in CI.").version(FLAKEFINDER_VERSION).option("--config <path>", "explicit path to flakefinder.config.json").option("--cwd <dir>", "working directory (where config/reports live; default: .)").option(
+    "--no-color",
+    "disable ANSI colors (also off with NO_COLOR or when output is not a terminal)"
+  ).exitOverride().hook("preAction", () => {
+    checkCwd(globals().cwd);
+  });
   const globals = () => {
     const o = program.opts();
-    return { config: o.config, cwd: o.cwd ?? process.cwd(), color: o.color !== false };
+    return { config: o.config, cwd: path8.resolve(o.cwd ?? "."), color: o.color !== false };
   };
-  program.command("init").description("detect your test runner and create flakefinder.config.json").option("--force", "overwrite an existing config").option("--runner <runner>", "explicit runner: pytest|jest|mocha|go|generic").action((opts) => {
+  program.command("init").description("detect your test runner and create flakefinder.config.json").option("--force", "overwrite an existing config").option(
+    "--runner <runner>",
+    "explicit runner: pytest|jest|mocha|go|generic (auto = detect, the default)"
+  ).action((opts) => {
     const g = globals();
     const RUNNERS = ["auto", "pytest", "jest", "mocha", "go", "generic"];
     if (opts.runner != null && !RUNNERS.includes(opts.runner)) {
@@ -5108,22 +6047,23 @@ async function main(argv) {
       exitCode = 2;
       return;
     }
-    const runner = opts.runner ?? detectRunner(g.cwd);
-    if (!runner || runner === "generic" && !opts.runner) {
+    const explicit = opts.runner === "auto" ? void 0 : opts.runner;
+    const runner = explicit ?? detectRunner(g.cwd);
+    if (runner === "generic" && !explicit) {
       console.error(
         "flakefinder: could not detect a test runner \u2014 re-run with --runner <pytest|jest|mocha|go|generic>"
       );
       exitCode = 2;
       return;
     }
-    const configPath = path7.join(g.cwd, CONFIG_FILE_NAME);
+    const configPath = path8.join(g.cwd, CONFIG_FILE_NAME);
     if (existsSync6(configPath) && !opts.force) {
       console.error(`flakefinder: ${configPath} already exists (use --force to overwrite)`);
       exitCode = 2;
       return;
     }
     const cfg = { reports: defaultReportsFor(runner), runner };
-    writeFileSync3(configPath, `${JSON.stringify(cfg, null, 2)}
+    writeFileSync4(configPath, `${JSON.stringify(cfg, null, 2)}
 `, "utf8");
     console.log(`created ${configPath} (runner: ${runner})`);
     printSetupHints(runner);
@@ -5174,21 +6114,33 @@ async function main(argv) {
         overrides.timeoutSeconds = seconds;
       }
       const cfg = resolveCfg(g, overrides);
-      const result = await runLive(command, cfg, {
-        retries: retries ?? cfg.liveRetries,
-        cwd: g.cwd,
-        applyQuarantine: opts.quarantine !== false
-      });
+      const storeWarnings = [];
+      const unsubscribe = subscribeStoreWarnings((w) => storeWarnings.push(w));
+      let result;
+      try {
+        result = await runLive(command, cfg, {
+          retries: retries ?? cfg.liveRetries,
+          cwd: g.cwd,
+          applyQuarantine: opts.quarantine !== false
+        });
+      } finally {
+        unsubscribe();
+      }
+      const printRunStoreWarnings = () => {
+        for (const w of new Set(storeWarnings)) console.warn(`flakefinder: ${w}`);
+      };
       if (result.finalExitCode === 2 && result.attempts.length === 0) {
+        printRunStoreWarnings();
         exitCode = 2;
         return;
       }
       console.log(
         renderTerminal(result.verdicts, {
-          color: g.color && process.stdout.isTTY === true,
+          color: shouldColor(g.color, process.stdout),
           flakesOnly: false
         })
       );
+      printRunStoreWarnings();
       exitCode = result.finalExitCode;
     }
   );
@@ -5208,7 +6160,7 @@ async function main(argv) {
       exitCode = 2;
       return;
     }
-    const targets = files.length > 0 ? [...new Set(files.map((f) => path7.resolve(g.cwd, f)))] : matchGlobs(g.cwd, cfg.reports);
+    const targets = files.length > 0 ? [...new Set(files.map((f) => path8.resolve(g.cwd, f)))] : matchGlobs(g.cwd, cfg.reports);
     if (targets.length === 0) {
       console.error(
         'flakefinder: no report files matched \u2014 pass files explicitly or set "reports" globs (see flakefinder init)'
@@ -5218,9 +6170,9 @@ async function main(argv) {
     }
     let runId = randomUUID2();
     if (opts.runId != null) {
-      if (!/^[0-9a-f-]{10,}$/i.test(opts.runId)) {
+      if (!RUN_ID_RE.test(opts.runId)) {
         console.error(
-          `flakefinder: --run-id must look like a UUID/identifier (got "${opts.runId}")`
+          `flakefinder: --run-id must be 1\u2013128 characters of letters, digits, '.', '_' or '-', starting with a letter or digit \u2014 e.g. a UUID or "$GITHUB_RUN_ID" (got "${escapeControlChars(opts.runId)}")`
         );
         exitCode = 2;
         return;
@@ -5234,7 +6186,7 @@ async function main(argv) {
     for (const file of targets) {
       let content;
       try {
-        content = readFileSync5(file, "utf8");
+        content = readTextFile(file);
       } catch (err) {
         console.warn(`flakefinder: cannot read ${file}: ${err.message}`);
         warnings++;
@@ -5242,7 +6194,7 @@ async function main(argv) {
       }
       const parser = detectParser(content);
       if (!parser) {
-        console.warn(`flakefinder: unrecognized report format \u2014 skipped ${file}`);
+        console.warn(`flakefinder: ${unrecognizedReason(content)} \u2014 skipped ${file}`);
         warnings++;
         continue;
       }
@@ -5261,6 +6213,13 @@ async function main(argv) {
       store.append(record);
       total += parsed.results.length;
       used++;
+    }
+    if (used === 0) {
+      console.error(
+        `flakefinder: none of the ${targets.length} report file(s) could be read and parsed \u2014 nothing ingested`
+      );
+      exitCode = 2;
+      return;
     }
     store.prune(cfg.maxRuns);
     printStoreWarnings(store);
@@ -5302,7 +6261,7 @@ async function main(argv) {
     }
     console.log(
       renderTerminal(verdicts, {
-        color: g.color && process.stdout.isTTY === true,
+        color: shouldColor(g.color, process.stdout),
         flakesOnly: opts.flakesOnly === true,
         allRows: opts.all === true,
         // table and md now agree: threshold gates suspected flakes; --all shows everything
@@ -5312,6 +6271,11 @@ async function main(argv) {
   });
   program.command("html").description("generate the self-contained HTML dashboard").option("-o, --out <file>", "output file", "flakefinder-report.html").option("--open", "open the dashboard in your browser").action((opts) => {
     const g = globals();
+    if (opts.out.trim() === "") {
+      console.error("flakefinder: html -o/--out needs a file path (got an empty string)");
+      exitCode = 2;
+      return;
+    }
     const cfg = resolveCfg(g);
     const store = storeFor(g, cfg);
     const verdicts = classifyAll(store.runs(), cfg);
@@ -5329,16 +6293,25 @@ async function main(argv) {
       verdicts,
       runs
     });
-    const out = path7.resolve(g.cwd, opts.out);
-    mkdirSync2(path7.dirname(out), { recursive: true });
-    writeFileSync3(out, html, "utf8");
+    const out = path8.resolve(g.cwd, opts.out);
+    try {
+      mkdirSync2(path8.dirname(out), { recursive: true });
+      writeFileSync4(out, html, "utf8");
+    } catch (err) {
+      const e = err;
+      console.error(
+        `flakefinder: cannot write the dashboard to ${out}${e.code === "EISDIR" ? " \u2014 it is a directory" : ` (${e.code ?? e.message})`}`
+      );
+      exitCode = 2;
+      return;
+    }
     console.log(`dashboard written \u2192 ${out} (${verdicts.length} tests, ${runs.length} runs)`);
     if (opts.open) openInBrowser(out);
   });
   program.command("quarantine").description("manage the quarantine list (tests excluded from runs)").argument("<action>", "list | add | remove | prune").argument("[testId]", "testId for add/remove").option("--reason <text>", "reason recorded with the entry", "flaky").action((action, testId, opts) => {
     const g = globals();
     const cfg = resolveCfg(g);
-    const qPath = path7.resolve(g.cwd, cfg.quarantineFile);
+    const qPath = path8.resolve(g.cwd, cfg.quarantineFile);
     const qm = new QuarantineManager(qPath);
     if (action === "list") {
       const entries = qm.list();
@@ -5349,7 +6322,7 @@ async function main(argv) {
       console.log(`${entries.length} quarantined test(s):`);
       for (const e of entries) {
         console.log(
-          `  ${e.testId}  ${e.suite} :: ${e.name}  (score ${e.flakeScore}, ${e.reason})`
+          `  ${esc(e.testId)}  ${esc(e.suite)} :: ${esc(e.name)}  (score ${e.flakeScore}, ${esc(String(e.reason))})`
         );
       }
       const runner = cfg.runner === "auto" ? detectRunner(g.cwd) : cfg.runner;
@@ -5359,7 +6332,7 @@ async function main(argv) {
         );
       } else {
         console.log(
-          `next run will add: ${exclusionArgs(runner, entries).join(" ")}`
+          `next run will add: ${esc(exclusionArgs(runner, entries).join(" "))}`
         );
       }
       return;
@@ -5374,9 +6347,9 @@ async function main(argv) {
       const v = verdicts.find((x) => x.testId === testId);
       if (!v) {
         console.error(
-          `flakefinder: testId ${testId} not in history \u2014 run "flakefinder report --format json" to list testIds`
+          `flakefinder: testId ${esc(testId)} not in history \u2014 run "flakefinder report --format json" to list testIds`
         );
-        exitCode = 2;
+        exitCode = 1;
         return;
       }
       qm.add({
@@ -5389,7 +6362,7 @@ async function main(argv) {
       });
       qm.save();
       console.log(
-        `quarantined ${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`
+        `quarantined ${esc(v.suite)} :: ${esc(v.name)} (${v.classification}, score ${v.flakeScore})`
       );
       console.log(`quarantine list: ${qPath}`);
       return;
@@ -5402,25 +6375,28 @@ async function main(argv) {
       }
       if (qm.remove(testId)) {
         qm.save();
-        console.log(`removed ${testId} from quarantine`);
+        console.log(`removed ${esc(testId)} from quarantine`);
       } else {
-        console.error(`flakefinder: ${testId} is not quarantined`);
-        exitCode = 2;
+        console.error(`flakefinder: ${esc(testId)} is not quarantined`);
+        exitCode = 1;
       }
       return;
     }
     if (action === "prune") {
       const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
       const removed = qm.prune(verdicts);
-      qm.save();
-      if (removed.length === 0) console.log("nothing to prune");
-      else {
-        console.log(`pruned ${removed.length} entr(y/ies):`);
-        for (const e of removed) console.log(`  ${e.suite} :: ${e.name}`);
+      if (removed.length === 0) {
+        console.log("nothing to prune");
+        return;
       }
+      qm.save();
+      console.log(`pruned ${removed.length} entr${removed.length === 1 ? "y" : "ies"}:`);
+      for (const e of removed) console.log(`  ${esc(e.suite)} :: ${esc(e.name)}`);
       return;
     }
-    console.error(`flakefinder: unknown quarantine action "${action}" (list|add|remove|prune)`);
+    console.error(
+      `flakefinder: unknown quarantine action "${esc(action)}" (list|add|remove|prune)`
+    );
     exitCode = 2;
   });
   program.command("ci").description(
@@ -5441,18 +6417,18 @@ async function main(argv) {
     }
     const store = storeFor(g, cfg);
     const runId = randomUUID2();
-    const commitSha = gitSha(g.cwd);
+    const commitSha = ciCommitSha(g.cwd);
     for (const file of targets) {
       let content;
       try {
-        content = readFileSync5(file, "utf8");
+        content = readTextFile(file);
       } catch (err) {
         console.warn(`flakefinder: cannot read ${file}: ${err.message}`);
         continue;
       }
       const parser = detectParser(content);
       if (!parser) {
-        console.warn(`flakefinder: unrecognized report format \u2014 skipped ${file}`);
+        console.warn(`flakefinder: ${unrecognizedReason(content)} \u2014 skipped ${file}`);
         continue;
       }
       const parsed = parser.parse(content, file);
@@ -5476,21 +6452,14 @@ async function main(argv) {
         `::warning title=flakefinder::${ghEscape(escapeControlChars(`${redact(v.suite)} :: ${redact(v.name)} (${v.classification}, score ${v.flakeScore})`))}`
       );
     }
-    const reportPath = path7.resolve(g.cwd, "flakefinder-report.json");
-    writeFileSync3(reportPath, renderJson(verdicts, cfg), "utf8");
+    const reportPath = path8.resolve(g.cwd, "flakefinder-report.json");
+    writeFileSync4(reportPath, renderJson(verdicts, cfg), "utf8");
     console.log(`json report \u2192 ${reportPath}`);
-    const snap = snapshotPath(path7.resolve(g.cwd, cfg.storeDir));
-    let previous = null;
-    if (existsSync6(snap)) {
-      try {
-        previous = JSON.parse(readFileSync5(snap, "utf8"));
-      } catch {
-        previous = null;
-      }
-    }
+    const snap = snapshotPath(path8.resolve(g.cwd, cfg.storeDir));
+    const previous = readSnapshot(snap);
     const newFlakes = computeNewFlakes(verdicts, previous);
-    mkdirSync2(path7.dirname(snap), { recursive: true });
-    writeFileSync3(snap, JSON.stringify(verdicts), "utf8");
+    mkdirSync2(path8.dirname(snap), { recursive: true });
+    writeFileSync4(snap, JSON.stringify(verdicts), "utf8");
     const gl = gitlabEnvFromProcess();
     if (gl) {
       try {
@@ -5517,19 +6486,41 @@ async function main(argv) {
   });
   program.command("doctor").description("check the setup: config, runner, reports, history, git, quarantine").action(() => {
     const g = globals();
-    const { lines, ok } = runDoctor(g.cwd);
+    const { lines, ok } = runDoctor(g.cwd, { configPath: g.config });
     const tag = { ok: "[ok]  ", warn: "[warn]", fail: "[FAIL]", info: "[info]" };
+    const color = shouldColor(g.color, process.stdout);
     for (const line of lines) {
-      const paint = line.status === "fail" ? (s) => `\x1B[31m${s}\x1B[0m` : line.status === "warn" ? (s) => `\x1B[33m${s}\x1B[0m` : (s) => s;
+      const code = line.status === "fail" ? "31" : line.status === "warn" ? "33" : null;
+      const paint = (s) => color && code ? `\x1B[${code}m${s}\x1B[0m` : s;
       console.log(`${paint(tag[line.status])} ${line.message}`);
       if (line.hint) console.log(`        ${paint("\u2192")} ${line.hint}`);
     }
     console.log(ok ? "" : "doctor: problems found (see FAIL lines above)");
     exitCode = ok ? 0 : 1;
   });
+  program.helpCommand(false);
+  program.command("help").description("display help for a command (or for flakefinder)").argument("[command]", "the command to describe").action((name) => {
+    if (name == null) {
+      program.outputHelp();
+      return;
+    }
+    const sub = program.commands.find((c) => c.name() === name || c.aliases().includes(name));
+    if (!sub) {
+      console.error(
+        `flakefinder: unknown command "${escapeControlChars(name)}" \u2014 run "flakefinder help" for the list`
+      );
+      exitCode = 2;
+      return;
+    }
+    sub.outputHelp();
+  });
   program.command("version").description("print the flakefinder version").action(() => {
     console.log(FLAKEFINDER_VERSION);
   });
+  if (!hasCommand(argv)) {
+    program.outputHelp();
+    return 0;
+  }
   try {
     await program.parseAsync(argv, { from: "user" });
   } catch (err) {
