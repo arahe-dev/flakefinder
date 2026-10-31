@@ -899,7 +899,7 @@ ${lightTokens}    }
     var tail = keep - head;
     return cps.slice(0, head).join('') + '\u2026' + cps.slice(cps.length - tail).join('');
   }
-  function shortSha(s) { return s ? String(s).slice(0, 7) : ''; }
+  function shortSha(s) { if (!s) return ''; s = String(s); var d = s.indexOf('-dirty'); return d >= 0 ? s.slice(0, 7) + ' (dirty)' : s.slice(0, 7); }
 
   // ---------- theme toggle ----------
   var themeBtn = $('ff-toggle');

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { detectRunner } from '../config.js';
 import { classifyAll } from '../engine/classify.js';
-import { detectParser } from '../parsers/index.js';
+import { detectParser, unrecognizedReason } from '../parsers/index.js';
 import {
   deselectedNodeIds,
   exclusionArgs,
@@ -671,7 +671,7 @@ export async function runLive(
         }
         const parser = detectParser(content);
         if (!parser) {
-          console.warn(`flakefinder: unrecognized report format — skipped ${file}`);
+          console.warn(`flakefinder: ${unrecognizedReason(content)} — skipped ${file}`);
           continue;
         }
         const { results, warnings } = parser.parse(content, file);

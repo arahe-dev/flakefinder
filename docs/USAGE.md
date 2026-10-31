@@ -409,11 +409,12 @@ These are stable and scriptable — gate CI on `run`'s exit code directly.
 
 Supported parsers (auto-detected per file): **JUnit XML** (pytest, jest-junit,
 surefire…; a Surefire rerun that passed after `<flakyFailure>`/`<flakyError>`,
-or a pytest-rerunfailures rerun, stays a pass but is flagged with a
-`flaky: failed k of n attempts` message and a warning; `<skipped>` +
+or a pytest-rerunfailures rerun, stays a pass flagged with a
+`flaky: failed k of n attempts` message and is **scored as a retry rescue**
+(its per-attempt results are recorded in `attempts`); `<skipped>` +
 `<failure>` (a failing TODO) is a skip), **Jest JSON** (jest + vitest; a test that passed only on a retry —
 `retryTimes`/vitest `retry` — stays a pass flagged `flaky: failed k of n
-attempts` plus a warning, as does a mocha test with `currentRetry` > 0; a file that failed outside any test — e.g.
+attempts` and is scored as a retry rescue, as is a mocha test with `currentRetry` > 0; a file that failed outside any test — e.g.
 an `afterAll` that threw — is recorded as a `(suite)` failure; vitest's
 fractional durations are rounded to whole milliseconds), **Mocha JSON** (`--reporter json` or mochawesome; statuses matched
 per file + full title; a failing `before`/`after` hook is recorded as a
@@ -703,7 +704,8 @@ safely; readers tolerate legacy header-less stores (v0.1.x files) unchanged.
   retry-rescue detection possible
 - `source` — `live` (from `run`), `report` (from `ingest`), `action` (GitHub Action)
 - `attempt` — 1-based; > 1 means a retry at the same code state
-- `commitSha` — best-effort `git rev-parse HEAD` at ingest time
+- `commitSha` — best-effort `git rev-parse HEAD` at ingest time (`run` on a
+  tree with uncommitted tracked changes records `<HEAD>-dirty-<hash>`)
 
 Pruning: after each append the store is atomically rewritten (tmp + rename)
 to the last `maxRuns` runs (default 300) — distinct `runId`s, not lines:

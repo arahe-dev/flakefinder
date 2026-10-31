@@ -319,7 +319,8 @@ reports (jest-junit config / `pytest --junitxml=...` / `go test -json > test-out
    are ignored (close-race guard).
 3. After each attempt: hash report files again; new-or-changed files are parsed
    (`detectParser`), results → `RunRecord` with the SAME `runId` across attempts, `attempt`
-   set, `source: 'live'`, best-effort `commitSha` via `git rev-parse HEAD` (absent → undefined).
+   set, `source: 'live'`, best-effort `commitSha` via `git rev-parse HEAD` (absent → undefined; a dirty tracked tree
+   records `<HEAD>-dirty-<12-hex content hash>` so uncommitted edits never count as same-SHA flips).
 4. Append all records to `HistoryStore`, then `classifyAll`.
 5. `suiteFlake` fallback: if zero report files ever matched, classify the SUITE: attempts with
    differing exit codes → print warning + suite-level flake verdict (no per-test data).
