@@ -1,11 +1,19 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { detectRunner } from '../config.js';
 import { classifyAll } from '../engine/classify.js';
 import { detectParser } from '../parsers/index.js';
-import { exclusionArgs, QuarantineManager } from '../quarantine/manager.js';
+import {
+  deselectedNodeIds,
+  exclusionArgs,
+  PYTEST_EXACT_PLUGIN_MODULE,
+  PYTEST_EXACT_PLUGIN_SOURCE,
+  pytestExactDeselectEnv,
+  QuarantineManager,
+} from '../quarantine/manager.js';
 import { HistoryStore } from '../store/history-store.js';
 import type {
   QuarantineEntry,
@@ -15,6 +23,7 @@ import type {
   TestVerdict,
 } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
+import { readTextFile } from '../util/read-text.js';
 import { failedNamesOf, failedOnlyArgs } from './adapters.js';
 import { detectCodeState } from './git-state.js';
 
@@ -108,15 +117,8 @@ function commandBase(token: string): string {
     .replace(/\.(?:cmd|exe|bat)$/, '');
 }
 
-/**
- * The shell segment that holds the test runner: `cmd` is its command word
- * (after any leading `VAR=value` assignments), `end` the first operator
- * after it (a redirect or the next control operator) or the command's end.
- * `cd app && npx jest` → the `npx jest` segment, not `cd`. Preference: a
- * segment naming a known runner/wrapper, then one started by node/python,
- * then the first segment.
- */
-export function runnerSegment(command: string[]): { cmd: number; end: number } {
+/** Every simple command of a shell command line: its command word and end (see runnerSegment). */
+function shellSegments(command: string[]): Array<{ cmd: number; end: number }> {
   const segments: Array<{ cmd: number; end: number }> = [];
   let start = 0;
   for (let i = 0; i <= command.length; i++) {
@@ -128,6 +130,65 @@ export function runnerSegment(command: string[]): { cmd: number; end: number } {
     if (cmd < end) segments.push({ cmd, end });
     start = i + 1;
   }
+  return segments;
+}
+
+/** Shell builtins / keywords that never resolve on PATH (POSIX sh and cmd.exe). */
+const SHELL_BUILTINS = new Set([
+  ...['.', ':', '[', 'alias', 'break', 'cd', 'command', 'continue', 'eval', 'exec', 'exit'],
+  ...['export', 'false', 'getopts', 'hash', 'pwd', 'read', 'readonly', 'return', 'set'],
+  ...['shift', 'source', 'test', 'times', 'trap', 'true', 'type', 'ulimit', 'umask'],
+  ...['unalias', 'unset', 'wait', 'echo', 'printf', 'if', 'then', 'else', 'fi', 'for'],
+  ...['while', 'do', 'done', 'case', 'esac', '!', '{', '}', '(', ')', 'call', 'copy'],
+  ...['del', 'dir', 'md', 'mkdir', 'move', 'rd', 'ren', 'rmdir', 'setlocal', 'type', 'ver'],
+]);
+
+/** Can `word` be resolved as a command from `cwd` (path, PATH lookup, or builtin)? */
+export function commandResolvable(
+  word: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (SHELL_BUILTINS.has(platform === 'win32' ? word.toLowerCase() : word)) return true;
+  // anything the shell would expand or that we cannot judge statically
+  if (/[$`*?~{(]/.test(word)) return true;
+  const exts =
+    platform === 'win32'
+      ? ['', ...(env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)]
+      : [''];
+  const isFile = (p: string): boolean => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (/[\\/]/.test(word)) return exts.some((e) => isFile(path.resolve(cwd, word + e)));
+  const dirs = (env.PATH ?? env.Path ?? '').split(platform === 'win32' ? ';' : ':');
+  if (platform === 'win32') dirs.unshift(cwd);
+  return dirs.some((d) => d !== '' && exts.some((e) => isFile(path.join(d, word + e))));
+}
+
+/** The first command word of `command` that the shell cannot resolve, if any. */
+export function missingCommandWord(command: string[], cwd: string): string | undefined {
+  for (const seg of shellSegments(command)) {
+    const word = command[seg.cmd]!;
+    if (!commandResolvable(word, cwd)) return word;
+  }
+  return undefined;
+}
+
+/**
+ * The shell segment that holds the test runner: `cmd` is its command word
+ * (after any leading `VAR=value` assignments), `end` the first operator
+ * after it (a redirect or the next control operator) or the command's end.
+ * `cd app && npx jest` → the `npx jest` segment, not `cd`. Preference: a
+ * segment naming a known runner/wrapper, then one started by node/python,
+ * then the first segment.
+ */
+export function runnerSegment(command: string[]): { cmd: number; end: number } {
+  const segments = shellSegments(command);
   const words = (seg: { cmd: number; end: number }) =>
     command.slice(seg.cmd, seg.end).map(commandBase);
   return (
@@ -172,18 +233,76 @@ export function insertRunnerArgs(command: string[], args: string[]): string[] {
  * workers — not just the direct child (killing only `npm` orphans the rest,
  * which keep running and, holding the inherited stdio, keep the attempt from
  * ever closing). Windows has no process groups; taskkill /T walks the tree.
+ *
+ * Exception: when OUR stdin is a terminal the child stays in our (foreground)
+ * process group and inherits stdin, so watch modes, prompts and debuggers can
+ * read the terminal — a background group reading it would be stopped by
+ * SIGTTIN. Such a child's tree is found by walking parent pids (`ps`), and
+ * a terminal Ctrl-C reaches it directly (it is in the foreground group).
  */
 const USE_PROCESS_GROUP = process.platform !== 'win32';
 
-/** Send `signal` to the child's process group, falling back to the child alone. */
-function signalTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
-  if (child.pid === undefined) return;
-  if (USE_PROCESS_GROUP) {
+/** Children spawned into their own process group (signalled via -pid). */
+const groupLeaders = new WeakSet<ReturnType<typeof spawn>>();
+
+/** Shares the terminal: POSIX with a TTY stdin (see above). */
+function interactiveStdin(): boolean {
+  return USE_PROCESS_GROUP && process.stdin.isTTY === true;
+}
+
+/** `pid` and all its descendants (POSIX, via `ps`); just `pid` when ps is unavailable. */
+export function processTree(pid: number): number[] {
+  const r = spawnSync('ps', ['-A', '-o', 'pid=', '-o', 'ppid='], {
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  if (r.status !== 0 || typeof r.stdout !== 'string') return [pid];
+  const children = new Map<number, number[]>();
+  for (const line of r.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!m) continue;
+    const [c, p] = [Number(m[1]), Number(m[2])];
+    const list = children.get(p);
+    if (list) list.push(c);
+    else children.set(p, [c]);
+  }
+  const out = [pid];
+  for (let i = 0; i < out.length; i++) {
+    for (const c of children.get(out[i]!) ?? []) if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Send `signal` to the child's whole tree: its process group when it leads
+ * one, else every pid in `known` plus its current descendants. Returns the
+ * pids signalled, so an escalation can still reach descendants that were
+ * re-parented once their parent died.
+ */
+function signalTree(
+  child: ReturnType<typeof spawn>,
+  signal: NodeJS.Signals,
+  known: number[] = [],
+): number[] {
+  if (child.pid === undefined) return known;
+  if (groupLeaders.has(child)) {
     try {
       process.kill(-child.pid, signal);
-      return;
+      return known;
     } catch {
       // group already gone (ESRCH) or not ours — try the direct child
+    }
+  }
+  const alive = child.exitCode === null && child.signalCode === null;
+  const pids = [
+    ...new Set([...(alive && USE_PROCESS_GROUP ? processTree(child.pid) : []), ...known]),
+  ];
+  for (const pid of pids) {
+    if (pid === child.pid) continue;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // already exited
     }
   }
   try {
@@ -191,12 +310,13 @@ function signalTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): vo
   } catch {
     // already exited
   }
+  return pids;
 }
 
 /**
  * Kill a child and its whole process tree, cross-platform. POSIX sends
  * `signal` (SIGTERM for timeouts; Ctrl-C forwards SIGINT so runners can
- * clean up) to the process group, escalating to SIGKILL after 3s.
+ * clean up) to the tree, escalating to SIGKILL after 3s.
  */
 function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = 'SIGTERM'): void {
   if (child.pid === undefined) return;
@@ -206,10 +326,32 @@ function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = 'SIG
     if (r.error || r.status !== 0) child.kill();
     return;
   }
-  signalTree(child, signal);
-  const escalated = setTimeout(() => signalTree(child, 'SIGKILL'), 3000);
+  const pids = signalTree(child, signal);
+  const escalated = setTimeout(() => signalTree(child, 'SIGKILL', pids), 3000);
   escalated.unref();
 }
+
+/**
+ * Ctrl-C handling. A child in its own group never sees the terminal's SIGINT,
+ * so it is forwarded at once. An interactive child (same group) already got
+ * the terminal's SIGINT: a second one would abort runners' own cleanup
+ * (pytest/jest treat a repeated Ctrl-C as "abort now"), so it gets a grace
+ * period, then SIGTERM — which also covers a SIGINT sent to flakefinder
+ * alone (`kill -INT`).
+ */
+function interruptTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (signal !== 'SIGINT' || groupLeaders.has(child) || process.platform === 'win32') {
+    killTree(child, signal);
+    return;
+  }
+  const grace = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) killTree(child, 'SIGTERM');
+  }, INTERRUPT_GRACE_MS);
+  grace.unref();
+}
+
+/** How long an interactive child may take to exit on its own after Ctrl-C. */
+export const INTERRUPT_GRACE_MS = 2000;
 
 /**
  * Sentinel resolved by spawnCommand when the command could not be started at
@@ -226,6 +368,7 @@ function spawnCommand(
   cwd: string,
   timeoutSeconds: number | null,
   currentChild: { ref: ReturnType<typeof spawn> | null },
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
   const shellArgv = shellArgvFor(command, cwd);
   return new Promise((resolve) => {
@@ -243,18 +386,15 @@ function spawnCommand(
       let timedOut = false;
       let child: ReturnType<typeof spawn>;
       try {
+        const ownGroup = USE_PROCESS_GROUP && !interactiveStdin();
         child = spawn(argv[0]!, argv.slice(1), {
           shell: useShell,
           cwd,
-          detached: USE_PROCESS_GROUP,
-          // a background process group that reads the terminal is stopped
-          // (SIGTTIN) — test runs get EOF on stdin instead of hanging
-          stdio: [
-            USE_PROCESS_GROUP && process.stdin.isTTY ? 'ignore' : 'inherit',
-            'inherit',
-            'inherit',
-          ],
+          env,
+          detached: ownGroup,
+          stdio: 'inherit',
         });
+        if (ownGroup) groupLeaders.add(child);
       } catch (err) {
         // synchronous EINVAL for Windows batch shims without a shell
         if (!useShell) {
@@ -300,10 +440,20 @@ function spawnCommand(
       });
       child.on('close', (code) => {
         if (abandoned) return; // superseded by the shell fallback
-        if (useShell && directNotFound && code === SHELL_NOT_FOUND && !timedOut) {
+        // "not found" from the shell: the command could not start at all —
+        // when the direct spawn already said ENOENT, or when a command word
+        // of the line genuinely resolves nowhere (a test script that itself
+        // exits 127 must stay a test failure)
+        const missing =
+          useShell && code === SHELL_NOT_FOUND && !timedOut
+            ? directNotFound
+              ? command[0]!
+              : missingCommandWord(command, cwd)
+            : undefined;
+        if (missing !== undefined) {
           if (timer) clearTimeout(timer);
           console.error(
-            `flakefinder: command not found: ${command[0]!} — is it installed and on PATH?`,
+            `flakefinder: command not found: ${missing} — is it installed and on PATH?`,
           );
           done(SPAWN_FAILED);
           return;
@@ -348,12 +498,14 @@ export async function runLive(
   let quarantineFlags: string[] = [];
   let quarantinedNames: string[] = [];
   let quarantinedIds = new Set<string>();
+  let exactDeselect: { env: NodeJS.ProcessEnv; dir: string } | null = null;
   if (opts.applyQuarantine) {
     const entries = loadQuarantine(path.resolve(cwd, cfg.quarantineFile));
     quarantinedIds = new Set(entries.map((e) => e.testId));
     if (runner === 'pytest' || runner === 'jest' || runner === 'mocha') {
       if (entries.length > 0) {
         quarantineFlags = exclusionArgs(runner, entries, cwd);
+        if (runner === 'pytest') exactDeselect = setUpExactDeselect(quarantineFlags);
         quarantinedNames = entries.map((e) => e.name);
         console.log(
           `flakefinder: quarantine active — excluding ${entries.length} quarantined test(s) via runner flags`,
@@ -387,7 +539,7 @@ export async function runLive(
   // reaches only us: forward the signal to the whole tree ourselves
   const onInterrupt = (signal: NodeJS.Signals): void => {
     interrupted = true;
-    if (currentChild.ref) killTree(currentChild.ref, signal);
+    if (currentChild.ref) interruptTree(currentChild.ref, signal);
   };
   process.on('SIGINT', onInterrupt);
   process.on('SIGTERM', onInterrupt);
@@ -408,7 +560,7 @@ export async function runLive(
         if (runner === 'pytest' && targeted) {
           // --lf needs pytest's cache plugin; without it pytest rejects the
           // flag (usage error) on every retry
-          if (pytestCacheDisabled(command)) targeted = null;
+          if (pytestCacheDisabled(command, cwd)) targeted = null;
           // --lf alone would drop attempt 1's --deselect flags, and pytest's
           // "no previously failed tests" fallback runs EVERYTHING
           else targeted = [...quarantineFlags, ...targeted];
@@ -424,7 +576,7 @@ export async function runLive(
           note = `targeted: re-running ${failed.length} failed test(s)`;
         } else if (failed.length === 0) {
           note = 'full re-run (no failures recorded)';
-        } else if (runner === 'pytest' && pytestCacheDisabled(command)) {
+        } else if (runner === 'pytest' && pytestCacheDisabled(command, cwd)) {
           note = 'full re-run (-p no:cacheprovider disables pytest --lf)';
         } else {
           if (cfg.retryMode === 'failed') {
@@ -458,7 +610,13 @@ export async function runLive(
           `flakefinder: attempt ${attempt}/${maxAttempts}${note ? ` (${note})` : ''} → ${truncateForLog(built.join(' '))}`,
         ),
       );
-      let code = await spawnCommand(built, cwd, cfg.timeoutSeconds, currentChild);
+      let code = await spawnCommand(
+        built,
+        cwd,
+        cfg.timeoutSeconds,
+        currentChild,
+        exactDeselect?.env,
+      );
       if (code === SPAWN_FAILED) {
         if (attempt === 1) {
           // nothing ran, so there is nothing to record or classify: this is a
@@ -487,18 +645,16 @@ export async function runLive(
 
       const after = snapshotReports(cwd, cfg, snapshot);
       for (const [file, stamp] of after) {
-        // Attempt 1: skip files that already existed pre-run with identical
-        // content (stale reports from a previous job). Attempts 2+: ingest
-        // every file the attempt WROTE — new, or mtime/size/content changed
-        // since the previous attempt. A byte-identical rewrite still counts
-        // (its mtime moves: a fail-fail-pass retry with a deterministic report
-        // must be detected), but a file nobody touched — a stale report from
-        // another job, or attempt N-1's report when attempt N crashed before
-        // writing — is not a new observation.
+        // Every attempt ingests exactly the files it WROTE — new, or
+        // mtime/size/content changed since the previous snapshot (taken
+        // before the attempt). A byte-identical rewrite still counts, on
+        // attempt 1 too: its mtime moves (a deterministic report generator
+        // re-run is a real run; a fail-fail-pass retry with identical
+        // failure reports must be detected). A file nobody touched — a stale
+        // report from a previous job, or attempt N-1's report when attempt N
+        // crashed before writing — is not a new observation.
         const prev = snapshot.get(file);
-        if (attempt === 1 && prev?.sha === stamp.sha) continue;
         if (
-          attempt > 1 &&
           prev !== undefined &&
           prev.mtimeMs === stamp.mtimeMs &&
           prev.size === stamp.size &&
@@ -508,7 +664,7 @@ export async function runLive(
         }
         let content: string;
         try {
-          content = readFileSync(file, 'utf8');
+          content = readTextFile(file);
         } catch (err) {
           console.warn(`flakefinder: cannot read report ${file}: ${(err as Error).message}`);
           continue;
@@ -536,6 +692,7 @@ export async function runLive(
       if (code === 0) break;
     }
   } finally {
+    if (exactDeselect) rmSync(exactDeselect.dir, { recursive: true, force: true });
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onInterrupt);
   }
@@ -698,14 +855,111 @@ function loadQuarantine(file: string): QuarantineEntry[] {
   }
 }
 
-/** `-p no:cacheprovider` (any spelling) disables pytest's cache, and with it --lf. */
-export function pytestCacheDisabled(command: string[]): boolean {
-  return command.some(
+/**
+ * pytest `--deselect` is a node-id prefix match: write the exact-deselect
+ * plugin to a temp dir and return the env that loads it (see
+ * PYTEST_EXACT_PLUGIN_SOURCE). Null — plain prefix `--deselect` — when the
+ * temp dir cannot be written.
+ */
+function setUpExactDeselect(flags: string[]): { env: NodeJS.ProcessEnv; dir: string } | null {
+  const ids = deselectedNodeIds(flags);
+  if (ids.length === 0) return null;
+  try {
+    const dir = mkdtempSync(path.join(tmpdir(), 'flakefinder-pytest-'));
+    writeFileSync(path.join(dir, `${PYTEST_EXACT_PLUGIN_MODULE}.py`), PYTEST_EXACT_PLUGIN_SOURCE);
+    return { env: pytestExactDeselectEnv(ids, dir), dir };
+  } catch {
+    return null;
+  }
+}
+
+/** `-p no:cacheprovider` in an argv / addopts token list. */
+function argvDisablesCache(tokens: string[]): boolean {
+  return tokens.some(
     (t, i) =>
       t === '-pno:cacheprovider' ||
       t === '-p=no:cacheprovider' ||
-      (t === 'no:cacheprovider' && command[i - 1] === '-p'),
+      (t === 'no:cacheprovider' && tokens[i - 1] === '-p'),
   );
+}
+
+/** pytest config files in pytest's precedence order, with their section headers. */
+const PYTEST_CONFIGS: Array<{ file: string; section: RegExp }> = [
+  { file: 'pytest.ini', section: /^\[pytest\]\s*$/ },
+  { file: '.pytest.ini', section: /^\[pytest\]\s*$/ },
+  { file: 'pyproject.toml', section: /^\[tool\.pytest(?:\.ini_options)?\]\s*$/ },
+  { file: 'tox.ini', section: /^\[pytest\]\s*$/ },
+  { file: 'setup.cfg', section: /^\[tool:pytest\]\s*$/ },
+];
+
+/** The text of the pytest section of a config file, or null when it has none. */
+function pytestSection(text: string, header: RegExp): string | null {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => header.test(l.trim()));
+  if (start < 0) return null;
+  const body: string[] = [];
+  for (const l of lines.slice(start + 1)) {
+    if (/^\[[^\]]+\]\s*$/.test(l)) break; // next section header (column 0)
+    if (/^\s*[#;]/.test(l)) continue; // comment line
+    body.push(l);
+  }
+  return body.join('\n');
+}
+
+function readIfFile(file: string): string | null {
+  try {
+    return statSync(file).isFile() ? readTextFile(file) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Does the pytest config `text` (section body) put `-p no:cacheprovider` in its addopts? */
+function sectionDisablesCache(section: string): boolean {
+  return /-p\s*["',\s]*=?\s*["']?no:cacheprovider/.test(section);
+}
+
+/**
+ * `-p no:cacheprovider` disables pytest's cache, and with it --lf. Checked in
+ * the command, in PYTEST_ADDOPTS, and in the addopts of the pytest config
+ * file pytest would use: `-c`/`--config-file`, else the first of
+ * pytest.ini / pyproject.toml / tox.ini / setup.cfg with a pytest section,
+ * from `cwd` upward (stopping at the repository root).
+ */
+export function pytestCacheDisabled(
+  command: string[],
+  cwd?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (argvDisablesCache(command)) return true;
+  if (argvDisablesCache((env.PYTEST_ADDOPTS ?? '').split(/\s+/).filter(Boolean))) return true;
+  if (cwd === undefined) return false;
+  let explicit: string | undefined;
+  command.forEach((t, i) => {
+    if ((t === '-c' || t === '--config-file') && command[i + 1]) explicit = command[i + 1];
+    else if (t.startsWith('--config-file=')) explicit = t.slice('--config-file='.length);
+  });
+  if (explicit !== undefined) {
+    const text = readIfFile(path.resolve(cwd, explicit));
+    if (text === null) return false;
+    const header = PYTEST_CONFIGS.find((c) => explicit!.endsWith(c.file))?.section;
+    const section = header ? pytestSection(text, header) : null;
+    return sectionDisablesCache(section ?? text);
+  }
+  let dir = path.resolve(cwd);
+  for (;;) {
+    for (const { file, section: header } of PYTEST_CONFIGS) {
+      const text = readIfFile(path.join(dir, file));
+      if (text === null) continue;
+      const section = pytestSection(text, header);
+      // pytest.ini is THE config even without a [pytest] section
+      if (section !== null) return sectionDisablesCache(section);
+      if (file === 'pytest.ini' || file === '.pytest.ini') return false;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir || existsSync(path.join(dir, '.git'))) return false;
+    dir = parent;
+  }
 }
 
 /**

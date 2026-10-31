@@ -112,14 +112,15 @@ stopping early on exit 0. The command is spawned **directly** (no shell) —
 arguments pass through verbatim, including spaces and special characters.
 Commands containing shell operators (`>`, `|`, `&&`) automatically fall back
 to shell mode so redirects keep working. After each attempt it parses the
-report files that **changed** (attempt 1 ingests only files created/changed
-since the invocation started — stale reports from previous runs are ignored)
-and records them as attempts of one run. Retry attempts record every report
-the attempt **wrote** — a byte-identical rewrite still counts (its mtime
-moves), so a fail-fail-pass sequence with a deterministic report is detected
-as a rescue — while files nobody touched (stale reports from another job, or
-the previous attempt's report when a retry crashed before writing) are not
-recorded again.
+report files that **changed** and records them as attempts of one run. Every
+attempt records exactly the reports it **wrote** — new files, or files whose
+mtime, size or content changed since before the attempt. A byte-identical
+rewrite still counts (its mtime moves): a deterministic report generator is
+recorded on every run, and a fail-fail-pass sequence with identical failure
+reports is detected as a rescue. Files nobody touched — stale reports from a
+previous job, or the previous attempt's report when a retry crashed before
+writing — are ignored. Reports are decoded as UTF-8 or UTF-16 (with a BOM,
+as PowerShell 5.1's `>` writes them).
 Then it classifies and prints a terminal report restricted to the tests
 observed in this invocation.
 
@@ -150,9 +151,12 @@ still compares like with like, so a real flake on your edits is caught.
   and the retry loop proceeds. Default: config `timeoutSeconds`, itself
   unlimited. SIGINT/SIGTERM (Ctrl-C) are forwarded to the current tree, stop
   the loop, and exit 130 while keeping everything observed so far in history.
-  On POSIX each attempt runs in its own process group (that is how the whole
-  tree is reached), so when stdin is a terminal the test command gets an empty
-  stdin — interactive/watch modes are not supported under `run`.
+  When stdin is a terminal, the test command inherits it and shares the
+  terminal (watch modes, prompts and debuggers work); the whole tree is still
+  killed on timeout, and Ctrl-C reaches it directly — flakefinder only steps
+  in (SIGTERM, then SIGKILL) if it hasn't exited 2 s later. Otherwise (CI,
+  piped stdin) each attempt runs in its own process group so the tree can be
+  signalled as one.
 - `--retry-mode auto|failed|full` — retry strategy (default: config `retryMode`,
   itself default `auto`). `auto`: attempt 1 runs everything; each re-run
   executes **only the tests that failed on the previous attempt** (a test that
@@ -173,8 +177,10 @@ a rescue. Two implementation notes: targeted selectors match failed test
 names as space-delimited final segments of the full name (a failure named
 `update` does not drag in `math re-update`), and quarantined tests are
 excluded from re-runs even on name collisions (pytest `--lf` retries keep the
-`--deselect` flags; with `-p no:cacheprovider` on the command line `--lf` is
-unavailable, so pytest retries are full re-runs). pytest's `--lf` trusts pytest's
+`--deselect` flags; with `-p no:cacheprovider` — on the command line, in
+`PYTEST_ADDOPTS`, or in the `addopts` of your pytest.ini / pyproject.toml /
+tox.ini / setup.cfg — `--lf` is unavailable, so pytest retries are full
+re-runs). pytest's `--lf` trusts pytest's
 own last-failed cache — a stale cache from a *manual* pytest run outside
 flakefinder could re-run a quarantined test once; clear it with
 `pytest --cache-clear` if that ever bites. If your command already passes
@@ -190,6 +196,18 @@ flags are appended automatically (with a notice); see
 If **no** report files match, per-test detection is impossible; flakefinder
 falls back to a suite-level verdict from the attempt exit codes and warns
 accordingly.
+
+**Exit status through pipes.** flakefinder sees the exit status of your
+whole command line. In shell mode `npx jest 2>&1 | tee out.txt` reports
+`tee`'s status (0), so a failing attempt looks green and is never retried.
+Wrap it so the pipeline fails when the test command does, e.g.
+`run -- bash -o pipefail -c 'npx jest 2>&1 | tee out.txt'` (or set
+`set -o pipefail` in the CI step that runs it).
+
+**A command that cannot be found** — a misspelled binary, also inside a
+shell-mode command line such as `nosuch-tool > out.txt` — exits 2 after one
+attempt with `command not found: …`; nothing is retried or recorded. A test
+script that itself exits 127 is still an ordinary failure.
 
 ### `ingest`
 
@@ -479,9 +497,14 @@ Per runner:
   back to a rootdir-relative node id (`tests/test_x.py::TestCls::test_y`):
   the module is the longest dotted prefix that exists as a `.py` file,
   falling back to "trailing Capitalized components are classes". pytest
-  skips those node ids; the rest of the suite runs normally. Note that pytest
-  matches `--deselect` as a node-id *prefix*, so quarantining `test_mod` also
-  deselects a sibling named `test_mod2` in the same module/class.
+  skips those node ids; the rest of the suite runs normally. pytest itself
+  matches `--deselect` as a node-id *prefix* (quarantining `test_mod` would
+  also drop `test_mod2`), so `run` also loads a tiny temporary plugin (via
+  `PYTEST_PLUGINS`/`PYTHONPATH`) that deselects exactly the quarantined ids
+  and their parametrizations (`test_mod[...]`) — `test_mod2` keeps running,
+  and your own `--deselect` flags keep pytest's usual meaning. If a wrapper
+  strips the environment (e.g. tox without `pass_env`), the plain
+  `--deselect` prefix match still applies.
 - **Jest** — a single `-t "<pattern>"` where pattern is
   `^(?!(?:.* )?(?:name1|name2)\s*$)` (names regex-escaped, deduped): a negative
   lookahead that matches every test name *except* the quarantined ones, so
