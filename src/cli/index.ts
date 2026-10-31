@@ -35,6 +35,7 @@ import { FLAKEFINDER_VERSION } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
 import { redact } from '../util/redact.js';
 import { parseStrictInt } from '../util/strict-int.js';
+import { shouldColor } from './color.js';
 
 interface Globals {
   config?: string;
@@ -171,7 +172,7 @@ export async function main(argv: string[]): Promise<number> {
     .version(FLAKEFINDER_VERSION)
     .option('--config <path>', 'explicit path to flakefinder.config.json')
     .option('--cwd <dir>', 'working directory (where config/reports live; default: .)')
-    .option('--no-color', 'disable ANSI colors')
+    .option('--no-color', 'disable ANSI colors (also off with NO_COLOR or when output is not a terminal)')
     .exitOverride()
     // every command resolves paths against --cwd: validate it once, up front
     .hook('preAction', () => {
@@ -296,7 +297,7 @@ export async function main(argv: string[]): Promise<number> {
         }
         console.log(
           renderTerminal(result.verdicts, {
-            color: g.color && process.stdout.isTTY === true,
+            color: shouldColor(g.color, process.stdout),
             flakesOnly: false,
           }),
         );
@@ -434,7 +435,7 @@ export async function main(argv: string[]): Promise<number> {
       }
       console.log(
         renderTerminal(verdicts, {
-          color: g.color && process.stdout.isTTY === true,
+          color: shouldColor(g.color, process.stdout),
           flakesOnly: opts.flakesOnly === true,
           allRows: opts.all === true,
           // table and md now agree: threshold gates suspected flakes; --all shows everything
@@ -688,15 +689,12 @@ export async function main(argv: string[]): Promise<number> {
     .description('check the setup: config, runner, reports, history, git, quarantine')
     .action(() => {
       const g = globals();
-      const { lines, ok } = runDoctor(g.cwd);
+      const { lines, ok } = runDoctor(g.cwd, { configPath: g.config });
       const tag = { ok: '[ok]  ', warn: '[warn]', fail: '[FAIL]', info: '[info]' };
+      const color = shouldColor(g.color, process.stdout);
       for (const line of lines) {
-        const paint =
-          line.status === 'fail'
-            ? (s: string) => `[31m${s}[0m`
-            : line.status === 'warn'
-              ? (s: string) => `[33m${s}[0m`
-              : (s: string) => s;
+        const code = line.status === 'fail' ? '31' : line.status === 'warn' ? '33' : null;
+        const paint = (s: string): string => (color && code ? `\x1b[${code}m${s}\x1b[0m` : s);
         console.log(`${paint(tag[line.status])} ${line.message}`);
         if (line.hint) console.log(`        ${paint('→')} ${line.hint}`);
       }

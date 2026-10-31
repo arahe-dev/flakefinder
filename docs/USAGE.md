@@ -76,7 +76,7 @@ Global options, valid before any command:
 |---|---|
 | `--config <path>` | Use this config file instead of auto-discovery (a relative path resolves against `--cwd`) |
 | `--cwd <dir>` | Working directory for config, reports, and store (default: `.`). Must be an existing directory — otherwise every command exits `2` |
-| `--no-color` | Disable ANSI colors |
+| `--no-color` | Disable ANSI colors. Colors are also off when the `NO_COLOR` environment variable is set (non-empty) or when output is not a terminal — the same rule for every command |
 
 Config discovery: `flakefinder.config.json` in `--cwd`, walking up to 3 parent
 levels. JSONC (comments) is allowed. Relative `storeDir` and `quarantineFile`
@@ -254,9 +254,12 @@ $ npx flakefinder doctor
 
 Checks the whole setup in one pass: config validity, detected runner, report
 files actually matching the globs, history size/freshness/corruption, git
-metadata availability, quarantine health. Each line is `[ok]`/`[warn]`/
-`[FAIL]`/`[info]` with an actionable hint where relevant. Exit `1` when any
-check FAILed — safe to gate CI or a setup script on it.
+metadata availability, quarantine health. It checks exactly what the other
+commands would use: the `--config` file when one is given (a missing or
+invalid one is a FAIL), and the configured `storeDir` and `quarantineFile`.
+Each line is `[ok]`/`[warn]`/`[FAIL]`/`[info]` with an actionable hint where
+relevant. Exit `1` when any check FAILed — safe to gate CI or a setup script
+on it.
 
 ### `quarantine`
 

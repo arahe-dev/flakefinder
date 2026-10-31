@@ -392,3 +392,23 @@ describe('--config resolves against --cwd (QA CLI-25)', () => {
     expect(r.stderr).not.toMatch(/TypeError/);
   });
 });
+
+describe('doctor honours --config and color settings (QA CLI-9/CLI-13)', () => {
+  it('doctor --config bad.json exits 1 with a FAIL line', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'bad.json'), '{ "runner": "Jest" }', 'utf8');
+    const r = cli(['--config', 'bad.json', 'doctor'], d);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('[FAIL]');
+    expect(r.stdout).toContain('did you mean "jest"?');
+  });
+
+  it('piped doctor output carries no ANSI escapes even without NO_COLOR', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "runner": 1 }', 'utf8');
+    const r = cli(['doctor'], d, { NO_COLOR: undefined });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('[FAIL]');
+    expect(r.stdout).not.toContain('\x1b[');
+  });
+});
