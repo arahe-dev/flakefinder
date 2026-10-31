@@ -343,23 +343,48 @@ or a pytest-rerunfailures rerun, stays a pass but is flagged with a
 `<failure>` (a failing TODO) is a skip), **Jest JSON** (jest + vitest; a test that passed only on a retry —
 `retryTimes`/vitest `retry` — stays a pass flagged `flaky: failed k of n
 attempts` plus a warning, as does a mocha test with `currentRetry` > 0; a file that failed outside any test — e.g.
-an `afterAll` that threw — is recorded as a `(suite)` failure), **Mocha JSON** (`--reporter json` or mochawesome; statuses matched
+an `afterAll` that threw — is recorded as a `(suite)` failure; vitest's
+fractional durations are rounded to whole milliseconds), **Mocha JSON** (`--reporter json` or mochawesome; statuses matched
 per file + full title; a failing `before`/`after` hook is recorded as a
 failure named e.g. `"before all" hook`), **`go test -json`**
 (NDJSON; with `-count=N` a test that failed in any run is reported as a fail,
 noted `flaky: failed k of n runs` when other runs passed; a parent test with
-`t.Run` subtests is only reported when it failed on its own; build failures —
+`t.Run` subtests is only reported when it failed on its own; messages drop
+go's `=== RUN`/`--- FAIL:` framing lines and a passing test carries no
+message; build failures —
 go 1.24 `build-fail` events or compiler errors on merged stderr — become
 warnings), **TAP** (node:test `--test-reporter=tap`, plain TAP13/14, and headerless
 TAP12 from Perl/prove/bats when every line is TAP-shaped; nested
 subtests — by indentation, with or without `# Subtest:` headers — become
 `ancestor > …` suites, a parent is only reported when it failed on its own,
 `# SKIP`/`# TODO` map to skip, multi-line YAML `error: |-` diagnostics and
-`duration_ms` are read), and **TRX**
+`duration_ms` are read), **TRX**
 (.NET `dotnet test --logger trx`; suite = the test class name, joined by
 test id so same-named methods in different classes stay distinct;
 Timeout → fail, Error/Aborted → error, NotExecuted/Inconclusive → skip;
-data-driven rows are reported individually).
+data-driven rows are reported individually), **Playwright JSON**
+(`--reporter=json`; the same test ids as Playwright's JUnit reporter —
+suite = spec file, name = `describe › title`; the browser projects of one
+test are folded into one result in which a failure in any project wins,
+prefixed `[project]`; a pass that needed a retry is flagged `flaky: failed k
+of n attempts`; `test.fail()` that failed is a pass; errors outside any
+test become a `playwright :: (global)` error), and **pytest-json-report**
+(`pytest --json-report`; the same test ids as `pytest --junitxml`;
+xfail → skip, setup/teardown failures → error, a module that fails to
+collect → an error named after the module, a pytest-rerunfailures `rerun`
+→ a pass flagged flaky).
+
+**In-report retries.** When the report itself shows that a test ran more
+than once — jest `invocations`, vitest/mocha retries, Surefire
+`flakyFailure`/`rerunFailure`, pytest-rerunfailures, Playwright retries and
+`--repeat-each`, go `-count` — the result keeps the final status and also
+records every attempt's status (oldest first), so a retry-then-pass is
+evidence of flakiness rather than a clean pass.
+
+**Encoding and compression.** A leading byte-order mark is ignored. Reports
+must be plain text: a gzip-compressed report is not read (decompress it
+first). A file no parser recognizes is skipped with a reason, e.g.
+`truncated/invalid JSON (…)` for a JSON report cut off mid-write.
 
 - **table** — sections per classification (`FLAKY (confirmed)`,
   `FLAKY (retry-rescued)`, `FLAKY (suspected)`, `FAILING`, `NEW FAILURE`),

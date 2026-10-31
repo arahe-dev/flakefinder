@@ -279,6 +279,92 @@ describe('retry-then-pass (QA PAR-6)', () => {
   });
 });
 
+// vitest-retry.json: REAL vitest 5.0 json: `flaky twice` ({retry: 3}) fails
+// twice then passes; `always fails` ({retry: 2}) fails all 3 attempts.
+describe('in-report attempts (QA PAR-6)', () => {
+  it('jest: invocations become attempts, oldest first, last = status', () => {
+    const { results } = jestParser.parse(load('jest-qa.json'), 'jest.json');
+    expect(results.find((r) => r.name === 'retried')!.attempts).toEqual(['fail', 'pass']);
+    expect(results.find((r) => r.name === 'slow')!.attempts).toEqual(['fail', 'fail', 'fail']);
+    // a test that ran once has no attempts
+    for (const r of results.filter((x) => x.name !== 'retried' && x.name !== 'slow')) {
+      expect(r).not.toHaveProperty('attempts');
+    }
+  });
+
+  it('vitest: a pass after failed retries lists one fail per failureMessage', () => {
+    const { results } = jestParser.parse(load('vitest-retry.json'), 'vitest.json');
+    const flaky = results.find((r) => r.name === 'flaky twice')!;
+    expect(flaky).toMatchObject({ status: 'pass', attempts: ['fail', 'fail', 'pass'] });
+    expect(flaky.message).toMatch(/^flaky: failed 2 of 3 attempts before passing on vitest retry/);
+    expect(results.find((r) => r.name === 'passes')).not.toHaveProperty('attempts');
+    const qa = jestParser.parse(load('vitest-qa.json'), 'vitest.json').results;
+    expect(qa.find((r) => r.name === 'retried')!.attempts).toEqual(['fail', 'pass']);
+  });
+
+  it('vitest: a failed test is not given attempts (several messages may be expect.soft)', () => {
+    const { results } = jestParser.parse(load('vitest-retry.json'), 'vitest.json');
+    const failed = results.find((r) => r.name === 'always fails')!;
+    expect(failed.status).toBe('fail');
+    expect(failed).not.toHaveProperty('attempts');
+  });
+
+  it('jest: a failed test with invocations but no failureMessages still notes the attempts', () => {
+    const doc = {
+      testResults: [
+        {
+          name: '/r/a.test.js',
+          assertionResults: [
+            {
+              title: 't',
+              ancestorTitles: [],
+              status: 'failed',
+              invocations: 2,
+              failureMessages: [],
+            },
+          ],
+        },
+      ],
+    };
+    const { results } = jestParser.parse(JSON.stringify(doc), 'inline');
+    expect(results[0]).toMatchObject({
+      status: 'fail',
+      attempts: ['fail', 'fail'],
+      message: '(failed all 2 attempts)',
+    });
+  });
+});
+
+describe('durations (QA PAR-18)', () => {
+  it('rounds vitest fractional durations to whole milliseconds', () => {
+    for (const fixture of ['vitest-qa.json', 'vitest-retry.json']) {
+      const { results } = jestParser.parse(load(fixture), fixture);
+      for (const r of results) {
+        if (r.durationMs !== null) expect(Number.isInteger(r.durationMs)).toBe(true);
+      }
+    }
+    const { results } = jestParser.parse(load('vitest-retry.json'), 'v.json');
+    expect(results.find((r) => r.name === 'flaky twice')!.durationMs).toBe(5); // 5.0594…
+    expect(results.find((r) => r.name === 'passes')!.durationMs).toBe(0); // 0.1788…
+  });
+
+  it('treats a negative or non-finite duration as unknown', () => {
+    const doc = {
+      testResults: [
+        {
+          name: 'f',
+          assertionResults: [
+            { title: 'a', status: 'passed', duration: -1 },
+            { title: 'b', status: 'passed', duration: '12' },
+          ],
+        },
+      ],
+    };
+    const { results } = jestParser.parse(JSON.stringify(doc), 'inline');
+    expect(results.map((r) => r.durationMs)).toEqual([null, null]);
+  });
+});
+
 describe('jest error status + vitest hook failures (QA PAR-7, PAR-8)', () => {
   it('maps assertion status "error" (jest-junit suite errors) instead of dropping it', () => {
     const { results, warnings } = jestParser.parse(load('jest-qa.json'), 'jest.json');

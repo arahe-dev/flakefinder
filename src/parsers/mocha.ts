@@ -23,7 +23,10 @@
  *
  * Retries (`this.retries(n)`): a passing test with `currentRetry` > 0 failed that many times
  * first — it stays 'pass' with a "flaky: failed k of n attempts before passing on mocha retry"
- * message and one warning per file (same representation as Surefire reruns).
+ * message and one warning per file (same representation as Surefire reruns). A failing test
+ * with `currentRetry` = k failed all k+1 attempts ("(failed all n attempts)"). Both set
+ * `attempts` (['fail', …, final]); it stays undefined for a test that ran once.
+ * durationMs is rounded to whole ms.
  *
  * suite = fullTitle with the title stripped (the describe chain), else `file`, else 'unknown'.
  * err.message trimmed to 2000 chars; err.stack trimmed to 1000 chars.
@@ -33,11 +36,12 @@
 import type { ReportParser, TestCaseResult, TestStatus } from '../types.js';
 import { makeTestId } from '../util/test-id.js';
 import {
-  errorMessage,
   flakyRetryMessage,
   flakyRetryWarning,
   isObj,
-  stripBom,
+  msOf,
+  parseJson,
+  retryAttempts,
   trimTo,
 } from './internal.js';
 
@@ -153,19 +157,11 @@ function deriveSuite(entry: Record<string, unknown>, title: string, fullTitle: s
   return fullTitle !== '' ? fullTitle : 'unknown';
 }
 
-function tryParseJson(content: string): { doc: unknown } | { error: string } {
-  try {
-    return { doc: JSON.parse(stripBom(content)) };
-  } catch (err) {
-    return { error: errorMessage(err) };
-  }
-}
-
 export const mochaParser: ReportParser = {
   name: 'mocha',
 
   sniff(content: string): boolean {
-    const parsed = tryParseJson(content);
+    const parsed = parseJson(content);
     if (!('doc' in parsed)) return false;
     const doc = parsed.doc;
     if (!isObj(doc)) return false;
@@ -178,7 +174,7 @@ export const mochaParser: ReportParser = {
     const results: TestCaseResult[] = [];
     const warnings: string[] = [];
 
-    const parsed = tryParseJson(content);
+    const parsed = parseJson(content);
     if (!('doc' in parsed)) {
       return { results, warnings: [`mocha: ${sourcePath}: invalid JSON: ${parsed.error}`] };
     }
@@ -276,10 +272,7 @@ export const mochaParser: ReportParser = {
       const isHook = HOOK_TITLE.test(title);
       const name = isHook ? hookName(title) : title;
       if (isHook && finalStatus === 'fail') hooks.push(`${suite} ${name}`);
-      const durationMs =
-        typeof entry.duration === 'number' && Number.isFinite(entry.duration)
-          ? entry.duration
-          : null;
+      const durationMs = msOf(entry.duration);
 
       const result: TestCaseResult = {
         testId: makeTestId(suite, name),
@@ -300,10 +293,23 @@ export const mochaParser: ReportParser = {
         if (stack !== undefined) result.stack = stack;
       }
       const retries =
-        typeof entry.currentRetry === 'number' && entry.currentRetry > 0 ? entry.currentRetry : 0;
+        typeof entry.currentRetry === 'number' &&
+        Number.isInteger(entry.currentRetry) &&
+        entry.currentRetry > 0
+          ? entry.currentRetry
+          : 0;
       if (retries > 0 && finalStatus === 'pass') {
         result.message = flakyRetryMessage(retries, 'mocha retry', result.message, 2000);
+        result.attempts = retryAttempts(retries, 'pass');
         flaky.push(`${suite} ${name}`);
+      } else if (retries > 0 && finalStatus === 'fail' && !isHook) {
+        // failed on the first try and on every one of its `currentRetry` retries
+        const note = `(failed all ${retries + 1} attempts)`;
+        result.message = trimTo(
+          result.message !== undefined ? `${result.message}\n${note}` : note,
+          2000,
+        );
+        result.attempts = retryAttempts(retries, 'fail');
       }
       results.push(result);
     }

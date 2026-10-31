@@ -32,21 +32,17 @@ describe('goTestParser', () => {
       status: 'pass',
       durationMs: 1,
     });
-    expect(results[0]?.message).toBe(
-      '=== RUN   TestAdd\n    math_test.go:11: computing 2 + 3\n--- PASS: TestAdd (0.00s)',
-    );
+    // a pass carries no message (QA PAR-19)
+    expect(results[0]).not.toHaveProperty('message');
 
     // TestDivide: fail with detail from red-colored output
     expect(results[1]).toMatchObject({ status: 'fail', durationMs: 10 });
-    expect(results[1]?.message).toBe(
-      '=== RUN   TestDivide\n    math_test.go:25: division mismatch: got 3, want 3.5\n--- FAIL: TestDivide (0.01s)',
-    );
+    // go's === RUN / --- FAIL framing is stripped (QA PAR-19)
+    expect(results[1]?.message).toBe('    math_test.go:25: division mismatch: got 3, want 3.5');
 
     // TestSkip: skip, elapsed 0 → 0ms
     expect(results[2]).toMatchObject({ status: 'skip', durationMs: 0 });
-    expect(results[2]?.message).toBe(
-      '    math_test.go:30: skipping: not implemented on windows\n--- SKIP: TestSkip (0.00s)',
-    );
+    expect(results[2]?.message).toBe('    math_test.go:30: skipping: not implemented on windows');
 
     // TestUpper: pass with no output events → no message
     expect(results[3]).toMatchObject({
@@ -58,12 +54,8 @@ describe('goTestParser', () => {
     expect(results[3]).not.toHaveProperty('message');
 
     // TestLong: fixture output is small enough to survive uncapped (600 L's)
-    const longText = ['=== RUN   TestLong', 'L'.repeat(600), '--- FAIL: TestLong (0.10s)'].join(
-      '\n',
-    );
     expect(results[4]).toMatchObject({ status: 'fail', durationMs: 100 });
-    expect(results[4]?.message).toBe(longText);
-    expect(results[4]?.message?.endsWith('(0.10s)')).toBe(true);
+    expect(results[4]?.message).toBe('L'.repeat(600));
   });
 
   it('keeps the LAST 2000 chars of oversized test output', () => {
@@ -107,7 +99,7 @@ describe('goTestParser', () => {
     ].join('\n');
     const { results } = goTestParser.parse(content, 'inline');
     expect(results[0]).toMatchObject({ status: 'pass', durationMs: 7 });
-    expect(results[0]?.message).toBe('something logged');
+    expect(results[0]).not.toHaveProperty('message'); // passes carry no message
   });
 
   it('a repeated test that failed once is NOT reported as a plain pass (r5 #2)', () => {
@@ -235,8 +227,10 @@ describe('go test -count=N (r5 #2)', () => {
     const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
     const stable = results.find((r) => r.name === 'TestStable')!;
     expect(stable.status).toBe('pass');
-    expect(stable.message?.match(/=== RUN/g)).toHaveLength(1);
-    expect(stable.message?.match(/always fine/g)).toHaveLength(1);
+    expect(stable).not.toHaveProperty('message');
+    const flaky = results.find((r) => r.name === 'TestFlaky')!;
+    expect(flaky.message?.match(/first attempt fails/g)).toHaveLength(1);
+    expect(flaky.message).not.toMatch(/=== RUN|--- FAIL/);
   });
 
   it('failing on every repeated run is a plain failure (no flaky note, no warning)', () => {
@@ -251,7 +245,70 @@ describe('go test -count=N (r5 #2)', () => {
     const { results, warnings } = goTestParser.parse(content, 'inline');
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ status: 'fail', message: 'boom 1' });
+    expect(results[0]?.attempts).toEqual(['fail', 'fail']);
     expect(warnings).toEqual([]);
+  });
+
+  it('sets attempts for -count repeats (QA PAR-6); a single run has none', () => {
+    const { results } = goTestParser.parse(load('go-count2.jsonl'), 'go-count2.jsonl');
+    const byName = new Map(results.map((r) => [r.name, r]));
+    // TestFlaky: fail then pass — reported 'fail', so the failing run is listed last
+    expect(byName.get('TestFlaky')?.attempts).toEqual(['pass', 'fail']);
+    expect(byName.get('TestStable')?.attempts).toEqual(['pass', 'pass']);
+    const single = goTestParser.parse(load('go-test.jsonl'), 'go-test.jsonl').results;
+    for (const r of single) expect(r).not.toHaveProperty('attempts');
+  });
+
+  it('keeps attempts chronological when the last run is the reported one', () => {
+    const content = [
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"pass","Package":"p","Test":"T","Elapsed":0.01}',
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"=== RUN   T\\n"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"    t_test.go:3: boom\\n"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"--- FAIL: T (0.00s)\\n"}',
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0.02}',
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"=== RUN   T\\n"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"panic: bad\\n"}',
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    // third run crashed: error, chronological
+    expect(results[0]).toMatchObject({ status: 'error', attempts: ['pass', 'fail', 'error'] });
+    expect(results[0]?.message).toContain('panic: bad');
+    expect(results[0]?.message).not.toContain('=== RUN');
+  });
+});
+
+describe('go framing lines (QA PAR-19)', () => {
+  it('strips === RUN/PAUSE/CONT/NAME and --- PASS/FAIL/SKIP lines, keeping the reason', () => {
+    const out = (text: string): string =>
+      `{"Action":"output","Package":"p","Test":"T","Output":${JSON.stringify(text)}}`;
+    const content = [
+      '{"Action":"run","Package":"p","Test":"T"}',
+      out('=== RUN   T\n'),
+      out('=== PAUSE T\n'),
+      out('=== CONT  T\n'),
+      out('=== NAME  T\n'),
+      out('    t_test.go:9: got 1, want 2\n'),
+      out('    --- PASS: T/sub (0.00s)\n'),
+      out('--- FAIL: T (0.00s)\n'),
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0}',
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    expect(results[0]?.message).toBe('    t_test.go:9: got 1, want 2');
+  });
+
+  it('a failure whose only output is framing has no message', () => {
+    const content = [
+      '{"Action":"run","Package":"p","Test":"T"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"=== RUN   T\\n"}',
+      '{"Action":"output","Package":"p","Test":"T","Output":"--- FAIL: T (0.00s)\\n"}',
+      '{"Action":"fail","Package":"p","Test":"T","Elapsed":0}',
+    ].join('\n');
+    const { results } = goTestParser.parse(content, 'inline');
+    expect(results[0]).toMatchObject({ status: 'fail' });
+    expect(results[0]).not.toHaveProperty('message');
   });
 });
 
@@ -372,7 +429,7 @@ describe('go benchmarks (QA PAR-2)', () => {
       'BenchmarkX:pass',
       'BenchmarkSub/size=10:pass',
     ]);
-    expect(results[2]!.message).toContain('ns/op');
+    expect(results[2]).not.toHaveProperty('message'); // passes carry no message
   });
 
   it('a failing benchmark still fails; its passing siblings do not turn into errors', () => {

@@ -26,15 +26,16 @@
  *   (that is the build's verdict, and `flakefinder run` must not turn a green
  *   build red), but the message records "flaky: failed k of n attempts" with
  *   the first failure's message/stackTrace, and one warning per file lists
- *   the affected tests. The parser output has no attempt dimension and the
- *   engine collapses same-testId results within a run (last wins), so extra
- *   'fail' rows could not carry the signal — see the parser report notes.
+ *   the affected tests. The engine collapses same-testId results within a run
+ *   (last wins), so the attempts travel in `attempts`, not as extra rows.
  * - `<rerunFailure>`/`<rerunError>` next to `<failure>`/`<error>`: it failed on
  *   every attempt — still 'fail'/'error', message notes the attempt count.
+ * - Both set `attempts` (oldest first, last = status): flaky → one 'fail'/'error'
+ *   per flaky element then 'pass'; failed-all → n × the final status.
  *
  * pytest-rerunfailures (`<testsuite name="pytest">` reports): rerun attempts are written as
  * empty duplicate testcases; they are collapsed into the final result with the same flaky
- * note / "(failed all n attempts)" representation (see collapsePytestReruns).
+ * note / "(failed all n attempts)" representation and `attempts` (see collapsePytestReruns).
  *
  * Never throws: malformed input produces warnings.
  */
@@ -46,6 +47,7 @@ import {
   flakyRetryMessage,
   flakyRetryWarning,
   isObj,
+  retryAttempts,
   stripBom,
   trimTo,
   XML_OPTIONS,
@@ -184,6 +186,7 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
       result.message !== undefined ? `${result.message}\n${note}` : note,
       MESSAGE_MAX_CHARS,
     );
+    result.attempts = retryAttempts(reruns.length, status, status);
   } else if (status === 'pass' && flakes.length > 0) {
     const first = flakes[0];
     result.message = flakyRetryMessage(
@@ -194,6 +197,11 @@ function mapTestCase(tc: unknown, suiteName: string, ctx: Ctx): void {
     );
     const stack = trimTo(detailStack(first), STACK_MAX_CHARS);
     if (stack !== undefined) result.stack = stack;
+    const failedKinds: TestStatus[] = [
+      ...children(tc, 'flakyFailure').map((): TestStatus => 'fail'),
+      ...children(tc, 'flakyError').map((): TestStatus => 'error'),
+    ];
+    result.attempts = [...failedKinds, 'pass'];
     ctx.flaky.push(`${suite}.${name}`);
   }
   ctx.results.push(result);
@@ -228,6 +236,7 @@ function collapsePytestReruns(ctx: Ctx): void {
     const how = 'pytest-rerunfailures rerun';
     if (final.status === 'pass') {
       final.message = flakyRetryMessage(earlier.length, how, undefined, MESSAGE_MAX_CHARS);
+      final.attempts = retryAttempts(earlier.length, 'pass');
       ctx.flaky.push(`${final.suite}.${final.name}`);
     } else if (final.status === 'fail' || final.status === 'error') {
       const note = `(failed all ${group.length} attempts)`;
@@ -235,6 +244,7 @@ function collapsePytestReruns(ctx: Ctx): void {
         final.message !== undefined ? `${final.message}\n${note}` : note,
         MESSAGE_MAX_CHARS,
       );
+      final.attempts = retryAttempts(earlier.length, final.status, final.status);
     }
     out.push(final);
   }

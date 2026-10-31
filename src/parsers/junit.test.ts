@@ -247,6 +247,12 @@ describe('Surefire reruns (r5 #1)', () => {
     expect(flakyWarning).toContain('com.example.CartTest.appliesDiscount');
     expect(flakyWarning).toContain('com.example.CartTest.syncsInventory');
     expect(warnings).toHaveLength(1);
+
+    // per-attempt statuses for the engine (QA PAR-6), oldest first, last = status
+    expect(byName.get('addsItem')).not.toHaveProperty('attempts');
+    expect(discount.attempts).toEqual(['fail', 'pass']);
+    expect(sync.attempts).toEqual(['error', 'error', 'pass']);
+    expect(checkout.attempts).toEqual(['fail', 'fail', 'fail']);
   });
 });
 
@@ -300,6 +306,8 @@ describe('JUnit QA findings (PAR-13, PAR-14, PAR-17)', () => {
     );
     expect(results[1]!.message).toContain('AssertionError: always');
     expect(results[1]!.message).toContain('(failed all 3 attempts)');
+    expect(results[0]!.attempts).toEqual(['fail', 'pass']);
+    expect(results[1]!.attempts).toEqual(['fail', 'fail', 'fail']);
     expect(warnings.some((w) => w.includes('FLAKY') && w.includes('rr.test_rr.test_flips'))).toBe(
       true,
     );

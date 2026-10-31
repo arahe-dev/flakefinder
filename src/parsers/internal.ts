@@ -1,6 +1,7 @@
 /**
  * Shared helpers internal to src/parsers — not part of the frozen public contract.
  */
+import type { TestStatus } from '../types.js';
 
 /**
  * fast-xml-parser options shared by the XML parsers (junit, trx):
@@ -47,9 +48,56 @@ export function stripAnsi(text: string): string {
   return text.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
-/** Remove a leading UTF-8 BOM if present. */
+/**
+ * Remove a leading byte-order mark (U+FEFF) if present — what a UTF-8 BOM, or
+ * a UTF-16 BOM decoded as UTF-16, becomes in a JS string.
+ */
 export function stripBom(content: string): string {
-  return content.startsWith('\uFEFF') ? content.slice(1) : content;
+  return content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+}
+
+/**
+ * A reported duration (already in ms) → integer ms, or null when it is not a
+ * finite non-negative number. Every parser emits whole milliseconds (vitest and
+ * Playwright report fractional ones).
+ */
+export function msOf(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : null;
+}
+
+/**
+ * `attempts` for a test the reporter ran more than once: `failed` failing
+ * attempts (status `failStatus`) followed by the final one. Undefined when the
+ * test ran once. The last entry always equals `final` (the result's status).
+ */
+export function retryAttempts(
+  failed: number,
+  final: TestStatus,
+  failStatus: TestStatus = 'fail',
+): TestStatus[] | undefined {
+  if (!Number.isInteger(failed) || failed <= 0) return undefined;
+  return [...Array<TestStatus>(failed).fill(failStatus), final];
+}
+
+/** Single-entry cache so the JSON sniffers (jest, mocha, playwright, pytest-json) parse a document once. */
+let jsonCache: { content: string; parsed: { doc: unknown } | { error: string } } | undefined;
+
+/**
+ * JSON.parse (BOM-tolerant) that never throws. The parsed document is shared
+ * between callers with the same content — treat it as read-only.
+ */
+export function parseJson(content: string): { doc: unknown } | { error: string } {
+  if (jsonCache !== undefined && jsonCache.content === content) return jsonCache.parsed;
+  let parsed: { doc: unknown } | { error: string };
+  try {
+    parsed = { doc: JSON.parse(stripBom(content)) };
+  } catch (err) {
+    parsed = { error: errorMessage(err) };
+  }
+  jsonCache = { content, parsed };
+  return parsed;
 }
 
 /** Readable message from an unknown thrown value. */
@@ -71,9 +119,10 @@ const MAX_FLAKY_NAMES = 10;
 /**
  * Message for a test that FAILED and then PASSED on a runner retry/rerun within
  * one report. The result stays 'pass' (the runner's verdict), and this note
- * keeps the failure visible. One ParseResult has no attempt dimension and the
- * engine collapses same-testId rows per run (last wins), so extra 'fail' rows
- * could not carry the signal. Shared by junit (Surefire), jest/vitest and mocha.
+ * keeps the failure visible; the per-attempt statuses go in
+ * `TestCaseResult.attempts` (the engine collapses same-testId rows per run, so
+ * extra 'fail' rows could not carry them). Shared by junit (Surefire,
+ * pytest-rerunfailures), jest/vitest, mocha and playwright.
  */
 export function flakyRetryMessage(
   failedAttempts: number,
