@@ -291,7 +291,9 @@ export function readConfigFile(file: string): FlakefinderConfig {
     throw new Error(`invalid config in ${abs}: ${(err as Error).message}`);
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`invalid config in ${abs}: config must be a JSON object, got ${describe(parsed)}`);
+    throw new Error(
+      `invalid config in ${abs}: config must be a JSON object, got ${describe(parsed)}`,
+    );
   }
   return anchorConfigPaths(parsed as FlakefinderConfig, path.dirname(abs));
 }
