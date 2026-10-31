@@ -334,7 +334,7 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 |---|---|---|---|
 | `reports` | `string[]` | `[]` | Globs (relative to cwd) for report files: `**`, `*`, `?` supported; `node_modules`, `.git`, `dist`, and the store dir are skipped. Example: `["junit*.xml", "test-results/*.json"]` |
 | `storeDir` | string | `".flakefinder"` | History directory (holds `history.jsonl` and the verdict snapshot); relative to the config file's directory |
-| `maxRuns` | integer 1–100000 | `300` | Prune history to the last N runs after each append |
+| `maxRuns` | integer 1–100000 | `300` | Prune history to the last N runs after each append. A run is one `runId`: all retry attempts of one `run` (or ingests sharing a `--run-id`) count once and are kept or dropped together |
 | `minRuns` | integer 1–1000 | `3` | Minimum observations before statistical claims (gates `flaky-suspected` and `failing`) |
 | `liveRetries` | integer 0–10 | `2` | Extra attempts for `run` (override per invocation with `-R`) |
 | `flakeScoreThreshold` | integer 0–100 | `30` | Score bar for including `flaky-suspected` in reports; confirmed/retry always included |
@@ -589,7 +589,9 @@ safely; readers tolerate legacy header-less stores (v0.1.x files) unchanged.
 - `commitSha` — best-effort `git rev-parse HEAD` at ingest time
 
 Pruning: after each append the store is atomically rewritten (tmp + rename)
-to the last `maxRuns` records (default 300). Corrupt lines are skipped on
+to the last `maxRuns` runs (default 300) — distinct `runId`s, not lines:
+the attempts of one run are never split, so a retry rescue is never cut in
+half. Corrupt lines are skipped on
 load, never crash the CLI. If `history.jsonl` itself cannot be read (it is a
 directory, or permissions deny access) read-only commands treat history as
 empty, `doctor` reports it as a FAIL, and any command that writes history

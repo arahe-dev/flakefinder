@@ -95,6 +95,21 @@ export function breakStaleLock(lockPath: string, observed: string): boolean {
 }
 
 /**
+ * The records of the last `maxRuns` distinct runIds, in file order. Counting
+ * records instead used to cut a retried run in half (attempt 1 dropped,
+ * attempt 2 kept), turning a retry rescue into a plain pass.
+ */
+export function lastRuns(records: RunRecord[], maxRuns: number): RunRecord[] {
+  if (records.length <= maxRuns) return records;
+  const kept = new Set<string>();
+  for (let i = records.length - 1; i >= 0 && kept.size < maxRuns; i--) {
+    kept.add(records[i]!.runId);
+  }
+  if (kept.size === new Set(records.map((r) => r.runId)).size) return records;
+  return records.filter((r) => kept.has(r.runId));
+}
+
+/**
  * Append-only JSONL history store. One RunRecord per line, prefixed by a
  * `{"version":1}` schema header (v0.2.0+; legacy header-less files load
  * unchanged). Corrupt lines are skipped on load and reported through
@@ -363,7 +378,9 @@ export class HistoryStore {
   }
 
   /**
-   * Keep only the last `maxRuns` records; rewrite the file atomically.
+   * Keep only the last `maxRuns` RUNS (distinct runIds — one `run` with
+   * retries writes one record per attempt, all sharing a runId, and they are
+   * kept or dropped together); rewrite the file atomically.
    * Re-reads the file FRESH inside the lock: a stale in-memory snapshot
    * would silently delete records another process appended between our load
    * and this prune (verified 10/10 with two concurrent ingests before the
@@ -400,11 +417,11 @@ export class HistoryStore {
         }
         return;
       }
-      if (source.length <= maxRuns) {
+      const keep = lastRuns(source, maxRuns);
+      if (keep.length === source.length) {
         this.adopt(fresh);
         return;
       }
-      const keep = source.slice(-maxRuns);
       // always (re)write the header; a newer-version header is preserved
       // rather than downgraded, since unknown fields are kept verbatim
       const version = Math.max(fresh.formatVersion ?? STORE_FORMAT_VERSION, STORE_FORMAT_VERSION);
