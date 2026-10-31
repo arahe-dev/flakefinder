@@ -630,3 +630,63 @@ describe('init --runner auto (QA CLI-28)', () => {
     expect(existsSync(path.join(d, 'flakefinder.config.json'))).toBe(false);
   });
 });
+
+describe('ci verdict snapshot robustness (QA CLI-29)', () => {
+  const FLAKY_RUNS = [false, true, false, true];
+  function setupFlaky(d: string): void {
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    for (const fail of FLAKY_RUNS) {
+      const tc = fail
+        ? '<testcase name="t"><failure message="x"/></testcase>'
+        : '<testcase name="t"/>';
+      writeFileSync(
+        path.join(d, 'r.xml'),
+        `<testsuites><testsuite name="s">${tc}</testsuite></testsuites>`,
+        'utf8',
+      );
+      expect(cli(['ci'], d).status).toBe(0);
+    }
+  }
+
+  it.each([
+    ['corrupt JSON', '{ not json'],
+    ['an object', '{"verdicts": []}'],
+    ['a number', '42'],
+    ['an array of junk', '[null, 1, "x", {"testId": 5}]'],
+  ])('%s: warns (or drops junk), never crashes, and rewrites the snapshot', (_label, content) => {
+    const d = tmp();
+    setupFlaky(d);
+    const snap = path.join(d, '.flakefinder', 'verdicts-snapshot.json');
+    writeFileSync(snap, content, 'utf8');
+    const r = cli(['ci', '--fail-on-new-flakes'], d);
+    expect(r.stderr).not.toMatch(/TypeError|\n\s+at /);
+    expect([0, 1]).toContain(r.status);
+    if (!content.startsWith('[')) expect(r.stderr).toContain('ignoring');
+    expect(Array.isArray(JSON.parse(readFileSync(snap, 'utf8')))).toBe(true);
+  });
+});
+
+describe('ci commit sha from the CI environment (QA ACT-18)', () => {
+  function shaOf(d: string, env: Record<string, string | undefined>): string | undefined {
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ci'], d, { NO_COLOR: '1', ...env }).status).toBe(0);
+    const recs = historyRecords(d) as unknown as { commitSha?: string }[];
+    return recs[recs.length - 1]!.commitSha;
+  }
+  const sha = 'a'.repeat(40);
+
+  it('GITHUB_SHA wins', () => {
+    expect(shaOf(tmp(), { GITHUB_SHA: sha, CI_COMMIT_SHA: undefined })).toBe(sha);
+  });
+
+  it('CI_COMMIT_SHA (GitLab) is used when GITHUB_SHA is absent', () => {
+    expect(shaOf(tmp(), { GITHUB_SHA: undefined, CI_COMMIT_SHA: 'B'.repeat(40) })).toBe(
+      'b'.repeat(40),
+    );
+  });
+
+  it('a malformed CI sha is ignored (falls back to git, here: none)', () => {
+    expect(shaOf(tmp(), { GITHUB_SHA: 'not-a-sha', CI_COMMIT_SHA: undefined })).toBeUndefined();
+  });
+});

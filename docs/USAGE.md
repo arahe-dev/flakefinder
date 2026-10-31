@@ -316,6 +316,14 @@ flaky test — also understood by GitLab, Buildkite, and others), writes
 
 - `--fail-on-new-flakes` — exit `1` when flakes appear that were not flaky in
   the previous snapshot. Known flakes never fail the build; new ones do.
+  With no snapshot (first run) every current flake is new. A corrupt or
+  wrongly-shaped snapshot is treated the same way, with a warning naming the
+  file, and is overwritten by this run's snapshot.
+
+The commit sha recorded with each run comes from the CI system when it
+provides one — `GITHUB_SHA` (GitHub Actions), then `CI_COMMIT_SHA`
+(GitLab) — and from `git rev-parse HEAD` otherwise, so shallow or git-less
+checkouts still get same-commit flip detection.
 
 On **GitLab**, `flakefinder ci` additionally upserts ONE merge-request note
 (marker-scoped, never duplicated) when these CI variables exist:

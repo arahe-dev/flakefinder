@@ -75,6 +75,58 @@ function gitSha(cwd: string): string | undefined {
   return r.status === 0 ? r.stdout.trim() : undefined;
 }
 
+const SHA_RE = /^[0-9a-f]{7,64}$/i;
+
+/**
+ * Commit sha for `ci` (QA ACT-18): the CI system's own variable wins —
+ * GitHub's GITHUB_SHA, GitLab's CI_COMMIT_SHA — because a CI checkout may be
+ * shallow, detached, or have no git at all, and HEAD can differ from the sha
+ * the pipeline is reporting on. Falls back to `git rev-parse HEAD`.
+ */
+function ciCommitSha(
+  cwd: string,
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  for (const key of ['GITHUB_SHA', 'CI_COMMIT_SHA']) {
+    const v = env[key]?.trim();
+    if (v && SHA_RE.test(v)) return v.toLowerCase();
+  }
+  return gitSha(cwd);
+}
+
+/**
+ * The previous verdict snapshot for the new-flake diff, or null when there is
+ * none. A corrupt or wrongly-shaped snapshot is ignored WITH a warning (QA
+ * CLI-29): silently treating it as "no baseline" made every flake NEW, and a
+ * non-array crashed the diff with a TypeError. Entries that are not
+ * verdict-shaped are dropped.
+ */
+function readSnapshot(file: string): TestVerdict[] | null {
+  if (!existsSync(file)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    console.warn(
+      `flakefinder: ignoring unreadable verdict snapshot ${file} (${(err as Error).message}) — no baseline this run, every current flake counts as new; it is rewritten below`,
+    );
+    return null;
+  }
+  if (!Array.isArray(parsed)) {
+    console.warn(
+      `flakefinder: ignoring verdict snapshot ${file}: expected an array — no baseline this run, every current flake counts as new; it is rewritten below`,
+    );
+    return null;
+  }
+  return parsed.filter(
+    (v): v is TestVerdict =>
+      typeof v === 'object' &&
+      v !== null &&
+      typeof (v as TestVerdict).testId === 'string' &&
+      typeof (v as TestVerdict).classification === 'string',
+  );
+}
+
 function storeFor(g: Globals, cfg: ResolvedConfig): HistoryStore {
   return new HistoryStore(path.resolve(g.cwd, cfg.storeDir));
 }
@@ -654,7 +706,7 @@ export async function main(argv: string[]): Promise<number> {
       }
       const store = storeFor(g, cfg);
       const runId = randomUUID();
-      const commitSha = gitSha(g.cwd);
+      const commitSha = ciCommitSha(g.cwd);
       for (const file of targets) {
         let content: string;
         try {
@@ -697,14 +749,7 @@ export async function main(argv: string[]): Promise<number> {
       console.log(`json report → ${reportPath}`);
 
       const snap = snapshotPath(path.resolve(g.cwd, cfg.storeDir));
-      let previous: TestVerdict[] | null = null;
-      if (existsSync(snap)) {
-        try {
-          previous = JSON.parse(readFileSync(snap, 'utf8')) as TestVerdict[];
-        } catch {
-          previous = null;
-        }
-      }
+      const previous = readSnapshot(snap);
       // same semantics as the GitHub Action — one implementation (src/action/diff.ts)
       const newFlakes = computeNewFlakes(verdicts, previous);
       // nothing parsed on a first run → no store dir yet (QA ACT-5 / CLI-7)
