@@ -38,7 +38,7 @@ Honest, deterministic, zero cloud. No telemetry. Two runtime dependencies (`comm
 ├── TASKS.md                 # ordered task checklist w/ ownership + status (integrator-maintained)
 ├── package.json             # name: flakefinder, bin: flakefinder → dist/cli.js
 ├── tsconfig.json            # strict, NodeNext, noEmit (typecheck only; tsup builds)
-├── tsup.config.ts           # bundles dist/cli.js and dist/action/index.js
+├── tsup.config.ts           # bundles dist/cli.js and dist/action/index.cjs
 ├── vitest.config.ts
 ├── biome.json
 ├── action.yml               # GitHub Action definition (repo root)
@@ -158,7 +158,7 @@ buildPrComment(verdicts: TestVerdict[], previous: TestVerdict[] | null): string 
 // src/report/html.ts  (Agent D)
 renderDashboard(data: DashboardData): string   // single self-contained HTML file content
 
-// src/action/index.ts  (Agent A)  — entry, no exported contract; bundled to dist/action/index.js
+// src/action/index.ts  (Agent A)  — entry, wires real services into runAction() (src/action/main.ts); bundled to dist/action/index.cjs
 // src/cli/index.ts  (Agent C)    — entry; commander program; bin banner shebang added by tsup
 ```
 
@@ -334,34 +334,44 @@ inputs:
   upload-dashboard:   { description: 'Upload HTML dashboard artifact', default: 'true' }
   history-max-runs:   { description: 'History retention', default: '300' }
   working-directory:  { description: 'Where reports/config live', default: '.' }
+  history-key:        { description: 'Extra cache-stream key', default: '${{ toJSON(matrix) }}' }
 outputs:
   flaky-count: { description: 'Total flaky tests' }
   new-flaky-count: { description: 'Flakes not previously flagged' }
   failing-count: { description: 'Deterministically failing tests' }
   report-json: { description: 'Path to written JSON report' }
 runs:
-  using: node20
-  main: dist/action/index.js
+  using: node24
+  main: dist/action/index.cjs
 ```
 
-Flow in `src/action/index.ts`:
+Flow in `runAction()` (`src/action/main.ts`; env, `@actions/core`, cache, artifact upload,
+glob and fetch are injected — `src/action/index.ts` only wires the real services):
 
-1. `@actions/core` getInputs; `working-directory` → chdir context for config/store.
-2. `@actions/cache.restoreCache([storeDir], 'flakefinder-history-<sha>', ['flakefinder-history-'])`.
-3. `@actions/glob` expand report globs (input overrides config `reports`); read files;
-   `detectParser` parse → one `RunRecord` (source `action`, attempt 1, `ciRunId = runId`,
-   `commitSha` from context, `branch` from context).
-4. Append to store; `prune(historyMaxRuns)`; `classifyAll`.
-5. Load previous `verdicts-snapshot.json` (if cached) → `newFlakes` = flaky-* verdicts whose
-   testId wasn't flaky-* in the snapshot. Write fresh snapshot.
-6. `cache.saveCache` best-effort (wrap in try — cache save may fail on default branch races).
-7. `core.summary` — headline counts + table of flakes; `core.setOutput`s; write JSON report
-   file `flakefinder-report.json` via `renderJson`.
-8. If PR context and `comment` and token: upsert comment (find existing by marker
-   `<!-- flakefinder:report -->` via octokit; edit else create) using `buildPrComment`.
-9. If `upload-dashboard`: build `DashboardData` (last 50 runs) → `renderDashboard` → upload
-   `flakefinder-dashboard.html` via `@actions/artifact`.
-10. If `fail-on-new-flakes` and newFlakes > 0 → `core.setFailed(...)` with a helpful message.
+1. Read and validate EVERY input first (`readInputs`; one failure listing all problems,
+   nothing done yet); `working-directory` → chdir context for config/store.
+2. Cache keys (`cacheKeys`): stream = short hash of job + working directory + `history-key`
+   (`null`/empty = no key; matrix JSON canonicalised). Save key
+   `flakefinder-history-<stream>-<sha>-<run id>-<run attempt>` (immutable per attempt);
+   restore keys `flakefinder-history-<stream>-`, then `flakefinder-history-` (warm start).
+   Skipped with one warning when the cache service is unavailable.
+3. Baseline (`resolveBaseline`): the restored `verdicts-snapshot.json`, unless
+   `action-baseline.json` shows this same run id already recorded one (re-run / second job)
+   — then that recorded baseline, so re-runs can't bypass the gate.
+4. `@actions/glob` expand report globs (input overrides config `reports`); read files
+   (UTF-8/UTF-16 aware); `detectParser` parse → one `RunRecord` per file (source `action`,
+   attempt 1, `ciRunId = runId`, `commitSha`/`branch` from context). Unparsable files warn.
+5. Append to store; `prune(historyMaxRuns)`; `classifyAll`. `newFlakes` = flaky-* verdicts
+   whose testId wasn't flaky-* in the baseline. Write fresh snapshot + `recordBaseline`.
+6. `saveHistory` best-effort (a taken key or failure is a warning).
+7. `core.setOutput`s; JSON report `flakefinder-report.json` via `renderJson`; job summary
+   (HTML, redacted + escaped).
+8. If `upload-dashboard`: build `DashboardData` (last 50 runs) → `renderDashboard` → upload
+   `flakefinder-dashboard.html` via `@actions/artifact` (failure = warning).
+9. If PR context and `comment`: upsert ONE comment (marker `<!-- flakefinder:report -->`,
+   only our own/bot-authored comment is updated, plain `fetch`, all pages, 15 s timeout,
+   no cross-origin redirects) using `buildPrComment`; mentions the dashboard only if uploaded.
+10. If `fail-on-new-flakes` and newFlakes > 0 → `core.setFailed(...)` naming them.
 
 `buildPrComment` format (Agent A, in `src/report/markdown.ts`):
 marker line; `## 🐍 flakefinder` heading; one-line summary (counts, new vs known);

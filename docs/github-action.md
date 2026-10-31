@@ -24,7 +24,7 @@ jobs:
       - run: npm ci
       - run: npm test                       # your tests must write report files
       - name: flakefinder
-        uses: DJJW26/flakefinder@main
+        uses: DJJW26/flakefinder@v1
         if: always()                        # analyze even when tests fail
 ```
 
@@ -83,17 +83,47 @@ the flake is fixed or quarantined. Later runs (new pushes) compare against
 the latest snapshot as usual, so a flake that was reported once counts as
 *known* from then on.
 
-**Matrix builds:** legs of one job share the job id and usually the
-working directory, so by default they share one history stream. Only one leg
-then saves per run (the others log a warning). To give each leg its own
-history, set `history-key` from the matrix:
+### Matrix builds and `history-key`
+
+Every matrix leg keeps its **own** history by default. The `history-key`
+input defaults to `${{ toJSON(matrix) }}`, and its value is part of the
+cache stream (see the save key above), so `node: 20` and `node: 22` (or
+`os: ubuntu-latest` and `os: windows-latest`) never overwrite or inherit
+each other's flake history. Outside a matrix the default evaluates to
+`null`, which counts as "no key": the stream is just job + working
+directory, as before.
+
+Set `history-key` yourself when the default isn't what you want:
 
 ```yaml
-      - uses: DJJW26/flakefinder@main
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22]
+        shard: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # …checkout, setup, run tests…
+      - uses: DJJW26/flakefinder@v1
         if: always()
         with:
-          history-key: ${{ matrix.os }}-${{ matrix.node }}
+          # equivalent to the default, but stable if you later add a
+          # matrix dimension; shards run different tests, so keep them apart
+          history-key: ${{ matrix.os }}-node${{ matrix.node }}-shard${{ matrix.shard }}
 ```
+
+- **Rename-safe keys:** the default changes whenever you add or rename a
+  matrix dimension (each leg then starts a new stream, warm-started from
+  another flakefinder cache). An explicit key built from the dimensions
+  you care about avoids that.
+- **Never share one key across legs that run at the same time.** Only one
+  of them can save per run (the others log "key taken"), so the others'
+  history is lost. The same goes for two flakefinder steps in one job:
+  give them different `working-directory` values or keys.
+- The key is hashed into the cache key, so any string works (no length or
+  character limits).
 
 ## Inputs
 
@@ -106,7 +136,7 @@ history, set `history-key` from the matrix:
 | `upload-dashboard` | `true` | Upload `flakefinder-dashboard.html` as artifact `flakefinder-dashboard` |
 | `history-max-runs` | `300` | History retention (number of runs) |
 | `working-directory` | `.` | Directory with config + reports (monorepos) |
-| `history-key` | _(empty)_ | Extra cache-stream key, e.g. the matrix values, so matrix legs keep separate histories |
+| `history-key` | `${{ toJSON(matrix) }}` | Extra cache-stream key. The default gives every matrix leg its own history; outside a matrix it is empty. See [Matrix builds](#matrix-builds-and-history-key) |
 
 All inputs are validated before the action does anything. Booleans must be
 `true`/`false`, `history-max-runs` an integer 1–100000, and
@@ -121,6 +151,21 @@ message.
 | `new-flaky-count` | Flakes not flagged in the previous run |
 | `failing-count` | Deterministically failing tests |
 | `report-json` | Path to the full JSON verdict report |
+
+## Dashboard artifact
+
+`flakefinder-dashboard.html` is one self-contained file: inline CSS and
+JavaScript, the report data embedded as JSON, no network requests, no
+external fonts or scripts. It follows the viewer's light/dark system
+preference (a toggle overrides it). Test names, suites and failure messages
+are redacted for credential shapes, and control/bidi characters are shown
+as visible escapes (`\u202e`) so a name can't be visually spoofed.
+
+If you serve the file from a web server with a Content-Security-Policy,
+the policy must allow inline code: `script-src 'unsafe-inline'` and
+`style-src 'unsafe-inline'` (it needs nothing else; `default-src 'none'`
+otherwise works). Opened from disk or the artifact download, no CSP
+applies.
 
 ## PR comment behavior
 
@@ -143,6 +188,10 @@ message.
 
 **Do I need the config file if I set the `reports` input?**
 No — the input overrides it. The config file is still useful for local runs.
+
+**Which version should I pin?** `@v1` follows the latest 1.x release.
+For supply-chain hardening, pin a full commit SHA with a version comment
+(`DJJW26/flakefinder@<sha> # v1.2.0`). Avoid `@main`.
 
 **Private repos?** Yes; the default `GITHUB_TOKEN` works. PR comments need the
 `pull-requests: write` permission. Comment on fork PRs may fail (token

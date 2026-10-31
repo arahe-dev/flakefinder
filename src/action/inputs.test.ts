@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { InputError, readInputs } from './inputs.js';
+import { cacheKeys } from './baseline.js';
+import { InputError, normalizeHistoryKey, readInputs } from './inputs.js';
 
 let dirs: string[] = [];
 afterEach(() => {
@@ -81,5 +82,49 @@ describe('action inputs are validated up front (QA ACT-15)', () => {
 
   it.each(['0', 'abc', '-5', '100001', '2.5'])('history-max-runs "%s" is rejected', (v) => {
     expect(() => readInputs(getter({ 'history-max-runs': v }), base())).toThrow('history-max-runs');
+  });
+});
+
+describe('history-key defaults to the matrix (QA ACT-4)', () => {
+  it('action.yml defaults history-key to toJSON(matrix)', () => {
+    const yml = readFileSync(path.resolve(__dirname, '../../action.yml'), 'utf8');
+    expect(yml).toMatch(/history-key:[\s\S]*?default: \$\{\{ toJSON\(matrix\) \}\}/);
+  });
+
+  it('outside a matrix (`null`) the key is empty — the stream is unchanged', () => {
+    expect(normalizeHistoryKey('null')).toBe('');
+    expect(normalizeHistoryKey('  ')).toBe('');
+    expect(normalizeHistoryKey('{}')).toBe('');
+    const gh = { sha: 's', runId: '1', runAttempt: '1', job: 'test' };
+    expect(
+      cacheKeys(gh, { workingDirectory: '.', historyKey: normalizeHistoryKey('null') }),
+    ).toEqual(cacheKeys(gh, { workingDirectory: '.', historyKey: '' }));
+  });
+
+  it('matrix JSON is canonical (formatting/key order do not matter), legs differ', () => {
+    const pretty = '{\n  "os": "ubuntu-latest",\n  "node": 20\n}';
+    const compact = '{"node":20,"os":"ubuntu-latest"}';
+    expect(normalizeHistoryKey(pretty)).toBe(normalizeHistoryKey(compact));
+    expect(normalizeHistoryKey(pretty)).toBe('{"node":20,"os":"ubuntu-latest"}');
+    expect(normalizeHistoryKey('{"a":{"y":1,"x":[2,{"q":1,"p":0}]}}')).toBe(
+      '{"a":{"x":[2,{"p":0,"q":1}],"y":1}}',
+    );
+    const gh = { sha: 's', runId: '1', runAttempt: '1', job: 'test' };
+    const leg = (m: string) =>
+      cacheKeys(gh, { workingDirectory: '.', historyKey: normalizeHistoryKey(m) }).saveKey;
+    expect(leg('{"node": 20}')).not.toBe(leg('{"node": 22}'));
+  });
+
+  it('explicit non-JSON keys pass through trimmed', () => {
+    expect(normalizeHistoryKey(' linux-20 ')).toBe('linux-20');
+    expect(normalizeHistoryKey('{not json')).toBe('{not json');
+  });
+
+  it('readInputs applies the normalisation', () => {
+    const d = base();
+    expect(readInputs(getter({ 'history-key': 'null' }), d).historyKey).toBe('');
+    expect(readInputs(getter({ 'history-key': '{ "b": 1, "a": 2 }' }), d).historyKey).toBe(
+      '{"a":2,"b":1}',
+    );
   });
 });

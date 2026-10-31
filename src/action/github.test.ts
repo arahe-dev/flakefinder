@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PR_COMMENT_MARKER } from '../report/markdown.js';
-import { type GithubContext, githubEnv, upsertPrComment } from './github.js';
+import { type GithubContext, githubEnv, MAX_COMMENT_PAGES, upsertPrComment } from './github.js';
 
 const ctx: GithubContext = {
   owner: 'o',
@@ -206,5 +206,29 @@ describe('tokens never leave the API origin (QA ACT-11)', () => {
       'created',
     );
     expect(urls.some((u) => u.includes('page=2'))).toBe(true);
+  });
+});
+
+describe('PR comment pagination is capped', () => {
+  it('a Link: next that never ends stops at the cap, warns, and still posts', async () => {
+    let gets = 0;
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith('/user')) return json({}, 403);
+      if ((init?.method ?? 'GET') !== 'GET') return json({ id: 1 }, 201);
+      gets++;
+      return new Response('[]', {
+        status: 200,
+        headers: {
+          link: `<https://api.example/repos/o/r/issues/5/comments?page=${gets + 1}>; rel="next"`,
+        },
+      });
+    }) as typeof fetch;
+    const warnings: string[] = [];
+    expect(
+      await upsertPrComment('t', 'b', ctx, { fetchImpl: impl, warn: (m) => warnings.push(m) }),
+    ).toBe('created');
+    expect(gets).toBe(MAX_COMMENT_PAGES);
+    expect(warnings.join('\n')).toContain('more than 5000 comments');
   });
 });

@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { classifyAll } from '../engine/classify.js';
 import { detectParser } from '../parsers/index.js';
 import { HistoryStore } from '../store/history-store.js';
 import type { ResolvedConfig, RunRecord, TestVerdict } from '../types.js';
+import { readTextFile } from '../util/read-text.js';
 
 export interface IngestContext {
   commitSha?: string;
@@ -37,7 +37,7 @@ export function ingestReports(
   for (const file of files) {
     let content: string;
     try {
-      content = readFileSync(file, 'utf8');
+      content = readTextFile(file);
     } catch (err) {
       warnings.push(`cannot read ${file}: ${(err as Error).message}`);
       continue;

@@ -128,14 +128,18 @@ repo are fine. Point `flakefinder.config.json` → `reports` globs at them.
 ```yaml
       - run: npm test            # your tests write report files
       - name: flakefinder
-        uses: DJJW26/flakefinder@main
+        uses: DJJW26/flakefinder@v1
         if: always()
 ```
 
 The action caches `.flakefinder/` between runs (history-aware verdicts),
 comments on PRs with **new vs known** flakes, uploads the HTML dashboard as an
-artifact, and can fail the job when *new* flakes appear. Full input/output
-reference and monorepo recipes: [docs/github-action.md](docs/github-action.md).
+artifact, and can fail the job when *new* flakes appear. Matrix legs keep
+separate histories automatically. Full input/output reference, matrix and
+monorepo recipes: [docs/github-action.md](docs/github-action.md).
+
+Pin `@v1` (or a full release tag/commit SHA), not `@main`: `main` can carry
+unreleased changes and a stale `dist/`.
 
 ## Quarantine
 
@@ -232,4 +236,5 @@ Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The GitHub Action bundle includes third-party packages; their
+licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
