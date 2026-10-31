@@ -62,6 +62,9 @@ export interface UpsertDeps {
   timeoutMs?: number;
 }
 
+/** Pagination cap for listing PR comments: 50 pages = 5000 comments. */
+export const MAX_COMMENT_PAGES = 50;
+
 /** Per-request timeout for GitHub/GitLab API calls. */
 export const API_TIMEOUT_MS = 15_000;
 
@@ -149,10 +152,16 @@ async function upsert(
 ): Promise<'created' | 'updated' | 'failed'> {
   const repoPath = `${ctx.apiUrl}/repos/${ctx.owner}/${ctx.repo}`;
 
-  // collect all comment pages
+  // collect all comment pages (capped: a Link loop must not spin forever)
   const comments: GhComment[] = [];
   let url: string | null = `${repoPath}/issues/${ctx.prNumber}/comments?per_page=100`;
-  while (url) {
+  for (let pages = 0; url; pages++) {
+    if (pages >= MAX_COMMENT_PAGES) {
+      warn(
+        `PR has more than ${MAX_COMMENT_PAGES * 100} comments — stopped looking for the flakefinder comment`,
+      );
+      break;
+    }
     const res = await call(url, { headers: ghHeaders(token) });
     if (!res.ok) {
       warn(`listing PR comments failed: HTTP ${res.status}`);
