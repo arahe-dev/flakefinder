@@ -4,6 +4,7 @@
  * so these never depend on a stale committed dist/.
  */
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -429,4 +430,53 @@ describe('UTF-16 report files (QA PAR-9)', () => {
     expect(r.stderr).not.toContain('unrecognized');
     expect(historyRecords(d)[0]!.results).toHaveLength(2);
   });
+});
+
+describe('ingest exits 2 when nothing could be ingested (QA CLI-6)', () => {
+  it.each([
+    ['missing', null],
+    ['empty', ''],
+    ['unparseable', 'not a report at all'],
+  ])('every file %s → exit 2, no history written', (_label, content) => {
+    const d = tmp();
+    if (content !== null) writeFileSync(path.join(d, 'r.xml'), content, 'utf8');
+    const r = cli(['ingest', 'r.xml'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('nothing ingested');
+    expect(existsSync(path.join(d, '.flakefinder', 'history.jsonl'))).toBe(false);
+  });
+
+  it('one good file among bad ones still succeeds', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'good.xml'), JUNIT, 'utf8');
+    writeFileSync(path.join(d, 'bad.xml'), 'garbage', 'utf8');
+    const r = cli(['ingest', 'good.xml', 'bad.xml', 'missing.xml'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('from 1/3 file(s)');
+  });
+});
+
+describe('--run-id validation (QA CLI-27)', () => {
+  it.each(['123456789', '9876543210', '1234567890-2', 'build.42_a', '7', crypto.randomUUID()])(
+    'accepts %s',
+    (id) => {
+      const d = tmp();
+      writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+      const r = cli(['ingest', 'r.xml', '--run-id', id], d);
+      expect(r.status).toBe(0);
+      expect(historyRecords(d)[0]!.runId).toBe(id);
+    },
+  );
+
+  it.each(['----------', '-123', '..', 'a b', 'x'.repeat(129), 'id\x1b[31m', ''])(
+    'rejects %j',
+    (id) => {
+      const d = tmp();
+      writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+      const r = cli(['ingest', 'r.xml', '--run-id', id], d);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('--run-id must be');
+      expect(r.stderr).not.toContain('\x1b');
+    },
+  );
 });

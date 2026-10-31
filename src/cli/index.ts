@@ -99,6 +99,13 @@ function flagInt(flag: string, value: string, min: number, max: number, unit = '
   return n;
 }
 
+/**
+ * --run-id: a UUID, a CI run number (`$GITHUB_RUN_ID`, `$CI_PIPELINE_ID`) or a
+ * composed id like `1234567890-2`. Must start with a letter or digit, so an
+ * all-punctuation id (`----------`) is rejected; capped at 128 characters.
+ */
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 /** Engine/config bounds the flags share (config.ts validates the same ranges). */
 const RETRIES_MAX = 10;
 
@@ -347,9 +354,9 @@ export async function main(argv: string[]): Promise<number> {
       }
       let runId: string = randomUUID();
       if (opts.runId != null) {
-        if (!/^[0-9a-f-]{10,}$/i.test(opts.runId)) {
+        if (!RUN_ID_RE.test(opts.runId)) {
           console.error(
-            `flakefinder: --run-id must look like a UUID/identifier (got "${opts.runId}")`,
+            `flakefinder: --run-id must be 1–128 characters of letters, digits, '.', '_' or '-', starting with a letter or digit — e.g. a UUID or "$GITHUB_RUN_ID" (got "${escapeControlChars(opts.runId)}")`,
           );
           exitCode = 2;
           return;
@@ -390,6 +397,15 @@ export async function main(argv: string[]): Promise<number> {
         store.append(record);
         total += parsed.results.length;
         used++;
+      }
+      if (used === 0) {
+        // nothing was recorded: every file was missing, empty or unparseable —
+        // a success exit here would let a broken CI pipeline look healthy
+        console.error(
+          `flakefinder: none of the ${targets.length} report file(s) could be read and parsed — nothing ingested`,
+        );
+        exitCode = 2;
+        return;
       }
       store.prune(cfg.maxRuns);
       printStoreWarnings(store);

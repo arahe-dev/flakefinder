@@ -197,9 +197,10 @@ per file from content.
   a fail on `--attempt 1` followed by a pass on `--attempt 2` counts as a
   retry rescue exactly as it would under `run` (+40 score; `flaky-retry`, or
   `flaky-confirmed` when the same commit also flipped). Use one id per
-  CI job (e.g. `--run-id "$GITHUB_RUN_ID"` or a `uuidgen`); it must be at
-  least 10 characters of hex digits and dashes (a UUID or a numeric CI run
-  id), otherwise `ingest` exits `2`.
+  CI job (e.g. `--run-id "$GITHUB_RUN_ID"`, `"$CI_PIPELINE_ID"` or a
+  `uuidgen`); it must be 1–128 characters of letters, digits, `.`, `_` and
+  `-`, starting with a letter or digit (so `1234567890-2` works, `----------`
+  does not), otherwise `ingest` exits `2`.
 
 **Same-runId note:** without `--run-id`, each `ingest` invocation creates its
 **own** `runId`. Retry-rescue detection requires attempts 1→2 to share a runId
@@ -207,7 +208,10 @@ per file from content.
 same `--run-id` to each call. Separate `ingest` calls without it can still flag
 a flake in a git repo — via the same-commit-flip rule (`flaky-confirmed`) — but
 without the retry-rescue evidence; outside git they cannot flag it at all.
-Exits `2` if nothing matched.
+Exits `2` if nothing matched, or if none of the files could be read and
+parsed (every one missing, empty or in an unrecognized format) — nothing is
+recorded then. A run where at least one file parsed exits `0`; the skipped
+files are listed as warnings.
 
 ### `report`
 
@@ -337,7 +341,7 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 | `0` | Clean run, **or** failures that were all proven flakes (unless `--fail-on-flake` / `failOnFlakes`) |
 | `1` | A deterministic failure persisted to the final attempt (`run`); a quarantined testId wasn't found; `ci --fail-on-new-flakes` saw new flakes |
 | `1` (doctor) | `doctor` found at least one FAIL-level problem (e.g. invalid config, unreadable quarantine file, unreadable `history.jsonl`) |
-| `2` | Usage or environment error: bad flags, unreadable config, no report files matched for `ingest`/`ci`, unknown quarantine action, test command could not be started (`run` — e.g. not installed / not on PATH; nothing is retried or recorded) |
+| `2` | Usage or environment error: bad flags, unreadable config, missing `--cwd`, no report files matched for `ingest`/`ci` (or none of them parsed, for `ingest`), unknown quarantine action, test command could not be started (`run` — e.g. not installed / not on PATH; nothing is retried or recorded) |
 
 These are stable and scriptable — gate CI on `run`'s exit code directly.
 
@@ -634,7 +638,7 @@ manually (e.g. `-run` in your own scripts) until Go grows a selector.
 
 **Exit code 2** — a flag/config problem, not a test result: check the error
 message above the exit (unreadable config, invalid `--retries`, empty
-quarantine action, no matching reports for `ingest`/`ci`, or a `run` test
+quarantine action, no matching or parseable reports for `ingest`, no matching reports for `ci`, or a `run` test
 command that could not be started — `command not found: …`). Numeric flags
 (`-R`, `--timeout`, `--attempt`, `--threshold`) accept plain integers only —
 `2.5`, `2x` or `50abc` are rejected with the flag's accepted range rather than
