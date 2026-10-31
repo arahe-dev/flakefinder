@@ -41,3 +41,16 @@ describe('ingestReports survives parser exceptions (R5 #13)', () => {
     expect(out.store.runs()).toHaveLength(1);
   });
 });
+
+describe('ingestReports decodes UTF-16 reports (PAR-9)', () => {
+  it('a UTF-16LE report with a BOM (PowerShell `>`) is parsed, not skipped', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'ff-ingest-'));
+    dirs.push(dir);
+    const file = path.join(dir, 'utf16.xml');
+    writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(JUNIT, 'utf16le')]));
+    const out = ingestReports([file], resolveConfig({}), path.join(dir, '.ff'), {});
+    expect(out.ingestedFiles).toEqual([file]);
+    expect(out.warnings).toEqual([]);
+    expect(out.verdicts).toHaveLength(2);
+  });
+});
