@@ -278,9 +278,17 @@ $ npx flakefinder quarantine remove <testId>
 $ npx flakefinder quarantine prune
 ```
 
-Manages `flakefinder.quarantine.json`. `testId`s come from
-`report` (the "next steps" hint) or `report --format json`. See the
-[deep-dive](#quarantine-deep-dive) for mechanics and the prune policy.
+Manages `flakefinder.quarantine.json` (or the configured `quarantineFile`).
+`testId`s come from `report` (the "next steps" hint) or
+`report --format json`. See the [deep-dive](#quarantine-deep-dive) for
+mechanics and the prune policy.
+
+- `add`/`remove` of a `testId` that is not in history / not quarantined exits
+  `1`; a missing `testId` argument or an unknown action exits `2`.
+- `prune` writes the file only when it actually removes entries — with
+  nothing to prune (e.g. an empty history) no file is created.
+- `list` and `prune` print test names, ids and reasons with control
+  characters made visible (`\x1b`, `\x0d`, …), never raw.
 
 ### `ci`
 
@@ -343,7 +351,7 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 | Code | Meaning |
 |---|---|
 | `0` | Clean run, **or** failures that were all proven flakes (unless `--fail-on-flake` / `failOnFlakes`) |
-| `1` | A deterministic failure persisted to the final attempt (`run`); a quarantined testId wasn't found; `ci --fail-on-new-flakes` saw new flakes |
+| `1` | A deterministic failure persisted to the final attempt (`run`); `quarantine add`/`remove` could not find the testId; `ci --fail-on-new-flakes` saw new flakes |
 | `1` (doctor) | `doctor` found at least one FAIL-level problem (e.g. invalid config, unreadable quarantine file, unreadable `history.jsonl`) |
 | `2` | Usage or environment error: bad flags, unreadable config, missing `--cwd`, no report files matched for `ingest`/`ci` (or none of them parsed, for `ingest`), unknown quarantine action, test command could not be started (`run` — e.g. not installed / not on PATH; nothing is retried or recorded) |
 

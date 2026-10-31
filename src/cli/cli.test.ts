@@ -507,3 +507,77 @@ describe('html output path and --open (QA CLI-10/CLI-31)', () => {
     expect(r.stderr).not.toMatch(/Unhandled|\n\s+at /);
   });
 });
+
+function firstTestId(d: string): string {
+  const r = cli(['report', '--format', 'json'], d);
+  return (JSON.parse(r.stdout) as { verdicts: { testId: string }[] }).verdicts[0]!.testId;
+}
+
+describe('quarantine exit codes, output and side effects (QA CLI-11/CLI-22/CLI-30)', () => {
+  it('add/remove of an unknown testId exits 1 (a missing testId argument stays 2)', () => {
+    const d = tmp();
+    expect(cli(['quarantine', 'add', 'deadbeefdeadbeef'], d).status).toBe(1);
+    expect(cli(['quarantine', 'remove', 'deadbeefdeadbeef'], d).status).toBe(1);
+    expect(cli(['quarantine', 'add'], d).status).toBe(2);
+    expect(cli(['quarantine', 'remove'], d).status).toBe(2);
+    expect(cli(['quarantine', 'bogus'], d).status).toBe(2);
+  });
+
+  it('prune on an empty history does not create the quarantine file', () => {
+    const d = tmp();
+    const r = cli(['quarantine', 'prune'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('nothing to prune');
+    expect(existsSync(path.join(d, 'flakefinder.quarantine.json'))).toBe(false);
+  });
+
+  it('control characters in --reason are escaped by quarantine list', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const id = firstTestId(d);
+    const add = cli(['quarantine', 'add', id, '--reason', 'evil\x1b[2J\rspoof\nline'], d);
+    expect(add.status).toBe(0);
+    const list = cli(['quarantine', 'list'], d);
+    expect(list.status).toBe(0);
+    expect(list.stdout).not.toContain('\x1b');
+    expect(list.stdout).not.toContain('\r');
+    const entryLines = list.stdout.split('\n').filter((l) => l.includes(id));
+    expect(entryLines).toHaveLength(1);
+    expect(entryLines[0]).toContain('evil');
+    expect(entryLines[0]).toContain('spoof');
+  });
+
+  it('prune prints escaped test names', () => {
+    const d = tmp();
+    const hostile = 'name\x1b[31mred\rCR';
+    const junit = `<testsuites><testsuite name="s"><testcase name="${hostile}"/></testsuite></testsuites>`;
+    writeFileSync(path.join(d, 'r.xml'), junit, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const id = firstTestId(d);
+    // an old entry for a test that has since passed 10+ times is pruned
+    writeFileSync(
+      path.join(d, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: id,
+            suite: 's',
+            name: hostile,
+            reason: 'flaky',
+            quarantinedAt: '2000-01-01T00:00:00.000Z',
+            flakeScore: 50,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    for (let i = 0; i < 10; i++) expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const r = cli(['quarantine', 'prune'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('pruned 1 entry:');
+    expect(r.stdout).not.toContain('\x1b');
+    expect(r.stdout).not.toContain('\r');
+  });
+});

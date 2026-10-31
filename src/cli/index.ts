@@ -153,6 +153,9 @@ function printSetupHints(runner: RunnerKind): void {
   );
 }
 
+/** Untrusted text (test names, ids, reasons) made safe for a terminal line. */
+const esc = escapeControlChars;
+
 function ghEscape(s: string): string {
   return s.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 }
@@ -519,8 +522,9 @@ export async function main(argv: string[]): Promise<number> {
         }
         console.log(`${entries.length} quarantined test(s):`);
         for (const e of entries) {
+          // hand-edited files and --reason may carry ESC/CR/LF — never echo raw
           console.log(
-            `  ${e.testId}  ${e.suite} :: ${e.name}  (score ${e.flakeScore}, ${e.reason})`,
+            `  ${esc(e.testId)}  ${esc(e.suite)} :: ${esc(e.name)}  (score ${e.flakeScore}, ${esc(String(e.reason))})`,
           );
         }
         const runner = cfg.runner === 'auto' ? detectRunner(g.cwd) : cfg.runner;
@@ -530,7 +534,7 @@ export async function main(argv: string[]): Promise<number> {
           );
         } else {
           console.log(
-            `next run will add: ${exclusionArgs(runner as Exclude<RunnerKind, 'auto'>, entries).join(' ')}`,
+            `next run will add: ${esc(exclusionArgs(runner as Exclude<RunnerKind, 'auto'>, entries).join(' '))}`,
           );
         }
         return;
@@ -545,10 +549,11 @@ export async function main(argv: string[]): Promise<number> {
         const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
         const v = verdicts.find((x) => x.testId === testId);
         if (!v) {
+          // a lookup miss, not a usage error: exit 1 (documented)
           console.error(
-            `flakefinder: testId ${testId} not in history — run "flakefinder report --format json" to list testIds`,
+            `flakefinder: testId ${esc(testId)} not in history — run "flakefinder report --format json" to list testIds`,
           );
-          exitCode = 2;
+          exitCode = 1;
           return;
         }
         qm.add({
@@ -561,7 +566,7 @@ export async function main(argv: string[]): Promise<number> {
         });
         qm.save();
         console.log(
-          `quarantined ${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`,
+          `quarantined ${esc(v.suite)} :: ${esc(v.name)} (${v.classification}, score ${v.flakeScore})`,
         );
         console.log(`quarantine list: ${qPath}`);
         return;
@@ -575,10 +580,10 @@ export async function main(argv: string[]): Promise<number> {
         }
         if (qm.remove(testId)) {
           qm.save();
-          console.log(`removed ${testId} from quarantine`);
+          console.log(`removed ${esc(testId)} from quarantine`);
         } else {
-          console.error(`flakefinder: ${testId} is not quarantined`);
-          exitCode = 2;
+          console.error(`flakefinder: ${esc(testId)} is not quarantined`);
+          exitCode = 1;
         }
         return;
       }
@@ -586,16 +591,20 @@ export async function main(argv: string[]): Promise<number> {
       if (action === 'prune') {
         const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
         const removed = qm.prune(verdicts);
-        qm.save();
-        if (removed.length === 0) console.log('nothing to prune');
-        else {
-          console.log(`pruned ${removed.length} entr(y/ies):`);
-          for (const e of removed) console.log(`  ${e.suite} :: ${e.name}`);
+        if (removed.length === 0) {
+          // no write: an empty history must not create the quarantine file
+          console.log('nothing to prune');
+          return;
         }
+        qm.save();
+        console.log(`pruned ${removed.length} entr${removed.length === 1 ? 'y' : 'ies'}:`);
+        for (const e of removed) console.log(`  ${esc(e.suite)} :: ${esc(e.name)}`);
         return;
       }
 
-      console.error(`flakefinder: unknown quarantine action "${action}" (list|add|remove|prune)`);
+      console.error(
+        `flakefinder: unknown quarantine action "${esc(action)}" (list|add|remove|prune)`,
+      );
       exitCode = 2;
     });
 
