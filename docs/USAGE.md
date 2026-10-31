@@ -230,8 +230,12 @@ Classifies everything in the history store and prints it.
 
 - `--format table` (default) — the terminal table. Default view shows the
   problem classes (flaky/failing/new-failure) plus an `ok: N passing…` line.
-- `--format json` — machine-readable `{ generatedAt, flakefinderVersion,
-  config, verdicts }` on stdout alone — safe to pipe into `jq`.
+- `--format json` — machine-readable `{ schemaVersion, generatedAt,
+  flakefinderVersion, config, verdicts }` on stdout alone — safe to pipe into
+  `jq`. The same shape is written by `ci` (`flakefinder-report.json`) and the
+  GitHub Action. `schemaVersion` (currently `1`) changes only when a field is
+  removed, renamed or retyped; new fields can appear without a bump, so
+  ignore keys you do not know.
 - `--format md` — markdown (same shape as PR comments).
 - `--flakes-only` — drop the `ok:` summary line (table).
 - `--all` — include passing/skipped/gone rows (table), all tests (md).
