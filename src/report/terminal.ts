@@ -98,13 +98,15 @@ export function renderTerminal(
   }
 
   lines.push(
-    bold(`flakefinder — ${verdicts.length} tracked test(s), ${problemCount} need attention`),
+    // "tracked" is the whole history — it must not change with --threshold;
+    // only the "need attention" rows are filtered (and the hidden ones counted)
+    bold(`flakefinder — ${allVerdicts.length} tracked test(s), ${problemCount} need attention`),
     '',
   );
   if (hiddenBelowThreshold > 0) {
     lines.push(
       dim(
-        `${hiddenBelowThreshold} flaky-suspected test(s) hidden below score ${opts.threshold} — raise --threshold visibility with --all or a lower --threshold`,
+        `${hiddenBelowThreshold} flaky-suspected test(s) hidden below score ${opts.threshold} — show them with --all or a lower --threshold`,
       ),
       '',
     );

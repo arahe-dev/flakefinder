@@ -4,6 +4,7 @@
  * so these never depend on a stale committed dist/.
  */
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -52,11 +53,12 @@ function tmp(): string {
 function cli(
   args: string[],
   cwd: string,
+  env: Record<string, string | undefined> = { NO_COLOR: '1' },
 ): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(process.execPath, [cliPath, ...args], {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, NO_COLOR: '1' },
+    env: { ...process.env, ...env },
   });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
@@ -341,5 +343,368 @@ describe('ci on a first run where nothing parses (QA ACT-5 / CLI-7)', () => {
     expect(r.stderr).not.toContain('ENOENT');
     expect(r.status).toBe(0);
     expect(existsSync(path.join(d, '.flakefinder', 'verdicts-snapshot.json'))).toBe(true);
+  });
+});
+
+describe('--cwd must be an existing directory (QA CLI-19)', () => {
+  it.each([['report'], ['init'], ['ingest'], ['html'], ['doctor'], ['ci'], ['quarantine', 'list']])(
+    '%s with a missing --cwd exits 2 with a clear error',
+    (...cmd) => {
+      const d = tmp();
+      const r = cli(['--cwd', path.join(d, 'nope'), ...cmd], d);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/--cwd .*nope does not exist/);
+      expect(r.stderr).not.toMatch(/ENOENT|\n\s+at /);
+    },
+  );
+
+  it('a --cwd that is a file is rejected', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'f'), '', 'utf8');
+    const r = cli(['--cwd', 'f', 'report'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/is not a directory/);
+  });
+});
+
+describe('--config resolves against --cwd (QA CLI-25)', () => {
+  it('a relative --config is looked up inside --cwd, not the process cwd', () => {
+    const outer = tmp();
+    const proj = path.join(outer, 'proj');
+    mkdirSync(proj);
+    writeFileSync(path.join(proj, 'ff.json'), '{ "storeDir": "hist" }', 'utf8');
+    writeFileSync(path.join(proj, 'r.xml'), JUNIT, 'utf8');
+    const r = cli(['--cwd', 'proj', '--config', 'ff.json', 'ingest', 'r.xml'], outer);
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(proj, 'hist', 'history.jsonl'))).toBe(true);
+  });
+
+  it('a config that is not a JSON object is a clear exit-2 error (QA CLI-16)', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), 'null', 'utf8');
+    const r = cli(['report'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/config must be a JSON object, got null/);
+    expect(r.stderr).not.toMatch(/TypeError/);
+  });
+});
+
+describe('doctor honours --config and color settings (QA CLI-9/CLI-13)', () => {
+  it('doctor --config bad.json exits 1 with a FAIL line', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'bad.json'), '{ "runner": "Jest" }', 'utf8');
+    const r = cli(['--config', 'bad.json', 'doctor'], d);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('[FAIL]');
+    expect(r.stdout).toContain('did you mean "jest"?');
+  });
+
+  it('piped doctor output carries no ANSI escapes even without NO_COLOR', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "runner": 1 }', 'utf8');
+    const r = cli(['doctor'], d, { NO_COLOR: undefined });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('[FAIL]');
+    expect(r.stdout).not.toContain('\x1b[');
+  });
+});
+
+describe('UTF-16 report files (QA PAR-9)', () => {
+  const utf16 = (s: string): Buffer =>
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')]);
+
+  it('ingest reads a UTF-16LE (BOM) JUnit report', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), utf16(JUNIT));
+    const r = cli(['ingest', 'r.xml'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ingested 2 test result(s) from 1/1 file(s)');
+  });
+
+  it('ci reads a UTF-16LE (BOM) JUnit report', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), utf16(JUNIT));
+    const r = cli(['ci'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('unrecognized');
+    expect(historyRecords(d)[0]!.results).toHaveLength(2);
+  });
+});
+
+describe('ingest exits 2 when nothing could be ingested (QA CLI-6)', () => {
+  it.each([
+    ['missing', null],
+    ['empty', ''],
+    ['unparseable', 'not a report at all'],
+  ])('every file %s → exit 2, no history written', (_label, content) => {
+    const d = tmp();
+    if (content !== null) writeFileSync(path.join(d, 'r.xml'), content, 'utf8');
+    const r = cli(['ingest', 'r.xml'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('nothing ingested');
+    expect(existsSync(path.join(d, '.flakefinder', 'history.jsonl'))).toBe(false);
+  });
+
+  it('one good file among bad ones still succeeds', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'good.xml'), JUNIT, 'utf8');
+    writeFileSync(path.join(d, 'bad.xml'), 'garbage', 'utf8');
+    const r = cli(['ingest', 'good.xml', 'bad.xml', 'missing.xml'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('from 1/3 file(s)');
+  });
+});
+
+describe('--run-id validation (QA CLI-27)', () => {
+  it.each(['123456789', '9876543210', '1234567890-2', 'build.42_a', '7', crypto.randomUUID()])(
+    'accepts %s',
+    (id) => {
+      const d = tmp();
+      writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+      const r = cli(['ingest', 'r.xml', '--run-id', id], d);
+      expect(r.status).toBe(0);
+      expect(historyRecords(d)[0]!.runId).toBe(id);
+    },
+  );
+
+  it.each(['----------', '-123', '..', 'a b', 'x'.repeat(129), 'id\x1b[31m', ''])(
+    'rejects %j',
+    (id) => {
+      const d = tmp();
+      writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+      const r = cli(['ingest', 'r.xml', '--run-id', id], d);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('--run-id must be');
+      expect(r.stderr).not.toContain('\x1b');
+    },
+  );
+});
+
+describe('html output path and --open (QA CLI-10/CLI-31)', () => {
+  it('-o "" is a clear exit-2 error, not a raw EISDIR', () => {
+    const d = tmp();
+    const r = cli(['html', '-o', ''], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('needs a file path');
+    expect(r.stderr).not.toMatch(/EISDIR|\n\s+at /);
+  });
+
+  it('-o pointing at a directory says so', () => {
+    const d = tmp();
+    mkdirSync(path.join(d, 'out'));
+    const r = cli(['html', '-o', 'out'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/cannot write the dashboard to .*out — it is a directory/);
+  });
+
+  it.runIf(process.platform === 'linux')('--open without xdg-open warns and still exits 0', () => {
+    const d = tmp();
+    const r = cli(['html', '--open'], d, { NO_COLOR: '1', PATH: path.join(d, 'empty-bin') });
+    expect(r.status).toBe(0);
+    expect(existsSync(path.join(d, 'flakefinder-report.html'))).toBe(true);
+    expect(r.stderr).toMatch(/could not open a browser \(xdg-open: /);
+    expect(r.stderr).not.toMatch(/Unhandled|\n\s+at /);
+  });
+});
+
+function firstTestId(d: string): string {
+  const r = cli(['report', '--format', 'json'], d);
+  return (JSON.parse(r.stdout) as { verdicts: { testId: string }[] }).verdicts[0]!.testId;
+}
+
+describe('quarantine exit codes, output and side effects (QA CLI-11/CLI-22/CLI-30)', () => {
+  it('add/remove of an unknown testId exits 1 (a missing testId argument stays 2)', () => {
+    const d = tmp();
+    expect(cli(['quarantine', 'add', 'deadbeefdeadbeef'], d).status).toBe(1);
+    expect(cli(['quarantine', 'remove', 'deadbeefdeadbeef'], d).status).toBe(1);
+    expect(cli(['quarantine', 'add'], d).status).toBe(2);
+    expect(cli(['quarantine', 'remove'], d).status).toBe(2);
+    expect(cli(['quarantine', 'bogus'], d).status).toBe(2);
+  });
+
+  it('prune on an empty history does not create the quarantine file', () => {
+    const d = tmp();
+    const r = cli(['quarantine', 'prune'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('nothing to prune');
+    expect(existsSync(path.join(d, 'flakefinder.quarantine.json'))).toBe(false);
+  });
+
+  it('control characters in --reason are escaped by quarantine list', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const id = firstTestId(d);
+    const add = cli(['quarantine', 'add', id, '--reason', 'evil\x1b[2J\rspoof\nline'], d);
+    expect(add.status).toBe(0);
+    const list = cli(['quarantine', 'list'], d);
+    expect(list.status).toBe(0);
+    expect(list.stdout).not.toContain('\x1b');
+    expect(list.stdout).not.toContain('\r');
+    const entryLines = list.stdout.split('\n').filter((l) => l.includes(id));
+    expect(entryLines).toHaveLength(1);
+    expect(entryLines[0]).toContain('evil');
+    expect(entryLines[0]).toContain('spoof');
+  });
+
+  it('prune prints escaped test names', () => {
+    const d = tmp();
+    const hostile = 'name\x1b[31mred\rCR';
+    const junit = `<testsuites><testsuite name="s"><testcase name="${hostile}"/></testsuite></testsuites>`;
+    writeFileSync(path.join(d, 'r.xml'), junit, 'utf8');
+    expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const id = firstTestId(d);
+    // an old entry for a test that has since passed 10+ times is pruned
+    writeFileSync(
+      path.join(d, 'flakefinder.quarantine.json'),
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            testId: id,
+            suite: 's',
+            name: hostile,
+            reason: 'flaky',
+            quarantinedAt: '2000-01-01T00:00:00.000Z',
+            flakeScore: 50,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    for (let i = 0; i < 10; i++) expect(cli(['ingest', 'r.xml'], d).status).toBe(0);
+    const r = cli(['quarantine', 'prune'], d);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('pruned 1 entry:');
+    expect(r.stdout).not.toContain('\x1b');
+    expect(r.stdout).not.toContain('\r');
+  });
+});
+
+describe('help behaviour (QA CLI-20)', () => {
+  it('bare flakefinder prints help to stdout and exits 0', () => {
+    const d = tmp();
+    for (const args of [[], ['--no-color'], ['--cwd', '.']]) {
+      const r = cli(args, d);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('Usage: flakefinder');
+      expect(r.stderr).toBe('');
+    }
+  });
+
+  it('help <command> describes that command; help alone lists commands', () => {
+    const d = tmp();
+    const sub = cli(['help', 'ingest'], d);
+    expect(sub.status).toBe(0);
+    expect(sub.stdout).toContain('Usage: flakefinder ingest');
+    const all = cli(['help'], d);
+    expect(all.status).toBe(0);
+    expect(all.stdout).toContain('Commands:');
+  });
+
+  it('help <unknown> exits 2 with an error instead of the general help', () => {
+    const d = tmp();
+    const r = cli(['help', 'nosuch'], d);
+    expect(r.status).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('unknown command "nosuch"');
+  });
+});
+
+describe('init --runner auto (QA CLI-28)', () => {
+  it('detects like the default and writes the detected runner with its report globs', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'go.mod'), 'module x\n', 'utf8');
+    const r = cli(['init', '--runner', 'auto'], d);
+    expect(r.status).toBe(0);
+    const cfg = JSON.parse(readFileSync(path.join(d, 'flakefinder.config.json'), 'utf8'));
+    expect(cfg).toEqual({ reports: ['test-output.jsonl'], runner: 'go' });
+  });
+
+  it('fails like the default when nothing can be detected (no reports: [] config)', () => {
+    const d = tmp();
+    const r = cli(['init', '--runner', 'auto'], d);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('could not detect a test runner');
+    expect(existsSync(path.join(d, 'flakefinder.config.json'))).toBe(false);
+  });
+});
+
+describe('ci verdict snapshot robustness (QA CLI-29)', () => {
+  const FLAKY_RUNS = [false, true, false, true];
+  function setupFlaky(d: string): void {
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    for (const fail of FLAKY_RUNS) {
+      const tc = fail
+        ? '<testcase name="t"><failure message="x"/></testcase>'
+        : '<testcase name="t"/>';
+      writeFileSync(
+        path.join(d, 'r.xml'),
+        `<testsuites><testsuite name="s">${tc}</testsuite></testsuites>`,
+        'utf8',
+      );
+      expect(cli(['ci'], d).status).toBe(0);
+    }
+  }
+
+  it.each([
+    ['corrupt JSON', '{ not json'],
+    ['an object', '{"verdicts": []}'],
+    ['a number', '42'],
+    ['an array of junk', '[null, 1, "x", {"testId": 5}]'],
+  ])('%s: warns (or drops junk), never crashes, and rewrites the snapshot', (_label, content) => {
+    const d = tmp();
+    setupFlaky(d);
+    const snap = path.join(d, '.flakefinder', 'verdicts-snapshot.json');
+    writeFileSync(snap, content, 'utf8');
+    const r = cli(['ci', '--fail-on-new-flakes'], d);
+    expect(r.stderr).not.toMatch(/TypeError|\n\s+at /);
+    expect([0, 1]).toContain(r.status);
+    if (!content.startsWith('[')) expect(r.stderr).toContain('ignoring');
+    expect(Array.isArray(JSON.parse(readFileSync(snap, 'utf8')))).toBe(true);
+  });
+});
+
+describe('ci commit sha from the CI environment (QA ACT-18)', () => {
+  function shaOf(d: string, env: Record<string, string | undefined>): string | undefined {
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    writeFileSync(path.join(d, 'r.xml'), JUNIT, 'utf8');
+    expect(cli(['ci'], d, { NO_COLOR: '1', ...env }).status).toBe(0);
+    const recs = historyRecords(d) as unknown as { commitSha?: string }[];
+    return recs[recs.length - 1]!.commitSha;
+  }
+  const sha = 'a'.repeat(40);
+
+  it('GITHUB_SHA wins', () => {
+    expect(shaOf(tmp(), { GITHUB_SHA: sha, CI_COMMIT_SHA: undefined })).toBe(sha);
+  });
+
+  it('CI_COMMIT_SHA (GitLab) is used when GITHUB_SHA is absent', () => {
+    expect(shaOf(tmp(), { GITHUB_SHA: undefined, CI_COMMIT_SHA: 'B'.repeat(40) })).toBe(
+      'b'.repeat(40),
+    );
+  });
+
+  it('a malformed CI sha is ignored (falls back to git, here: none)', () => {
+    expect(shaOf(tmp(), { GITHUB_SHA: 'not-a-sha', CI_COMMIT_SHA: undefined })).toBeUndefined();
+  });
+});
+
+describe('run surfaces history-store warnings', () => {
+  it('a corrupt history line is reported on stderr after a run', () => {
+    const d = tmp();
+    writeFileSync(path.join(d, 'flakefinder.config.json'), '{ "reports": ["r.xml"] }', 'utf8');
+    mkdirSync(path.join(d, '.flakefinder'));
+    writeFileSync(path.join(d, '.flakefinder', 'history.jsonl'), '{"version":1}\n{ corrupt\n');
+    writeFileSync(
+      path.join(d, 'write.js'),
+      `require('fs').writeFileSync('r.xml', ${JSON.stringify(JUNIT)});`,
+      'utf8',
+    );
+    const r = cli(['run', '--', process.execPath, 'write.js'], d);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('skipping corrupt line 2');
+    expect(r.stderr.match(/skipping corrupt line 2/g)).toHaveLength(1);
   });
 });

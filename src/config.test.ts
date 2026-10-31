@@ -8,8 +8,10 @@ import {
   defaultConfig,
   detectRunner,
   loadConfig,
+  readConfigFile,
   resolveConfig,
   stripJsonComments,
+  TIMEOUT_MAX_SECONDS,
   validateConfig,
 } from './config.js';
 import type { FlakefinderConfig, RunnerKind } from './types.js';
@@ -273,5 +275,52 @@ describe('BOM tolerance (QA round 2)', () => {
     writeFileSync(file, '\uFEFF{\n  "liveRetries": 4,\n}', 'utf8');
     const { config } = loadConfig(dir);
     expect(config.liveRetries).toBe(4);
+  });
+});
+
+describe('top-level config shape (QA CLI-16)', () => {
+  it.each([
+    ['null', 'null'],
+    ['[]', 'array'],
+    ['42', '42 \\(number\\)'],
+    ['"abc"', '"abc" \\(string\\)'],
+  ])('%s → "config must be a JSON object"', (json, got) => {
+    const dir = tmpDir();
+    writeFileSync(path.join(dir, CONFIG_FILE_NAME), json, 'utf8');
+    expect(() => loadConfig(dir)).toThrow(new RegExp(`config must be a JSON object, got ${got}`));
+    expect(() => readConfigFile(path.join(dir, CONFIG_FILE_NAME))).toThrow(
+      /config must be a JSON object/,
+    );
+    expect(() => validateConfig(JSON.parse(json))).toThrow(/config must be a JSON object/);
+  });
+
+  it('readConfigFile anchors paths to the file directory and names the file on errors', () => {
+    const dir = tmpDir();
+    const file = path.join(dir, 'custom.json');
+    writeFileSync(file, '{ "storeDir": "h" }', 'utf8');
+    expect(readConfigFile(file).storeDir).toBe(path.join(dir, 'h'));
+    expect(() => readConfigFile(path.join(dir, 'missing.json'))).toThrow(/cannot read config/);
+    writeFileSync(file, '{ nope', 'utf8');
+    expect(() => readConfigFile(file)).toThrow(/invalid config in .*custom\.json/);
+  });
+});
+
+describe('timeoutSeconds validation (QA CLI-17)', () => {
+  it('accepts a positive integer within the run --timeout range, or null', () => {
+    expect(() => validateConfig({ timeoutSeconds: 1 })).not.toThrow();
+    expect(() => validateConfig({ timeoutSeconds: TIMEOUT_MAX_SECONDS })).not.toThrow();
+    expect(() => validateConfig({ timeoutSeconds: null })).not.toThrow();
+  });
+
+  it.each([0.5, 0, -1, 1e12, TIMEOUT_MAX_SECONDS + 1, Number.NaN])('rejects %s', (v) => {
+    expect(() => validateConfig({ timeoutSeconds: v })).toThrow(
+      new RegExp(`timeoutSeconds: expected integer 1–${TIMEOUT_MAX_SECONDS}`),
+    );
+  });
+
+  it('rejects a non-number', () => {
+    expect(() => validateConfig({ timeoutSeconds: '30' as unknown as number })).toThrow(
+      /timeoutSeconds: expected integer/,
+    );
   });
 });

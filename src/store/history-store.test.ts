@@ -14,7 +14,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { RunRecord } from '../types.js';
-import { breakStaleLock, HistoryStore, snapshotPath } from './history-store.js';
+import {
+  breakStaleLock,
+  HistoryStore,
+  lastRuns,
+  snapshotPath,
+  subscribeStoreWarnings,
+} from './history-store.js';
 
 let dirs: string[] = [];
 
@@ -540,4 +546,80 @@ describe('lock failures that retrying cannot fix (QA CLI-1/CLI-12)', () => {
     rmSync(`${a.path}.lock`);
     expect(new HistoryStore(path.dirname(a.path)).runs()).toHaveLength(4); // untouched
   });
+});
+
+describe('maxRuns counts runs, not records (QA CLI-15)', () => {
+  const attempt = (runId: string, n: number, status: string): RunRecord => ({
+    ...record(runId, status),
+    attempt: n,
+  });
+
+  it('never splits the attempts of one runId', () => {
+    const a = tmpStore();
+    a.append(attempt('old', 1, 'pass'));
+    a.append(attempt('retried', 1, 'fail'));
+    a.append(attempt('retried', 2, 'pass'));
+    a.append(attempt('retried', 3, 'pass'));
+    a.append(attempt('latest', 1, 'pass'));
+    // 5 records but 3 runs: maxRuns 2 keeps BOTH runs whole (4 records)
+    a.prune(2);
+    expect(a.runs().map((r) => `${r.runId}#${r.attempt}`)).toEqual([
+      'retried#1',
+      'retried#2',
+      'retried#3',
+      'latest#1',
+    ]);
+    const fresh = new HistoryStore(path.dirname(a.path));
+    expect(fresh.runs()).toHaveLength(4);
+  });
+
+  it('no rewrite when the record count exceeds maxRuns but the run count does not', () => {
+    const a = tmpStore();
+    for (let i = 1; i <= 4; i++) a.append(attempt('one-run', i, i === 4 ? 'pass' : 'fail'));
+    a.prune(1);
+    expect(a.runs()).toHaveLength(4);
+  });
+
+  it('lastRuns keeps every record of a runId that reappears after others (shared --run-id)', () => {
+    const recs = [
+      attempt('a', 1, 'fail'),
+      attempt('b', 1, 'pass'),
+      attempt('a', 2, 'pass'),
+      attempt('c', 1, 'pass'),
+    ];
+    expect(lastRuns(recs, 2).map((r) => r.runId)).toEqual(['a', 'a', 'c']);
+    expect(lastRuns(recs, 3)).toBe(recs);
+    expect(lastRuns(recs, 1).map((r) => r.runId)).toEqual(['c']);
+  });
+});
+
+describe('subscribeStoreWarnings (run surfaces store warnings)', () => {
+  it('delivers each warning once, including a busy prune, until unsubscribed', () => {
+    const a = tmpStore();
+    a.append(record('r1', 'pass'));
+    appendFileSync(a.path, '{ corrupt\n', 'utf8');
+    a.append(record('r2', 'pass'));
+    const seen: string[] = [];
+    const off = subscribeStoreWarnings((w) => seen.push(w));
+    try {
+      // fresh instance, never loaded: prune's fresh re-read reports the corrupt
+      // line; adopting it must not report it a second time
+      const b = new HistoryStore(path.dirname(a.path));
+      b.prune(1);
+      expect(seen.filter((w) => w.includes('corrupt line'))).toHaveLength(1);
+      expect(b.warnings.some((w) => w.includes('corrupt line'))).toBe(true);
+      // a held lock: prune is skipped with a warning the subscriber sees
+      writeFileSync(`${a.path}.lock`, JSON.stringify({ pid: 1, epoch: Date.now() }), 'utf8');
+      new HistoryStore(path.dirname(a.path)).prune(1);
+      expect(seen.some((w) => w.includes('prune skipped'))).toBe(true);
+    } finally {
+      off();
+      rmSync(`${a.path}.lock`, { force: true });
+    }
+    const before = seen.length;
+    const c = new HistoryStore(path.dirname(a.path));
+    appendFileSync(a.path, '{ more corrupt\n', 'utf8');
+    c.runs();
+    expect(seen).toHaveLength(before);
+  }, 10_000);
 });

@@ -74,9 +74,14 @@ Global options, valid before any command:
 
 | Flag | Meaning |
 |---|---|
-| `--config <path>` | Use this config file instead of auto-discovery |
-| `--cwd <dir>` | Working directory for config, reports, and store (default: `.`) |
-| `--no-color` | Disable ANSI colors |
+| `--config <path>` | Use this config file instead of auto-discovery (a relative path resolves against `--cwd`) |
+| `--cwd <dir>` | Working directory for config, reports, and store (default: `.`). Must be an existing directory — otherwise every command exits `2` |
+| `--no-color` | Disable ANSI colors. Colors are also off when the `NO_COLOR` environment variable is set (non-empty) or when output is not a terminal — the same rule for every command |
+
+Help: `flakefinder` with no command, `flakefinder --help` and
+`flakefinder help` print the command list to stdout and exit `0`;
+`flakefinder help <command>` (or `<command> --help`) describes one command.
+`flakefinder help <unknown>` and an unknown command exit `2` with an error.
 
 Config discovery: `flakefinder.config.json` in `--cwd`, walking up to 3 parent
 levels. JSONC (comments) is allowed. Relative `storeDir` and `quarantineFile`
@@ -95,7 +100,9 @@ pytest, `jest` in package.json → jest, `go.mod` → go, mocha configs → moch
 then writes `flakefinder.config.json` with default report globs.
 
 - `--force` — overwrite an existing config
-- `--runner <pytest|jest|mocha|go|generic>` — skip detection, force a runner
+- `--runner <pytest|jest|mocha|go|generic>` — skip detection, force a runner.
+  `--runner auto` is the same as omitting the flag: it detects, writes the
+  detected runner and its report globs, and exits `2` when nothing is detected
 
 Prints the exact reporter setup your runner still needs. Exits `2` if it
 can't detect a runner (pass `--runner` explicitly) or the config exists
@@ -197,9 +204,10 @@ per file from content.
   a fail on `--attempt 1` followed by a pass on `--attempt 2` counts as a
   retry rescue exactly as it would under `run` (+40 score; `flaky-retry`, or
   `flaky-confirmed` when the same commit also flipped). Use one id per
-  CI job (e.g. `--run-id "$GITHUB_RUN_ID"` or a `uuidgen`); it must be at
-  least 10 characters of hex digits and dashes (a UUID or a numeric CI run
-  id), otherwise `ingest` exits `2`.
+  CI job (e.g. `--run-id "$GITHUB_RUN_ID"`, `"$CI_PIPELINE_ID"` or a
+  `uuidgen`); it must be 1–128 characters of letters, digits, `.`, `_` and
+  `-`, starting with a letter or digit (so `1234567890-2` works, `----------`
+  does not), otherwise `ingest` exits `2`.
 
 **Same-runId note:** without `--run-id`, each `ingest` invocation creates its
 **own** `runId`. Retry-rescue detection requires attempts 1→2 to share a runId
@@ -207,7 +215,10 @@ per file from content.
 same `--run-id` to each call. Separate `ingest` calls without it can still flag
 a flake in a git repo — via the same-commit-flip rule (`flaky-confirmed`) — but
 without the retry-rescue evidence; outside git they cannot flag it at all.
-Exits `2` if nothing matched.
+Exits `2` if nothing matched, or if none of the files could be read and
+parsed (every one missing, empty or in an unrecognized format) — nothing is
+recorded then. A run where at least one file parsed exits `0`; the skipped
+files are listed as warnings.
 
 ### `report`
 
@@ -219,8 +230,12 @@ Classifies everything in the history store and prints it.
 
 - `--format table` (default) — the terminal table. Default view shows the
   problem classes (flaky/failing/new-failure) plus an `ok: N passing…` line.
-- `--format json` — machine-readable `{ generatedAt, flakefinderVersion,
-  config, verdicts }` on stdout alone — safe to pipe into `jq`.
+- `--format json` — machine-readable `{ schemaVersion, generatedAt,
+  flakefinderVersion, config, verdicts }` on stdout alone — safe to pipe into
+  `jq`. The same shape is written by `ci` (`flakefinder-report.json`) and the
+  GitHub Action. `schemaVersion` (currently `1`) changes only when a field is
+  removed, renamed or retyped; new fields can appear without a bump, so
+  ignore keys you do not know.
 - `--format md` — markdown (same shape as PR comments).
 - `--flakes-only` — drop the `ok:` summary line (table).
 - `--all` — include passing/skipped/gone rows (table), all tests (md).
@@ -243,8 +258,12 @@ drawer per test with its full observation timeline, failure message, duration
 sparkline, and a copyable `quarantine add` command.
 
 - `-o, --out <file>` — output path (default `flakefinder-report.html`);
-  missing parent directories are created automatically
-- `--open` — open it in your browser after writing
+  missing parent directories are created automatically. An empty path, a
+  directory, or an unwritable location exits `2` with the reason
+- `--open` — open it in your browser after writing (`xdg-open` on Linux,
+  `open` on macOS, `start` on Windows). When no opener is available (e.g. a
+  headless box without `xdg-open`) this is a one-line warning; the dashboard
+  is still written and the exit code stays `0`
 
 ### `doctor`
 
@@ -254,9 +273,12 @@ $ npx flakefinder doctor
 
 Checks the whole setup in one pass: config validity, detected runner, report
 files actually matching the globs, history size/freshness/corruption, git
-metadata availability, quarantine health. Each line is `[ok]`/`[warn]`/
-`[FAIL]`/`[info]` with an actionable hint where relevant. Exit `1` when any
-check FAILed — safe to gate CI or a setup script on it.
+metadata availability, quarantine health. It checks exactly what the other
+commands would use: the `--config` file when one is given (a missing or
+invalid one is a FAIL), and the configured `storeDir` and `quarantineFile`.
+Each line is `[ok]`/`[warn]`/`[FAIL]`/`[info]` with an actionable hint where
+relevant. Exit `1` when any check FAILed — safe to gate CI or a setup script
+on it.
 
 ### `quarantine`
 
@@ -267,9 +289,17 @@ $ npx flakefinder quarantine remove <testId>
 $ npx flakefinder quarantine prune
 ```
 
-Manages `flakefinder.quarantine.json`. `testId`s come from
-`report` (the "next steps" hint) or `report --format json`. See the
-[deep-dive](#quarantine-deep-dive) for mechanics and the prune policy.
+Manages `flakefinder.quarantine.json` (or the configured `quarantineFile`).
+`testId`s come from `report` (the "next steps" hint) or
+`report --format json`. See the [deep-dive](#quarantine-deep-dive) for
+mechanics and the prune policy.
+
+- `add`/`remove` of a `testId` that is not in history / not quarantined exits
+  `1`; a missing `testId` argument or an unknown action exits `2`.
+- `prune` writes the file only when it actually removes entries — with
+  nothing to prune (e.g. an empty history) no file is created.
+- `list` and `prune` print test names, ids and reasons with control
+  characters made visible (`\x1b`, `\x0d`, …), never raw.
 
 ### `ci`
 
@@ -286,6 +316,14 @@ flaky test — also understood by GitLab, Buildkite, and others), writes
 
 - `--fail-on-new-flakes` — exit `1` when flakes appear that were not flaky in
   the previous snapshot. Known flakes never fail the build; new ones do.
+  With no snapshot (first run) every current flake is new. A corrupt or
+  wrongly-shaped snapshot is treated the same way, with a warning naming the
+  file, and is overwritten by this run's snapshot.
+
+The commit sha recorded with each run comes from the CI system when it
+provides one — `GITHUB_SHA` (GitHub Actions), then `CI_COMMIT_SHA`
+(GitLab) — and from `git rev-parse HEAD` otherwise, so shallow or git-less
+checkouts still get same-commit flip detection.
 
 On **GitLab**, `flakefinder ci` additionally upserts ONE merge-request note
 (marker-scoped, never duplicated) when these CI variables exist:
@@ -301,7 +339,9 @@ Prints the flakefinder version.
 
 ## Configuration reference
 
-`flakefinder.config.json` (JSONC allowed). All keys optional.
+`flakefinder.config.json` (JSONC allowed). The file must hold a JSON
+**object**; `null`, an array, a number or a string is rejected with
+`config must be a JSON object` (exit `2`). All keys optional.
 
 **Validation (v0.2.0+):** every key is type- and range-checked on load —
 unknown keys and wrong-typed values (including wrong-case `runner` values,
@@ -313,7 +353,7 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 |---|---|---|---|
 | `reports` | `string[]` | `[]` | Globs (relative to cwd) for report files: `**`, `*`, `?` supported; `node_modules`, `.git`, `dist`, and the store dir are skipped. Example: `["junit*.xml", "test-results/*.json"]` |
 | `storeDir` | string | `".flakefinder"` | History directory (holds `history.jsonl` and the verdict snapshot); relative to the config file's directory |
-| `maxRuns` | integer 1–100000 | `300` | Prune history to the last N runs after each append |
+| `maxRuns` | integer 1–100000 | `300` | Prune history to the last N runs after each append. A run is one `runId`: all retry attempts of one `run` (or ingests sharing a `--run-id`) count once and are kept or dropped together |
 | `minRuns` | integer 1–1000 | `3` | Minimum observations before statistical claims (gates `flaky-suspected` and `failing`) |
 | `liveRetries` | integer 0–10 | `2` | Extra attempts for `run` (override per invocation with `-R`) |
 | `flakeScoreThreshold` | integer 0–100 | `30` | Score bar for including `flaky-suspected` in reports; confirmed/retry always included |
@@ -322,15 +362,17 @@ Previously these silently misbehaved (a wrong-case runner fell back to
 | `quarantineFile` | string | `"flakefinder.quarantine.json"` | Quarantine list location; relative to the config file's directory |
 | `runner` | enum | `"auto"` | `auto` (detect per run), `pytest`, `jest`, `mocha`, `go`, `generic`. Controls quarantine exclusion flags and `init` hints |
 | `failOnFlakes` | boolean | `false` | Flakes make `run` exit non-zero (same as `--fail-on-flake`) |
+| `retryMode` | enum | `"auto"` | How `run` retries: `auto` (re-run only the failed tests when the runner supports it, else the whole command), `failed` (always targeted), `full` (always re-run everything). Same as `run --retry-mode` |
+| `timeoutSeconds` | integer 1–2147483 \| null | `null` | Kill an attempt of `run` (and its process tree) after N seconds; `null` = no limit. Same range as `run --timeout`, which overrides it |
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Clean run, **or** failures that were all proven flakes (unless `--fail-on-flake` / `failOnFlakes`) |
-| `1` | A deterministic failure persisted to the final attempt (`run`); a quarantined testId wasn't found; `ci --fail-on-new-flakes` saw new flakes |
+| `1` | A deterministic failure persisted to the final attempt (`run`); `quarantine add`/`remove` could not find the testId; `ci --fail-on-new-flakes` saw new flakes |
 | `1` (doctor) | `doctor` found at least one FAIL-level problem (e.g. invalid config, unreadable quarantine file, unreadable `history.jsonl`) |
-| `2` | Usage or environment error: bad flags, unreadable config, no report files matched for `ingest`/`ci`, unknown quarantine action, test command could not be started (`run` — e.g. not installed / not on PATH; nothing is retried or recorded) |
+| `2` | Usage or environment error: bad flags, unreadable config, missing `--cwd`, no report files matched for `ingest`/`ci` (or none of them parsed, for `ingest`), unknown quarantine action, test command could not be started (`run` — e.g. not installed / not on PATH; nothing is retried or recorded) |
 
 These are stable and scriptable — gate CI on `run`'s exit code directly.
 
@@ -607,7 +649,9 @@ safely; readers tolerate legacy header-less stores (v0.1.x files) unchanged.
 - `commitSha` — best-effort `git rev-parse HEAD` at ingest time
 
 Pruning: after each append the store is atomically rewritten (tmp + rename)
-to the last `maxRuns` records (default 300). Corrupt lines are skipped on
+to the last `maxRuns` runs (default 300) — distinct `runId`s, not lines:
+the attempts of one run are never split, so a retry rescue is never cut in
+half. Corrupt lines are skipped on
 load, never crash the CLI. If `history.jsonl` itself cannot be read (it is a
 directory, or permissions deny access) read-only commands treat history as
 empty, `doctor` reports it as a FAIL, and any command that writes history
@@ -668,7 +712,7 @@ manually (e.g. `-run` in your own scripts) until Go grows a selector.
 
 **Exit code 2** — a flag/config problem, not a test result: check the error
 message above the exit (unreadable config, invalid `--retries`, empty
-quarantine action, no matching reports for `ingest`/`ci`, or a `run` test
+quarantine action, no matching or parseable reports for `ingest`, no matching reports for `ci`, or a `run` test
 command that could not be started — `command not found: …`). Numeric flags
 (`-R`, `--timeout`, `--attempt`, `--threshold`) accept plain integers only —
 `2.5`, `2x` or `50abc` are rejected with the flag's accepted range rather than

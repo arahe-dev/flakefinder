@@ -1,16 +1,16 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Command } from 'commander';
 import { computeNewFlakes } from '../action/diff.js';
 import {
-  anchorConfigPaths,
   CONFIG_FILE_NAME,
   detectRunner,
   loadConfig,
+  readConfigFile,
   resolveConfig,
-  stripJsonComments,
+  TIMEOUT_MAX_SECONDS,
 } from '../config.js';
 import { runDoctor } from '../doctor.js';
 import { classifyAll } from '../engine/classify.js';
@@ -23,7 +23,7 @@ import { buildPrComment, renderMarkdown } from '../report/markdown.js';
 import { renderTerminal } from '../report/terminal.js';
 import { escapeControlChars } from '../report/text.js';
 import { runLive } from '../runner/wrap.js';
-import { HistoryStore, snapshotPath } from '../store/history-store.js';
+import { HistoryStore, snapshotPath, subscribeStoreWarnings } from '../store/history-store.js';
 import type {
   FlakefinderConfig,
   ResolvedConfig,
@@ -33,8 +33,11 @@ import type {
 } from '../types.js';
 import { FLAKEFINDER_VERSION } from '../types.js';
 import { matchGlobs } from '../util/glob.js';
+import { readTextFile } from '../util/read-text.js';
 import { redact } from '../util/redact.js';
 import { parseStrictInt } from '../util/strict-int.js';
+import { shouldColor } from './color.js';
+import { openInBrowser } from './open.js';
 
 interface Globals {
   config?: string;
@@ -46,30 +49,82 @@ const PROBLEM_ALWAYS: string[] = ['flaky-confirmed', 'flaky-retry', 'failing', '
 
 function resolveCfg(g: Globals, overrides: Partial<FlakefinderConfig> = {}): ResolvedConfig {
   if (g.config) {
-    let raw: string;
-    try {
-      raw = readFileSync(g.config, 'utf8');
-    } catch (err) {
-      throw new Error(`cannot read config ${g.config}: ${(err as Error).message}`);
-    }
-    let parsed: FlakefinderConfig;
-    try {
-      parsed = JSON.parse(stripJsonComments(raw.replace(/^\uFEFF/, ''))) as FlakefinderConfig;
-    } catch (err) {
-      throw new Error(`invalid config ${g.config}: ${(err as Error).message}`);
-    }
-    return resolveConfig(
-      anchorConfigPaths(parsed, path.dirname(path.resolve(g.config))),
-      overrides,
-    );
+    // --config is relative to --cwd, like every other path argument (CLI-25)
+    return resolveConfig(readConfigFile(path.resolve(g.cwd, g.config)), overrides);
   }
   const { config } = loadConfig(g.cwd);
   return resolveConfig(config, overrides);
 }
 
+/**
+ * --cwd must name an existing directory: a typo used to make `report` print
+ * "no history yet" (exit 0) and `init`/`ingest` die with a raw ENOENT.
+ */
+function checkCwd(dir: string): void {
+  let isDir = false;
+  try {
+    isDir = statSync(dir).isDirectory();
+  } catch {
+    throw new Error(`--cwd ${dir} does not exist`);
+  }
+  if (!isDir) throw new Error(`--cwd ${dir} is not a directory`);
+}
+
 function gitSha(cwd: string): string | undefined {
   const r = spawnSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' });
   return r.status === 0 ? r.stdout.trim() : undefined;
+}
+
+const SHA_RE = /^[0-9a-f]{7,64}$/i;
+
+/**
+ * Commit sha for `ci` (QA ACT-18): the CI system's own variable wins —
+ * GitHub's GITHUB_SHA, GitLab's CI_COMMIT_SHA — because a CI checkout may be
+ * shallow, detached, or have no git at all, and HEAD can differ from the sha
+ * the pipeline is reporting on. Falls back to `git rev-parse HEAD`.
+ */
+function ciCommitSha(
+  cwd: string,
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  for (const key of ['GITHUB_SHA', 'CI_COMMIT_SHA']) {
+    const v = env[key]?.trim();
+    if (v && SHA_RE.test(v)) return v.toLowerCase();
+  }
+  return gitSha(cwd);
+}
+
+/**
+ * The previous verdict snapshot for the new-flake diff, or null when there is
+ * none. A corrupt or wrongly-shaped snapshot is ignored WITH a warning (QA
+ * CLI-29): silently treating it as "no baseline" made every flake NEW, and a
+ * non-array crashed the diff with a TypeError. Entries that are not
+ * verdict-shaped are dropped.
+ */
+function readSnapshot(file: string): TestVerdict[] | null {
+  if (!existsSync(file)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    console.warn(
+      `flakefinder: ignoring unreadable verdict snapshot ${file} (${(err as Error).message}) — no baseline this run, every current flake counts as new; it is rewritten below`,
+    );
+    return null;
+  }
+  if (!Array.isArray(parsed)) {
+    console.warn(
+      `flakefinder: ignoring verdict snapshot ${file}: expected an array — no baseline this run, every current flake counts as new; it is rewritten below`,
+    );
+    return null;
+  }
+  return parsed.filter(
+    (v): v is TestVerdict =>
+      typeof v === 'object' &&
+      v !== null &&
+      typeof (v as TestVerdict).testId === 'string' &&
+      typeof (v as TestVerdict).classification === 'string',
+  );
 }
 
 function storeFor(g: Globals, cfg: ResolvedConfig): HistoryStore {
@@ -97,10 +152,15 @@ function flagInt(flag: string, value: string, min: number, max: number, unit = '
   return n;
 }
 
+/**
+ * --run-id: a UUID, a CI run number (`$GITHUB_RUN_ID`, `$CI_PIPELINE_ID`) or a
+ * composed id like `1234567890-2`. Must start with a letter or digit, so an
+ * all-punctuation id (`----------`) is rejected; capped at 128 characters.
+ */
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 /** Engine/config bounds the flags share (config.ts validates the same ranges). */
 const RETRIES_MAX = 10;
-/** setTimeout's ceiling (2^31-1 ms) in whole seconds — larger values would fire at once. */
-const TIMEOUT_MAX_SECONDS = 2_147_483;
 
 function filterVerdicts(
   verdicts: TestVerdict[],
@@ -145,18 +205,25 @@ function printSetupHints(runner: RunnerKind): void {
   );
 }
 
-function openInBrowser(file: string): void {
-  try {
-    if (process.platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '', file], { detached: true, stdio: 'ignore' });
-    } else if (process.platform === 'darwin') {
-      spawn('open', [file], { detached: true, stdio: 'ignore' });
-    } else {
-      spawn('xdg-open', [file], { detached: true, stdio: 'ignore' });
+/** Untrusted text (test names, ids, reasons) made safe for a terminal line. */
+const esc = escapeControlChars;
+
+/**
+ * True unless argv holds nothing but the value-taking global options and
+ * --no-color. Anything else (a command, -h/-V, an unknown flag) is left to
+ * commander.
+ */
+function hasCommand(argv: string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--config' || a === '--cwd') {
+      i++;
+      continue;
     }
-  } catch {
-    // opening is best-effort
+    if (a.startsWith('--config=') || a.startsWith('--cwd=') || a === '--no-color') continue;
+    return true;
   }
+  return false;
 }
 
 function ghEscape(s: string): string {
@@ -172,20 +239,30 @@ export async function main(argv: string[]): Promise<number> {
     .description('Detect, track, and quarantine flaky tests — locally and in CI.')
     .version(FLAKEFINDER_VERSION)
     .option('--config <path>', 'explicit path to flakefinder.config.json')
-    .option('--cwd <dir>', 'working directory (where config/reports live)', process.cwd())
-    .option('--no-color', 'disable ANSI colors')
-    .exitOverride();
+    .option('--cwd <dir>', 'working directory (where config/reports live; default: .)')
+    .option(
+      '--no-color',
+      'disable ANSI colors (also off with NO_COLOR or when output is not a terminal)',
+    )
+    .exitOverride()
+    // every command resolves paths against --cwd: validate it once, up front
+    .hook('preAction', () => {
+      checkCwd(globals().cwd);
+    });
 
   const globals = (): Globals => {
-    const o = program.opts<{ config?: string; cwd: string; color?: boolean }>();
-    return { config: o.config, cwd: o.cwd ?? process.cwd(), color: o.color !== false };
+    const o = program.opts<{ config?: string; cwd?: string; color?: boolean }>();
+    return { config: o.config, cwd: path.resolve(o.cwd ?? '.'), color: o.color !== false };
   };
 
   program
     .command('init')
     .description('detect your test runner and create flakefinder.config.json')
     .option('--force', 'overwrite an existing config')
-    .option('--runner <runner>', 'explicit runner: pytest|jest|mocha|go|generic')
+    .option(
+      '--runner <runner>',
+      'explicit runner: pytest|jest|mocha|go|generic (auto = detect, the default)',
+    )
     .action((opts: { force?: boolean; runner?: RunnerKind }) => {
       const g = globals();
       const RUNNERS: readonly string[] = ['auto', 'pytest', 'jest', 'mocha', 'go', 'generic'];
@@ -196,8 +273,11 @@ export async function main(argv: string[]): Promise<number> {
         exitCode = 2;
         return;
       }
-      const runner: RunnerKind | undefined = opts.runner ?? detectRunner(g.cwd);
-      if (!runner || (runner === 'generic' && !opts.runner)) {
+      // `--runner auto` means "detect", exactly like omitting the flag — it
+      // used to write runner "auto" with an empty reports list (QA CLI-28)
+      const explicit = opts.runner === 'auto' ? undefined : opts.runner;
+      const runner: RunnerKind = explicit ?? detectRunner(g.cwd);
+      if (runner === 'generic' && !explicit) {
         console.error(
           'flakefinder: could not detect a test runner — re-run with --runner <pytest|jest|mocha|go|generic>',
         );
@@ -281,23 +361,37 @@ export async function main(argv: string[]): Promise<number> {
           overrides.timeoutSeconds = seconds;
         }
         const cfg = resolveCfg(g, overrides);
-        const result = await runLive(command, cfg, {
-          retries: retries ?? cfg.liveRetries,
-          cwd: g.cwd,
-          applyQuarantine: opts.quarantine !== false,
-        });
+        // runLive keeps its HistoryStore private: collect what it warns about
+        // (corrupt lines, busy prune skipped, …) and show it after the report
+        const storeWarnings: string[] = [];
+        const unsubscribe = subscribeStoreWarnings((w) => storeWarnings.push(w));
+        let result: Awaited<ReturnType<typeof runLive>>;
+        try {
+          result = await runLive(command, cfg, {
+            retries: retries ?? cfg.liveRetries,
+            cwd: g.cwd,
+            applyQuarantine: opts.quarantine !== false,
+          });
+        } finally {
+          unsubscribe();
+        }
+        const printRunStoreWarnings = (): void => {
+          for (const w of new Set(storeWarnings)) console.warn(`flakefinder: ${w}`);
+        };
         if (result.finalExitCode === 2 && result.attempts.length === 0) {
           // the command could not be started — runLive already said why; a
           // "no test history yet" report here would only mislead
+          printRunStoreWarnings();
           exitCode = 2;
           return;
         }
         console.log(
           renderTerminal(result.verdicts, {
-            color: g.color && process.stdout.isTTY === true,
+            color: shouldColor(g.color, process.stdout),
             flakesOnly: false,
           }),
         );
+        printRunStoreWarnings();
         exitCode = result.finalExitCode;
       },
     );
@@ -340,9 +434,9 @@ export async function main(argv: string[]): Promise<number> {
       }
       let runId: string = randomUUID();
       if (opts.runId != null) {
-        if (!/^[0-9a-f-]{10,}$/i.test(opts.runId)) {
+        if (!RUN_ID_RE.test(opts.runId)) {
           console.error(
-            `flakefinder: --run-id must look like a UUID/identifier (got "${opts.runId}")`,
+            `flakefinder: --run-id must be 1–128 characters of letters, digits, '.', '_' or '-', starting with a letter or digit — e.g. a UUID or "$GITHUB_RUN_ID" (got "${escapeControlChars(opts.runId)}")`,
           );
           exitCode = 2;
           return;
@@ -356,7 +450,7 @@ export async function main(argv: string[]): Promise<number> {
       for (const file of targets) {
         let content: string;
         try {
-          content = readFileSync(file, 'utf8');
+          content = readTextFile(file); // UTF-8 or UTF-16 (PowerShell 5.1 `>`)
         } catch (err) {
           console.warn(`flakefinder: cannot read ${file}: ${(err as Error).message}`);
           warnings++;
@@ -383,6 +477,15 @@ export async function main(argv: string[]): Promise<number> {
         store.append(record);
         total += parsed.results.length;
         used++;
+      }
+      if (used === 0) {
+        // nothing was recorded: every file was missing, empty or unparseable —
+        // a success exit here would let a broken CI pipeline look healthy
+        console.error(
+          `flakefinder: none of the ${targets.length} report file(s) could be read and parsed — nothing ingested`,
+        );
+        exitCode = 2;
+        return;
       }
       store.prune(cfg.maxRuns);
       printStoreWarnings(store);
@@ -432,7 +535,7 @@ export async function main(argv: string[]): Promise<number> {
       }
       console.log(
         renderTerminal(verdicts, {
-          color: g.color && process.stdout.isTTY === true,
+          color: shouldColor(g.color, process.stdout),
           flakesOnly: opts.flakesOnly === true,
           allRows: opts.all === true,
           // table and md now agree: threshold gates suspected flakes; --all shows everything
@@ -448,6 +551,11 @@ export async function main(argv: string[]): Promise<number> {
     .option('--open', 'open the dashboard in your browser')
     .action((opts: { out: string; open?: boolean }) => {
       const g = globals();
+      if (opts.out.trim() === '') {
+        console.error('flakefinder: html -o/--out needs a file path (got an empty string)');
+        exitCode = 2;
+        return;
+      }
       const cfg = resolveCfg(g);
       const store = storeFor(g, cfg);
       const verdicts = classifyAll(store.runs(), cfg);
@@ -469,8 +577,17 @@ export async function main(argv: string[]): Promise<number> {
         runs,
       });
       const out = path.resolve(g.cwd, opts.out);
-      mkdirSync(path.dirname(out), { recursive: true }); // -o into a fresh directory just works
-      writeFileSync(out, html, 'utf8');
+      try {
+        mkdirSync(path.dirname(out), { recursive: true }); // -o into a fresh directory just works
+        writeFileSync(out, html, 'utf8');
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        console.error(
+          `flakefinder: cannot write the dashboard to ${out}${e.code === 'EISDIR' ? ' — it is a directory' : ` (${e.code ?? e.message})`}`,
+        );
+        exitCode = 2;
+        return;
+      }
       console.log(`dashboard written → ${out} (${verdicts.length} tests, ${runs.length} runs)`);
       if (opts.open) openInBrowser(out);
     });
@@ -495,8 +612,9 @@ export async function main(argv: string[]): Promise<number> {
         }
         console.log(`${entries.length} quarantined test(s):`);
         for (const e of entries) {
+          // hand-edited files and --reason may carry ESC/CR/LF — never echo raw
           console.log(
-            `  ${e.testId}  ${e.suite} :: ${e.name}  (score ${e.flakeScore}, ${e.reason})`,
+            `  ${esc(e.testId)}  ${esc(e.suite)} :: ${esc(e.name)}  (score ${e.flakeScore}, ${esc(String(e.reason))})`,
           );
         }
         const runner = cfg.runner === 'auto' ? detectRunner(g.cwd) : cfg.runner;
@@ -506,7 +624,7 @@ export async function main(argv: string[]): Promise<number> {
           );
         } else {
           console.log(
-            `next run will add: ${exclusionArgs(runner as Exclude<RunnerKind, 'auto'>, entries).join(' ')}`,
+            `next run will add: ${esc(exclusionArgs(runner as Exclude<RunnerKind, 'auto'>, entries).join(' '))}`,
           );
         }
         return;
@@ -521,10 +639,11 @@ export async function main(argv: string[]): Promise<number> {
         const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
         const v = verdicts.find((x) => x.testId === testId);
         if (!v) {
+          // a lookup miss, not a usage error: exit 1 (documented)
           console.error(
-            `flakefinder: testId ${testId} not in history — run "flakefinder report --format json" to list testIds`,
+            `flakefinder: testId ${esc(testId)} not in history — run "flakefinder report --format json" to list testIds`,
           );
-          exitCode = 2;
+          exitCode = 1;
           return;
         }
         qm.add({
@@ -537,7 +656,7 @@ export async function main(argv: string[]): Promise<number> {
         });
         qm.save();
         console.log(
-          `quarantined ${v.suite} :: ${v.name} (${v.classification}, score ${v.flakeScore})`,
+          `quarantined ${esc(v.suite)} :: ${esc(v.name)} (${v.classification}, score ${v.flakeScore})`,
         );
         console.log(`quarantine list: ${qPath}`);
         return;
@@ -551,10 +670,10 @@ export async function main(argv: string[]): Promise<number> {
         }
         if (qm.remove(testId)) {
           qm.save();
-          console.log(`removed ${testId} from quarantine`);
+          console.log(`removed ${esc(testId)} from quarantine`);
         } else {
-          console.error(`flakefinder: ${testId} is not quarantined`);
-          exitCode = 2;
+          console.error(`flakefinder: ${esc(testId)} is not quarantined`);
+          exitCode = 1;
         }
         return;
       }
@@ -562,16 +681,20 @@ export async function main(argv: string[]): Promise<number> {
       if (action === 'prune') {
         const verdicts = classifyAll(storeFor(g, cfg).runs(), cfg);
         const removed = qm.prune(verdicts);
-        qm.save();
-        if (removed.length === 0) console.log('nothing to prune');
-        else {
-          console.log(`pruned ${removed.length} entr(y/ies):`);
-          for (const e of removed) console.log(`  ${e.suite} :: ${e.name}`);
+        if (removed.length === 0) {
+          // no write: an empty history must not create the quarantine file
+          console.log('nothing to prune');
+          return;
         }
+        qm.save();
+        console.log(`pruned ${removed.length} entr${removed.length === 1 ? 'y' : 'ies'}:`);
+        for (const e of removed) console.log(`  ${esc(e.suite)} :: ${esc(e.name)}`);
         return;
       }
 
-      console.error(`flakefinder: unknown quarantine action "${action}" (list|add|remove|prune)`);
+      console.error(
+        `flakefinder: unknown quarantine action "${esc(action)}" (list|add|remove|prune)`,
+      );
       exitCode = 2;
     });
 
@@ -597,11 +720,11 @@ export async function main(argv: string[]): Promise<number> {
       }
       const store = storeFor(g, cfg);
       const runId = randomUUID();
-      const commitSha = gitSha(g.cwd);
+      const commitSha = ciCommitSha(g.cwd);
       for (const file of targets) {
         let content: string;
         try {
-          content = readFileSync(file, 'utf8');
+          content = readTextFile(file); // UTF-8 or UTF-16 (PowerShell 5.1 `>`)
         } catch (err) {
           console.warn(`flakefinder: cannot read ${file}: ${(err as Error).message}`);
           continue;
@@ -640,14 +763,7 @@ export async function main(argv: string[]): Promise<number> {
       console.log(`json report → ${reportPath}`);
 
       const snap = snapshotPath(path.resolve(g.cwd, cfg.storeDir));
-      let previous: TestVerdict[] | null = null;
-      if (existsSync(snap)) {
-        try {
-          previous = JSON.parse(readFileSync(snap, 'utf8')) as TestVerdict[];
-        } catch {
-          previous = null;
-        }
-      }
+      const previous = readSnapshot(snap);
       // same semantics as the GitHub Action — one implementation (src/action/diff.ts)
       const newFlakes = computeNewFlakes(verdicts, previous);
       // nothing parsed on a first run → no store dir yet (QA ACT-5 / CLI-7)
@@ -686,20 +802,40 @@ export async function main(argv: string[]): Promise<number> {
     .description('check the setup: config, runner, reports, history, git, quarantine')
     .action(() => {
       const g = globals();
-      const { lines, ok } = runDoctor(g.cwd);
+      const { lines, ok } = runDoctor(g.cwd, { configPath: g.config });
       const tag = { ok: '[ok]  ', warn: '[warn]', fail: '[FAIL]', info: '[info]' };
+      const color = shouldColor(g.color, process.stdout);
       for (const line of lines) {
-        const paint =
-          line.status === 'fail'
-            ? (s: string) => `[31m${s}[0m`
-            : line.status === 'warn'
-              ? (s: string) => `[33m${s}[0m`
-              : (s: string) => s;
+        const code = line.status === 'fail' ? '31' : line.status === 'warn' ? '33' : null;
+        const paint = (s: string): string => (color && code ? `\x1b[${code}m${s}\x1b[0m` : s);
         console.log(`${paint(tag[line.status])} ${line.message}`);
         if (line.hint) console.log(`        ${paint('→')} ${line.hint}`);
       }
       console.log(ok ? '' : 'doctor: problems found (see FAIL lines above)');
       exitCode = ok ? 0 : 1;
+    });
+
+  // explicit help command: commander's built-in one printed the general help
+  // and exited 0 for `help nosuch`, hiding the typo (QA CLI-20)
+  program.helpCommand(false);
+  program
+    .command('help')
+    .description('display help for a command (or for flakefinder)')
+    .argument('[command]', 'the command to describe')
+    .action((name?: string) => {
+      if (name == null) {
+        program.outputHelp();
+        return;
+      }
+      const sub = program.commands.find((c) => c.name() === name || c.aliases().includes(name));
+      if (!sub) {
+        console.error(
+          `flakefinder: unknown command "${escapeControlChars(name)}" — run "flakefinder help" for the list`,
+        );
+        exitCode = 2;
+        return;
+      }
+      sub.outputHelp();
     });
 
   program
@@ -708,6 +844,13 @@ export async function main(argv: string[]): Promise<number> {
     .action(() => {
       console.log(FLAKEFINDER_VERSION);
     });
+
+  // bare `flakefinder` (only global options): help on stdout, exit 0 — it is a
+  // request for help, not a usage error (commander would print to stderr)
+  if (!hasCommand(argv)) {
+    program.outputHelp();
+    return 0;
+  }
 
   try {
     await program.parseAsync(argv, { from: 'user' });
