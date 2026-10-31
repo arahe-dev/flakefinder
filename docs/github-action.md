@@ -24,7 +24,7 @@ jobs:
       - run: npm ci
       - run: npm test                       # your tests must write report files
       - name: flakefinder
-        uses: DJJW26/flakefinder@main
+        uses: DJJW26/flakefinder@v1
         if: always()                        # analyze even when tests fail
 ```
 
@@ -152,6 +152,21 @@ message.
 | `failing-count` | Deterministically failing tests |
 | `report-json` | Path to the full JSON verdict report |
 
+## Dashboard artifact
+
+`flakefinder-dashboard.html` is one self-contained file: inline CSS and
+JavaScript, the report data embedded as JSON, no network requests, no
+external fonts or scripts. It follows the viewer's light/dark system
+preference (a toggle overrides it). Test names, suites and failure messages
+are redacted for credential shapes, and control/bidi characters are shown
+as visible escapes (`\u202e`) so a name can't be visually spoofed.
+
+If you serve the file from a web server with a Content-Security-Policy,
+the policy must allow inline code: `script-src 'unsafe-inline'` and
+`style-src 'unsafe-inline'` (it needs nothing else; `default-src 'none'`
+otherwise works). Opened from disk or the artifact download, no CSP
+applies.
+
 ## PR comment behavior
 
 - One comment per PR, updated in place (marker `<!-- flakefinder:report -->`).
@@ -173,6 +188,10 @@ message.
 
 **Do I need the config file if I set the `reports` input?**
 No — the input overrides it. The config file is still useful for local runs.
+
+**Which version should I pin?** `@v1` follows the latest 1.x release.
+For supply-chain hardening, pin a full commit SHA with a version comment
+(`DJJW26/flakefinder@<sha> # v1.2.0`). Avoid `@main`.
 
 **Private repos?** Yes; the default `GITHUB_TOKEN` works. PR comments need the
 `pull-requests: write` permission. Comment on fork PRs may fail (token
